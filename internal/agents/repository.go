@@ -128,6 +128,10 @@ type rowQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+type rowsQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
 func (repository *Repository) tokenByHash(
 	ctx context.Context,
 	queryer rowQueryer,
@@ -184,12 +188,12 @@ func (repository *Repository) tokenByHash(
 	return token, true, nil
 }
 
-func (repository *Repository) grantsTx(
+func (repository *Repository) grants(
 	ctx context.Context,
-	tx *sql.Tx,
+	queryer rowsQueryer,
 	agentID string,
 ) ([]Grant, error) {
-	rows, err := tx.QueryContext(ctx, `
+	rows, err := queryer.QueryContext(ctx, `
 		SELECT space_id, scopes_json, labels_json
 		FROM agent_space_grants
 		WHERE agent_id = ?

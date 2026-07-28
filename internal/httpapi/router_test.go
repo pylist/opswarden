@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1153,6 +1154,13 @@ func (*fakeCredentialService) Restore(
 
 type fakeAgentService struct{}
 
+func (service fakeAgentService) InspectAuthentication(
+	ctx context.Context,
+	raw string,
+) (agents.AuthenticatedPrincipal, error) {
+	return service.Authenticate(ctx, raw)
+}
+
 func (fakeAgentService) Authenticate(
 	context.Context,
 	string,
@@ -1213,6 +1221,19 @@ func (fakeAgentService) ListUsage(
 type countingAgentService struct {
 	fakeAgentService
 	authenticateCalls atomic.Int64
+	inspectCalls      atomic.Int64
+	inspectError      error
+}
+
+func (service *countingAgentService) InspectAuthentication(
+	ctx context.Context,
+	raw string,
+) (agents.AuthenticatedPrincipal, error) {
+	service.inspectCalls.Add(1)
+	if service.inspectError != nil {
+		return agents.AuthenticatedPrincipal{}, service.inspectError
+	}
+	return service.fakeAgentService.InspectAuthentication(ctx, raw)
 }
 
 func (service *countingAgentService) Authenticate(
@@ -1346,10 +1367,12 @@ func TestCredentialLimiterSeparatesAgentAndHumanSubjects(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	limiter := agents.NewLimiter(agents.LimiterConfig{
 		Capacity: map[agents.Operation]int{
-			agents.OperationCredentialList: 1,
+			agents.OperationAgentCredentialList: 1,
+			agents.OperationHumanCredentialList: 1,
 		},
 		RefillPerSecond: map[agents.Operation]float64{
-			agents.OperationCredentialList: 0.000001,
+			agents.OperationAgentCredentialList: 0.000001,
+			agents.OperationHumanCredentialList: 0.000001,
 		},
 	})
 	credentialService := &fakeCredentialService{actualSpaceID: "spc_test"}
@@ -1400,12 +1423,12 @@ func TestSuccessfulAgentAuthenticationDoesNotSpendFailureBudget(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	limiter := agents.NewLimiter(agents.LimiterConfig{
 		Capacity: map[agents.Operation]int{
-			agents.OperationAuthFailure:    1,
-			agents.OperationCredentialList: 10,
+			agents.OperationAuthFailure:         1,
+			agents.OperationAgentCredentialList: 10,
 		},
 		RefillPerSecond: map[agents.Operation]float64{
-			agents.OperationAuthFailure:    0.000001,
-			agents.OperationCredentialList: 1,
+			agents.OperationAuthFailure:         0.000001,
+			agents.OperationAgentCredentialList: 1,
 		},
 	})
 	handler := newTestHandler(Dependencies{
@@ -1444,12 +1467,12 @@ func TestProtectedRequestQuotaRunsBeforeHumanSessionAndAuditWrites(t *testing.T)
 		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
 		Limiter: agents.NewLimiter(agents.LimiterConfig{
 			Capacity: map[agents.Operation]int{
-				agents.OperationRequestSource: 10,
-				agents.OperationRequestRead:   2,
+				agents.OperationHumanRequestReadSource: 10,
+				agents.OperationHumanRequestRead:       2,
 			},
 			RefillPerSecond: map[agents.Operation]float64{
-				agents.OperationRequestSource: 0.000001,
-				agents.OperationRequestRead:   0.000001,
+				agents.OperationHumanRequestReadSource: 0.000001,
+				agents.OperationHumanRequestRead:       0.000001,
 			},
 		}),
 	})
@@ -1487,12 +1510,12 @@ func TestProtectedSourceQuotaBoundsRotatingHumanTokens(t *testing.T) {
 		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
 		Limiter: agents.NewLimiter(agents.LimiterConfig{
 			Capacity: map[agents.Operation]int{
-				agents.OperationRequestSource: 3,
-				agents.OperationRequestRead:   10,
+				agents.OperationHumanRequestReadSource: 3,
+				agents.OperationHumanRequestRead:       10,
 			},
 			RefillPerSecond: map[agents.Operation]float64{
-				agents.OperationRequestSource: 0.000001,
-				agents.OperationRequestRead:   0.000001,
+				agents.OperationHumanRequestReadSource: 0.000001,
+				agents.OperationHumanRequestRead:       0.000001,
 			},
 		}),
 	})
@@ -1539,12 +1562,12 @@ func TestProtectedAssetQuotaRunsBeforeAgentLastUsedAndIsNamespaced(t *testing.T)
 		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
 		Limiter: agents.NewLimiter(agents.LimiterConfig{
 			Capacity: map[agents.Operation]int{
-				agents.OperationRequestSource: 10,
-				agents.OperationRequestRead:   1,
+				agents.OperationAgentRequestReadSource: 10,
+				agents.OperationAgentRequestRead:       1,
 			},
 			RefillPerSecond: map[agents.Operation]float64{
-				agents.OperationRequestSource: 0.000001,
-				agents.OperationRequestRead:   0.000001,
+				agents.OperationAgentRequestReadSource: 0.000001,
+				agents.OperationAgentRequestRead:       0.000001,
 			},
 		}),
 	})
@@ -1564,8 +1587,82 @@ func TestProtectedAssetQuotaRunsBeforeAgentLastUsedAndIsNamespaced(t *testing.T)
 	if calls := agentService.authenticateCalls.Load(); calls != 1 {
 		t.Fatalf("Agent last-used writes=%d want 1", calls)
 	}
+	if calls := agentService.inspectCalls.Load(); calls != 4 {
+		t.Fatalf("Agent read-only inspections=%d want 4", calls)
+	}
 	if recorder.eventCount() != 1 {
 		t.Fatalf("Agent success audit writes=%d want 1", recorder.eventCount())
+	}
+}
+
+func TestInvalidAgentTokenRotationNeverCreatesEstablishedLimiterState(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := agents.NewLimiter(agents.LimiterConfig{
+		Capacity: map[agents.Operation]int{
+			agents.OperationAgentRequestReadSource: 30_000,
+			agents.OperationAgentRequestRead:       30_000,
+		},
+		RefillPerSecond: map[agents.Operation]float64{
+			agents.OperationAgentRequestReadSource: 0.000001,
+			agents.OperationAgentRequestRead:       0.000001,
+		},
+		MaxSubjects: 10_000,
+	})
+	agentService := &countingAgentService{
+		inspectError: agents.ErrAuthenticationFailed,
+	}
+	recorder := &recordingAuthAudit{}
+	handler := newTestHandler(Dependencies{
+		Identity: &fakeIdentityService{}, Spaces: fakeSpaceService{},
+		Assets: &fakeAssetService{}, Agents: agentService, AuthAudit: recorder,
+		Limiter: limiter, Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
+	})
+	started := time.Now()
+	for index := range 20_000 {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("unknown-agent-%d", index)))
+		raw := "owat_" + base64.RawURLEncoding.EncodeToString(sum[:])
+		request := httptest.NewRequest(
+			http.MethodGet, "/api/v1/spaces/spc_test/assets", nil,
+		)
+		request.RemoteAddr = "198.51.100.231:4242"
+		request.Header.Set("Authorization", "Bearer "+raw)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized &&
+			response.Code != http.StatusTooManyRequests {
+			t.Fatalf("request %d status=%d", index, response.Code)
+		}
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("invalid Agent rotation took %s", elapsed)
+	}
+	if count := limiter.SubjectCountFor(
+		agents.OperationAgentRequestReadSource,
+	); count != 1 {
+		t.Fatalf("source subjects=%d want 1", count)
+	}
+	if count := limiter.SubjectCountFor(
+		agents.OperationAgentRequestRead,
+	); count != 0 {
+		t.Fatalf("invalid Agent tokens created %d strict subjects", count)
+	}
+	if work := limiter.WorkUnitsFor(
+		agents.OperationAgentRequestRead,
+	); work != 0 {
+		t.Fatalf("invalid Agent strict work=%d want 0", work)
+	}
+	if calls := agentService.inspectCalls.Load(); calls != 20_000 {
+		t.Fatalf("read-only inspections=%d want 20000", calls)
+	}
+	if calls := agentService.authenticateCalls.Load(); calls != 0 {
+		t.Fatalf("invalid tokens reached last-used writer %d times", calls)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	for _, event := range recorder.events {
+		if event.Success {
+			t.Fatalf("invalid token wrote success audit event: %+v", event)
+		}
 	}
 }
 
@@ -1573,12 +1670,12 @@ func TestInvalidJWTRotationUsesOnlyBoundedSourceAdmission(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	limiter := agents.NewLimiter(agents.LimiterConfig{
 		Capacity: map[agents.Operation]int{
-			agents.OperationRequestSource: 30_000,
-			agents.OperationRequestRead:   30_000,
+			agents.OperationHumanRequestReadSource: 30_000,
+			agents.OperationHumanRequestRead:       30_000,
 		},
 		RefillPerSecond: map[agents.Operation]float64{
-			agents.OperationRequestSource: 0.000001,
-			agents.OperationRequestRead:   0.000001,
+			agents.OperationHumanRequestReadSource: 0.000001,
+			agents.OperationHumanRequestRead:       0.000001,
 		},
 		MaxSubjects: 128,
 	})
@@ -1604,13 +1701,19 @@ func TestInvalidJWTRotationUsesOnlyBoundedSourceAdmission(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("invalid JWT rotation took %s", elapsed)
 	}
-	if count := limiter.SubjectCountFor(agents.OperationRequestSource); count != 1 {
+	if count := limiter.SubjectCountFor(
+		agents.OperationHumanRequestReadSource,
+	); count != 1 {
 		t.Fatalf("source subjects=%d want 1", count)
 	}
-	if count := limiter.SubjectCountFor(agents.OperationRequestRead); count != 0 {
+	if count := limiter.SubjectCountFor(
+		agents.OperationHumanRequestRead,
+	); count != 0 {
 		t.Fatalf("invalid JWTs created %d strict subjects", count)
 	}
-	if work := limiter.WorkUnitsFor(agents.OperationRequestRead); work != 0 {
+	if work := limiter.WorkUnitsFor(
+		agents.OperationHumanRequestRead,
+	); work != 0 {
 		t.Fatalf("invalid JWT strict work=%d want 0", work)
 	}
 	if service.resolveCalls.Load() != 0 {
@@ -1637,12 +1740,12 @@ func TestRefreshedJWTsShareStableSessionQuotaAcrossSources(t *testing.T) {
 		Clock: clock, MasterKey: [32]byte{1},
 		Limiter: agents.NewLimiter(agents.LimiterConfig{
 			Capacity: map[agents.Operation]int{
-				agents.OperationRequestSource: 20,
-				agents.OperationRequestWrite:  2,
+				agents.OperationHumanRequestWriteSource: 20,
+				agents.OperationHumanRequestWrite:       2,
 			},
 			RefillPerSecond: map[agents.Operation]float64{
-				agents.OperationRequestSource: 0.000001,
-				agents.OperationRequestWrite:  0.000001,
+				agents.OperationHumanRequestWriteSource: 0.000001,
+				agents.OperationHumanRequestWrite:       0.000001,
 			},
 		}),
 	})

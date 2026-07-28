@@ -537,7 +537,7 @@ func (service *Service) Authenticate(
 		if affected != 1 {
 			return authenticationFailed(ErrInvalidToken)
 		}
-		grants, err := service.repository.grantsTx(ctx, tx, token.AgentID)
+		grants, err := service.repository.grants(ctx, tx, token.AgentID)
 		if err != nil {
 			return err
 		}
@@ -552,6 +552,46 @@ func (service *Service) Authenticate(
 		return AuthenticatedPrincipal{}, err
 	}
 	return cloneAuthenticatedPrincipal(principal), nil
+}
+
+// InspectAuthentication verifies an Agent token and reads its current grants
+// without mutating token usage or writing audit data. Callers must still use
+// Authenticate for the authoritative check immediately before authorization.
+func (service *Service) InspectAuthentication(
+	ctx context.Context,
+	raw string,
+) (AuthenticatedPrincipal, error) {
+	if !validRawToken(raw) {
+		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidToken)
+	}
+	now := service.clock.Now().UTC()
+	if now.IsZero() {
+		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidClock)
+	}
+	hash := sha256.Sum256([]byte(raw))
+	defer clear(hash[:])
+	token, found, err := service.repository.tokenByHash(
+		ctx, service.repository.db.Reader, hash[:],
+	)
+	if err != nil {
+		return AuthenticatedPrincipal{}, err
+	}
+	if !found {
+		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidToken)
+	}
+	if err := validateAuthenticationCandidate(token, raw, hash[:], now); err != nil {
+		return AuthenticatedPrincipal{}, err
+	}
+	grants, err := service.repository.grants(
+		ctx, service.repository.db.Reader, token.AgentID,
+	)
+	if err != nil {
+		return AuthenticatedPrincipal{}, err
+	}
+	return cloneAuthenticatedPrincipal(AuthenticatedPrincipal{
+		AgentID: token.AgentID, TokenID: token.ID,
+		TokenPrefix: token.Prefix, Grants: grants,
+	}), nil
 }
 
 func validateAuthenticationCandidate(

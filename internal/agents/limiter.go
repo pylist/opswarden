@@ -9,17 +9,31 @@ import (
 type Operation string
 
 const (
-	OperationAuthFailure       Operation = "auth_failure"
-	OperationBootstrap         Operation = "bootstrap"
-	OperationLoginSource       Operation = "login_source"
-	OperationReverifySource    Operation = "reverify_source"
-	OperationReverifyPrincipal Operation = "reverify_principal"
-	OperationRequestSource     Operation = "request_source"
-	OperationRequestRead       Operation = "request_read"
-	OperationRequestWrite      Operation = "request_write"
-	OperationCredentialList    Operation = "credential_list"
-	OperationCredentialRead    Operation = "credential_read"
-	OperationCredentialWrite   Operation = "credential_write"
+	OperationAuthFailure                Operation = "auth_failure"
+	OperationBootstrap                  Operation = "bootstrap"
+	OperationLoginSource                Operation = "login_source"
+	OperationReverifySource             Operation = "reverify_source"
+	OperationReverifyPrincipal          Operation = "reverify_principal"
+	OperationHumanRequestReadSource     Operation = "human_request_read_source"
+	OperationHumanRequestWriteSource    Operation = "human_request_write_source"
+	OperationAgentRequestReadSource     Operation = "agent_request_read_source"
+	OperationAgentRequestWriteSource    Operation = "agent_request_write_source"
+	OperationHumanCredentialListSource  Operation = "human_credential_list_source"
+	OperationHumanCredentialReadSource  Operation = "human_credential_read_source"
+	OperationHumanCredentialWriteSource Operation = "human_credential_write_source"
+	OperationAgentCredentialListSource  Operation = "agent_credential_list_source"
+	OperationAgentCredentialReadSource  Operation = "agent_credential_read_source"
+	OperationAgentCredentialWriteSource Operation = "agent_credential_write_source"
+	OperationHumanRequestRead           Operation = "human_request_read"
+	OperationHumanRequestWrite          Operation = "human_request_write"
+	OperationAgentRequestRead           Operation = "agent_request_read"
+	OperationAgentRequestWrite          Operation = "agent_request_write"
+	OperationHumanCredentialList        Operation = "human_credential_list"
+	OperationHumanCredentialRead        Operation = "human_credential_read"
+	OperationHumanCredentialWrite       Operation = "human_credential_write"
+	OperationAgentCredentialList        Operation = "agent_credential_list"
+	OperationAgentCredentialRead        Operation = "agent_credential_read"
+	OperationAgentCredentialWrite       Operation = "agent_credential_write"
 )
 
 var allOperations = []Operation{
@@ -28,19 +42,36 @@ var allOperations = []Operation{
 	OperationLoginSource,
 	OperationReverifySource,
 	OperationReverifyPrincipal,
-	OperationRequestSource,
-	OperationRequestRead,
-	OperationRequestWrite,
-	OperationCredentialList,
-	OperationCredentialRead,
-	OperationCredentialWrite,
+	OperationHumanRequestReadSource,
+	OperationHumanRequestWriteSource,
+	OperationAgentRequestReadSource,
+	OperationAgentRequestWriteSource,
+	OperationHumanCredentialListSource,
+	OperationHumanCredentialReadSource,
+	OperationHumanCredentialWriteSource,
+	OperationAgentCredentialListSource,
+	OperationAgentCredentialReadSource,
+	OperationAgentCredentialWriteSource,
+	OperationHumanRequestRead,
+	OperationHumanRequestWrite,
+	OperationAgentRequestRead,
+	OperationAgentRequestWrite,
+	OperationHumanCredentialList,
+	OperationHumanCredentialRead,
+	OperationHumanCredentialWrite,
+	OperationAgentCredentialList,
+	OperationAgentCredentialRead,
+	OperationAgentCredentialWrite,
 }
 
 type LimiterConfig struct {
 	Capacity        map[Operation]int
 	RefillPerSecond map[Operation]float64
 	MaxSubjects     int
-	IdleTTL         time.Duration
+	// GenerationTTL sets the generation phase length. Inactive state receives
+	// one previous-generation grace phase before reclamation. Each operation
+	// clamps it to at least its capacity/refill full-recovery duration.
+	GenerationTTL time.Duration
 }
 
 type Decision struct {
@@ -61,10 +92,11 @@ type Reservation struct {
 }
 
 type reservationItem struct {
-	subject   string
-	operation Operation
-	overflow  bool
-	units     float64
+	subject    string
+	operation  Operation
+	overflow   bool
+	units      float64
+	generation uint64
 }
 
 func (reservation *Reservation) Commit() {
@@ -97,53 +129,95 @@ type limiterBucket struct {
 }
 
 type Limiter struct {
-	mu          sync.Mutex
-	capacity    map[Operation]float64
-	refill      map[Operation]float64
-	maxSubjects int
-	buckets     map[Operation]map[string]*limiterBucket
-	overflow    map[Operation]*limiterBucket
-	lastNow     map[Operation]time.Time
-	workUnits   map[Operation]uint64
+	mu               sync.Mutex
+	capacity         map[Operation]float64
+	refill           map[Operation]float64
+	maxSubjects      int
+	buckets          map[Operation]map[string]*limiterBucket
+	previousBuckets  map[Operation]map[string]*limiterBucket
+	overflow         map[Operation]*limiterBucket
+	previousOverflow map[Operation]*limiterBucket
+	lastNow          map[Operation]time.Time
+	workUnits        map[Operation]uint64
+	generationTTL    map[Operation]time.Duration
+	generationStart  map[Operation]time.Time
+	generation       map[Operation]uint64
 }
 
 func NewLimiter(config LimiterConfig) *Limiter {
 	if config.MaxSubjects <= 0 {
 		config.MaxSubjects = 10_000
 	}
-	if config.IdleTTL <= 0 {
-		config.IdleTTL = 15 * time.Minute
+	if config.GenerationTTL <= 0 {
+		config.GenerationTTL = 15 * time.Minute
 	}
 	limiter := &Limiter{
-		capacity:    make(map[Operation]float64, len(allOperations)),
-		refill:      make(map[Operation]float64, len(allOperations)),
-		maxSubjects: config.MaxSubjects,
-		buckets:     make(map[Operation]map[string]*limiterBucket),
-		overflow:    make(map[Operation]*limiterBucket),
-		lastNow:     make(map[Operation]time.Time),
-		workUnits:   make(map[Operation]uint64),
+		capacity:         make(map[Operation]float64, len(allOperations)),
+		refill:           make(map[Operation]float64, len(allOperations)),
+		maxSubjects:      config.MaxSubjects,
+		buckets:          make(map[Operation]map[string]*limiterBucket),
+		previousBuckets:  make(map[Operation]map[string]*limiterBucket),
+		overflow:         make(map[Operation]*limiterBucket),
+		previousOverflow: make(map[Operation]*limiterBucket),
+		lastNow:          make(map[Operation]time.Time),
+		workUnits:        make(map[Operation]uint64),
+		generationTTL:    make(map[Operation]time.Duration, len(allOperations)),
+		generationStart:  make(map[Operation]time.Time, len(allOperations)),
+		generation:       make(map[Operation]uint64, len(allOperations)),
 	}
 	defaultCapacity := map[Operation]int{
-		OperationAuthFailure: 5, OperationCredentialList: 60,
-		OperationBootstrap:         2,
-		OperationLoginSource:       20,
-		OperationReverifySource:    10,
-		OperationReverifyPrincipal: 5,
-		OperationRequestSource:     200,
-		OperationRequestRead:       120,
-		OperationRequestWrite:      60,
-		OperationCredentialRead:    30, OperationCredentialWrite: 20,
+		OperationAuthFailure:                5,
+		OperationBootstrap:                  2,
+		OperationLoginSource:                20,
+		OperationReverifySource:             10,
+		OperationReverifyPrincipal:          5,
+		OperationHumanRequestReadSource:     200,
+		OperationHumanRequestWriteSource:    200,
+		OperationAgentRequestReadSource:     200,
+		OperationAgentRequestWriteSource:    200,
+		OperationHumanCredentialListSource:  200,
+		OperationHumanCredentialReadSource:  200,
+		OperationHumanCredentialWriteSource: 200,
+		OperationAgentCredentialListSource:  200,
+		OperationAgentCredentialReadSource:  200,
+		OperationAgentCredentialWriteSource: 200,
+		OperationHumanRequestRead:           120,
+		OperationHumanRequestWrite:          60,
+		OperationAgentRequestRead:           120,
+		OperationAgentRequestWrite:          60,
+		OperationHumanCredentialList:        60,
+		OperationHumanCredentialRead:        30,
+		OperationHumanCredentialWrite:       20,
+		OperationAgentCredentialList:        60,
+		OperationAgentCredentialRead:        30,
+		OperationAgentCredentialWrite:       20,
 	}
 	defaultRefill := map[Operation]float64{
-		OperationAuthFailure: 1.0 / 60, OperationCredentialList: 1,
-		OperationBootstrap:         1.0 / 60,
-		OperationLoginSource:       1.0 / 6,
-		OperationReverifySource:    1.0 / 30,
-		OperationReverifyPrincipal: 1.0 / 60,
-		OperationRequestSource:     10,
-		OperationRequestRead:       2,
-		OperationRequestWrite:      1,
-		OperationCredentialRead:    0.5, OperationCredentialWrite: 1.0 / 3,
+		OperationAuthFailure:                1.0 / 60,
+		OperationBootstrap:                  1.0 / 60,
+		OperationLoginSource:                1.0 / 6,
+		OperationReverifySource:             1.0 / 30,
+		OperationReverifyPrincipal:          1.0 / 60,
+		OperationHumanRequestReadSource:     10,
+		OperationHumanRequestWriteSource:    10,
+		OperationAgentRequestReadSource:     10,
+		OperationAgentRequestWriteSource:    10,
+		OperationHumanCredentialListSource:  10,
+		OperationHumanCredentialReadSource:  10,
+		OperationHumanCredentialWriteSource: 10,
+		OperationAgentCredentialListSource:  10,
+		OperationAgentCredentialReadSource:  10,
+		OperationAgentCredentialWriteSource: 10,
+		OperationHumanRequestRead:           2,
+		OperationHumanRequestWrite:          1,
+		OperationAgentRequestRead:           2,
+		OperationAgentRequestWrite:          1,
+		OperationHumanCredentialList:        1,
+		OperationHumanCredentialRead:        0.5,
+		OperationHumanCredentialWrite:       1.0 / 3,
+		OperationAgentCredentialList:        1,
+		OperationAgentCredentialRead:        0.5,
+		OperationAgentCredentialWrite:       1.0 / 3,
 	}
 	for _, operation := range allOperations {
 		capacity := config.Capacity[operation]
@@ -156,7 +230,12 @@ func NewLimiter(config LimiterConfig) *Limiter {
 		}
 		limiter.capacity[operation] = float64(capacity)
 		limiter.refill[operation] = refill
+		limiter.generationTTL[operation] = max(
+			config.GenerationTTL,
+			naturalRecoveryDuration(float64(capacity), refill),
+		)
 		limiter.buckets[operation] = make(map[string]*limiterBucket)
+		limiter.previousBuckets[operation] = make(map[string]*limiterBucket)
 	}
 	return limiter
 }
@@ -217,11 +296,16 @@ func (limiter *Limiter) Reserve(
 	}
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
+	operations := make(map[Operation]struct{}, len(unique))
 	for _, request := range unique {
 		if last := limiter.lastNow[request.Operation]; !last.IsZero() &&
 			now.Before(last) {
 			return nil, Decision{RetryAfter: last.Sub(now)}
 		}
+		operations[request.Operation] = struct{}{}
+	}
+	for operation := range operations {
+		limiter.rotateGenerationLocked(operation, now)
 	}
 	staged := make([]stagedBucket, 0, len(unique))
 	stagedIndexes := make(map[stagedKey]int, len(unique))
@@ -229,7 +313,9 @@ func (limiter *Limiter) Reserve(
 	var retryAfter time.Duration
 	for _, request := range unique {
 		capacity := limiter.capacity[request.Operation]
-		bucket := limiter.buckets[request.Operation][request.Subject]
+		bucket := limiter.subjectBucketLocked(
+			request.Operation, request.Subject,
+		)
 		limiter.workUnits[request.Operation]++
 		key := stagedKey{
 			operation: request.Operation,
@@ -237,14 +323,14 @@ func (limiter *Limiter) Reserve(
 		}
 		create := false
 		if bucket == nil {
-			if len(limiter.buckets[request.Operation])+
+			if limiter.subjectCountLocked(request.Operation)+
 				pendingNew[request.Operation] < limiter.maxSubjects {
 				pendingNew[request.Operation]++
 				create = true
 			} else {
 				key.subject = ""
 				key.overflow = true
-				bucket = limiter.overflow[request.Operation]
+				bucket = limiter.overflowBucketLocked(request.Operation)
 			}
 		}
 		if index, exists := stagedIndexes[key]; exists {
@@ -304,23 +390,12 @@ func (limiter *Limiter) Reserve(
 		reservationItems = append(reservationItems, reservationItem{
 			subject: item.key.subject, operation: item.key.operation,
 			overflow: item.key.overflow, units: item.spend,
+			generation: limiter.generation[item.key.operation],
 		})
 	}
 	return &Reservation{
 		limiter: limiter, items: reservationItems,
 	}, Decision{Allowed: true}
-}
-
-// Refund returns one previously reserved token. It is used when a request was
-// admitted pessimistically but did not end in the failure being limited.
-func (limiter *Limiter) Refund(
-	subject string,
-	operation Operation,
-	now time.Time,
-) {
-	limiter.refundMany([]reservationItem{{
-		subject: subject, operation: operation, units: 1,
-	}}, now)
 }
 
 func (limiter *Limiter) refundMany(
@@ -336,7 +411,12 @@ func (limiter *Limiter) refundMany(
 	for _, item := range items {
 		capacity, known := limiter.capacity[item.operation]
 		if !known || (!item.overflow && item.subject == "") ||
-			item.units <= 0 {
+			item.units <= 0 ||
+			item.generation != limiter.generation[item.operation] {
+			continue
+		}
+		if last := limiter.lastNow[item.operation]; !last.IsZero() &&
+			now.Before(last) {
 			continue
 		}
 		var bucket *limiterBucket
@@ -359,6 +439,7 @@ func (limiter *Limiter) refundMany(
 			bucket.lastSeen = now
 		}
 		bucket.tokens = math.Min(capacity, bucket.tokens+item.units)
+		limiter.lastNow[item.operation] = now
 	}
 }
 
@@ -382,21 +463,22 @@ func (limiter *Limiter) decide(
 	if last := limiter.lastNow[operation]; !last.IsZero() && now.Before(last) {
 		return Decision{RetryAfter: last.Sub(now)}
 	}
+	limiter.rotateGenerationLocked(operation, now)
 	limiter.lastNow[operation] = now
 	subjects := limiter.buckets[operation]
-	bucket, exists := subjects[subject]
+	bucket := limiter.subjectBucketLocked(operation, subject)
 	limiter.workUnits[operation]++
-	if !exists {
+	if bucket == nil {
 		if !consume {
-			if len(subjects) < limiter.maxSubjects {
+			if limiter.subjectCountLocked(operation) < limiter.maxSubjects {
 				return Decision{Allowed: true}
 			}
-			bucket = limiter.overflow[operation]
+			bucket = limiter.overflowBucketLocked(operation)
 			if bucket == nil {
 				return Decision{Allowed: true}
 			}
-		} else if len(subjects) >= limiter.maxSubjects {
-			bucket = limiter.overflow[operation]
+		} else if limiter.subjectCountLocked(operation) >= limiter.maxSubjects {
+			bucket = limiter.overflowBucketLocked(operation)
 			if bucket == nil {
 				bucket = &limiterBucket{
 					tokens: capacity, last: now, lastSeen: now,
@@ -429,6 +511,77 @@ func (limiter *Limiter) decide(
 	return Decision{Allowed: true}
 }
 
+func (limiter *Limiter) rotateGenerationLocked(
+	operation Operation,
+	now time.Time,
+) {
+	start := limiter.generationStart[operation]
+	if start.IsZero() {
+		limiter.generationStart[operation] = now
+		return
+	}
+	if now.Sub(start) < limiter.generationTTL[operation] {
+		return
+	}
+	// Keep one grace generation. A bucket used during the next generation is
+	// migrated into the current map in O(1); only an entire generation of
+	// inactivity makes it eligible for this O(1) map replacement.
+	limiter.previousBuckets[operation] = limiter.buckets[operation]
+	limiter.previousOverflow[operation] = limiter.overflow[operation]
+	limiter.buckets[operation] = make(map[string]*limiterBucket)
+	limiter.overflow[operation] = nil
+	limiter.generation[operation]++
+	limiter.generationStart[operation] = now
+	limiter.workUnits[operation]++
+}
+
+func (limiter *Limiter) subjectBucketLocked(
+	operation Operation,
+	subject string,
+) *limiterBucket {
+	if bucket := limiter.buckets[operation][subject]; bucket != nil {
+		return bucket
+	}
+	bucket := limiter.previousBuckets[operation][subject]
+	if bucket == nil {
+		return nil
+	}
+	delete(limiter.previousBuckets[operation], subject)
+	limiter.buckets[operation][subject] = bucket
+	return bucket
+}
+
+func (limiter *Limiter) overflowBucketLocked(
+	operation Operation,
+) *limiterBucket {
+	if bucket := limiter.overflow[operation]; bucket != nil {
+		return bucket
+	}
+	bucket := limiter.previousOverflow[operation]
+	if bucket == nil {
+		return nil
+	}
+	limiter.previousOverflow[operation] = nil
+	limiter.overflow[operation] = bucket
+	return bucket
+}
+
+func (limiter *Limiter) subjectCountLocked(operation Operation) int {
+	return len(limiter.buckets[operation]) +
+		len(limiter.previousBuckets[operation])
+}
+
+func naturalRecoveryDuration(
+	capacity float64,
+	refillPerSecond float64,
+) time.Duration {
+	recoveryNanoseconds := capacity / refillPerSecond * float64(time.Second)
+	if recoveryNanoseconds >= float64(math.MaxInt64) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(math.Ceil(recoveryNanoseconds))
+}
+
 func (limiter *Limiter) SubjectCount() int {
 	if limiter == nil {
 		return 0
@@ -437,6 +590,9 @@ func (limiter *Limiter) SubjectCount() int {
 	defer limiter.mu.Unlock()
 	count := 0
 	for _, subjects := range limiter.buckets {
+		count += len(subjects)
+	}
+	for _, subjects := range limiter.previousBuckets {
 		count += len(subjects)
 	}
 	return count
@@ -448,7 +604,7 @@ func (limiter *Limiter) SubjectCountFor(operation Operation) int {
 	}
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
-	return len(limiter.buckets[operation])
+	return limiter.subjectCountLocked(operation)
 }
 
 func (limiter *Limiter) WorkUnitsFor(operation Operation) uint64 {

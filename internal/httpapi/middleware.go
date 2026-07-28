@@ -23,6 +23,12 @@ type responseCapture struct {
 }
 
 type verifiedJWTContextKey struct{}
+type inspectedAgentContextKey struct{}
+
+type inspectedAgentIdentity struct {
+	agentID string
+	tokenID string
+}
 
 func (capture *responseCapture) WriteHeader(status int) {
 	if capture.status == 0 {
@@ -132,13 +138,15 @@ func (router *Router) rateLimitMiddleware(next http.Handler) http.Handler {
 			if strings.HasPrefix(raw, "owat_") {
 				tokenKind = "agent"
 			}
-			operation := preAuthenticationOperation(request)
+			isAgent := tokenKind == "agent"
+			operation := preAuthenticationOperation(request, isAgent)
+			sourceOperation := preAuthenticationSourceOperation(operation)
 			metadata := requestMetadataFromContext(request.Context())
 			reservation, decision := router.deps.Limiter.Reserve(
 				[]agents.LimitRequest{{
 					Subject: "preauth-source:" + tokenKind + ":" +
 						string(operation) + ":" + metadata.sourceIP,
-					Operation: agents.OperationRequestSource,
+					Operation: sourceOperation,
 				}},
 				router.deps.Clock.Now(),
 			)
@@ -148,9 +156,34 @@ func (router *Router) rateLimitMiddleware(next http.Handler) http.Handler {
 			}
 			reservation.Commit()
 			var strictSubject string
-			if tokenKind == "agent" {
+			if isAgent {
+				if router.deps.Agents == nil || !routeAllowsAgent(request) {
+					router.rejectAnonymousAuthentication(
+						writer, request, "auth.agent", "INVALID_AGENT_BEARER",
+					)
+					return
+				}
+				inspected, err := router.deps.Agents.InspectAuthentication(
+					request.Context(), raw,
+				)
+				if err != nil || inspected.AgentID == "" || inspected.TokenID == "" {
+					router.rejectAnonymousAuthentication(
+						writer, request, "auth.agent", "INVALID_AGENT_BEARER",
+					)
+					return
+				}
 				strictSubject = "preauth-agent:" +
-					inMemoryBearerFingerprint(raw)
+					inMemoryBearerFingerprint(
+						inspected.AgentID+"\x00"+inspected.TokenID+
+							"\x00"+raw,
+					)
+				ctx := context.WithValue(
+					request.Context(), inspectedAgentContextKey{},
+					inspectedAgentIdentity{
+						agentID: inspected.AgentID, tokenID: inspected.TokenID,
+					},
+				)
+				request = request.WithContext(ctx)
 			} else if router.jwt != nil {
 				claims, err := router.jwt.verify(raw)
 				if err == nil {
@@ -264,7 +297,12 @@ func (router *Router) authenticationMiddleware(next http.Handler) http.Handler {
 				return
 			}
 			principal, err := router.deps.Agents.Authenticate(request.Context(), raw)
-			if err != nil {
+			inspected, inspectedOK := request.Context().Value(
+				inspectedAgentContextKey{},
+			).(inspectedAgentIdentity)
+			if err != nil || !inspectedOK ||
+				principal.AgentID != inspected.agentID ||
+				principal.TokenID != inspected.tokenID {
 				router.rejectAnonymousAuthentication(
 					writer, request, "auth.agent", "INVALID_AGENT_BEARER",
 				)
@@ -342,19 +380,62 @@ func inMemoryBearerFingerprint(raw string) string {
 	return fingerprint
 }
 
-func preAuthenticationOperation(request *http.Request) agents.Operation {
-	if operation, limited := credentialOperation(request); limited {
+func preAuthenticationOperation(
+	request *http.Request,
+	isAgent bool,
+) agents.Operation {
+	if operation, limited := credentialOperation(request, isAgent); limited {
 		return operation
+	}
+	if isAgent {
+		switch request.Method {
+		case http.MethodGet, http.MethodHead:
+			return agents.OperationAgentRequestRead
+		default:
+			return agents.OperationAgentRequestWrite
+		}
 	}
 	switch request.Method {
 	case http.MethodGet, http.MethodHead:
-		return agents.OperationRequestRead
+		return agents.OperationHumanRequestRead
 	default:
-		return agents.OperationRequestWrite
+		return agents.OperationHumanRequestWrite
 	}
 }
 
-func credentialOperation(request *http.Request) (agents.Operation, bool) {
+func preAuthenticationSourceOperation(
+	operation agents.Operation,
+) agents.Operation {
+	switch operation {
+	case agents.OperationHumanRequestRead:
+		return agents.OperationHumanRequestReadSource
+	case agents.OperationHumanRequestWrite:
+		return agents.OperationHumanRequestWriteSource
+	case agents.OperationAgentRequestRead:
+		return agents.OperationAgentRequestReadSource
+	case agents.OperationAgentRequestWrite:
+		return agents.OperationAgentRequestWriteSource
+	case agents.OperationHumanCredentialList:
+		return agents.OperationHumanCredentialListSource
+	case agents.OperationHumanCredentialRead:
+		return agents.OperationHumanCredentialReadSource
+	case agents.OperationHumanCredentialWrite:
+		return agents.OperationHumanCredentialWriteSource
+	case agents.OperationAgentCredentialList:
+		return agents.OperationAgentCredentialListSource
+	case agents.OperationAgentCredentialRead:
+		return agents.OperationAgentCredentialReadSource
+	case agents.OperationAgentCredentialWrite:
+		return agents.OperationAgentCredentialWriteSource
+	default:
+		return ""
+	}
+}
+
+func credentialOperation(
+	request *http.Request,
+	isAgent bool,
+) (agents.Operation, bool) {
 	segments := pathSegments(request.URL.Path)
 	if len(segments) < 5 || segments[0] != "api" || segments[1] != "v1" ||
 		segments[2] != "spaces" || segments[4] != "credentials" {
@@ -363,13 +444,22 @@ func credentialOperation(request *http.Request) (agents.Operation, bool) {
 	switch request.Method {
 	case http.MethodGet:
 		if len(segments) == 5 {
-			return agents.OperationCredentialList, true
+			if isAgent {
+				return agents.OperationAgentCredentialList, true
+			}
+			return agents.OperationHumanCredentialList, true
 		}
 		if len(segments) == 6 {
-			return agents.OperationCredentialRead, true
+			if isAgent {
+				return agents.OperationAgentCredentialRead, true
+			}
+			return agents.OperationHumanCredentialRead, true
 		}
 	case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
-		return agents.OperationCredentialWrite, true
+		if isAgent {
+			return agents.OperationAgentCredentialWrite, true
+		}
+		return agents.OperationHumanCredentialWrite, true
 	}
 	return "", false
 }

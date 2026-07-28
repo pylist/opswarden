@@ -350,6 +350,76 @@ func TestGrantValidationAndFreshAuthentication(t *testing.T) {
 	}
 }
 
+func TestInspectAuthenticationIsReadOnlyAndReturnsCurrentGrants(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	issued, err := h.service.IssueToken(
+		h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grantContext := h.member
+	grantContext.IdempotencyKey = "inspect-grant"
+	if err := h.service.SetGrant(h.ctx, grantContext, agent.ID, Grant{
+		SpaceID: h.spaceID,
+		Scopes:  []authorization.Scope{authorization.ScopeCredentialRead},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	auditCount := len(h.audit.seen)
+
+	principal, err := h.service.InspectAuthentication(h.ctx, issued.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if principal.AgentID != agent.ID || principal.TokenID != issued.ID ||
+		len(principal.Grants) != 1 ||
+		len(principal.Grants[0].Scopes) != 1 ||
+		principal.Grants[0].Scopes[0] != authorization.ScopeCredentialRead {
+		t.Fatalf("unexpected inspected principal: %+v", principal)
+	}
+	var lastUsedAt sql.NullString
+	if err := h.db.Reader.QueryRow(`
+		SELECT last_used_at FROM agent_tokens WHERE id = ?
+	`, issued.ID).Scan(&lastUsedAt); err != nil {
+		t.Fatal(err)
+	}
+	if lastUsedAt.Valid {
+		t.Fatalf("inspection updated last_used_at=%q", lastUsedAt.String)
+	}
+	if len(h.audit.seen) != auditCount {
+		t.Fatalf("inspection wrote audit events: before=%d after=%d",
+			auditCount, len(h.audit.seen))
+	}
+}
+
+func TestAuthenticateFailsWhenTokenRevokedAfterInspection(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	issued, err := h.service.IssueToken(
+		h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.InspectAuthentication(h.ctx, issued.Raw); err != nil {
+		t.Fatal(err)
+	}
+	revokeContext := h.owner
+	revokeContext.IdempotencyKey = "revoke-after-inspection"
+	if err := h.service.RevokeToken(
+		h.ctx, revokeContext, issued.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.Authenticate(
+		h.ctx, issued.Raw,
+	); !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("formal authentication did not fail closed: %v", err)
+	}
+}
+
 func TestMutationAuthorizationAndAuditAreAtomic(t *testing.T) {
 	h := newAgentHarness(t)
 	if _, err := h.service.Create(
@@ -559,6 +629,11 @@ func TestAuthenticateFailsClosedOnMalformedGrantShapes(t *testing.T) {
 			`, agent.ID, h.spaceID, corruption.scopes, corruption.labels); err != nil {
 				t.Fatal(err)
 			}
+			if _, err := h.service.InspectAuthentication(
+				h.ctx, issued.Raw,
+			); !errors.Is(err, ErrAuthenticationUnavailable) {
+				t.Fatalf("inspection got %v", err)
+			}
 			if _, err := h.service.Authenticate(
 				h.ctx, issued.Raw,
 			); !errors.Is(err, ErrAuthenticationUnavailable) {
@@ -588,6 +663,9 @@ func TestAuthenticateRemainsCorrectWithManyNonmatchingTokens(t *testing.T) {
 			formatAgentTime(h.clock.now.Add(time.Hour))); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := h.service.InspectAuthentication(h.ctx, target.Raw); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := h.service.Authenticate(h.ctx, target.Raw); err != nil {
 		t.Fatal(err)

@@ -108,6 +108,7 @@ func (principal AuthenticatedPrincipal) AuditActor() audit.Actor {
 }
 
 type Authenticator interface {
+	InspectAuthentication(context.Context, string) (AuthenticatedPrincipal, error)
 	Authenticate(context.Context, string) (AuthenticatedPrincipal, error)
 }
 
