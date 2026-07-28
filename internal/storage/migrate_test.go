@@ -40,8 +40,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := db.Writer.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	if before != 4 || after != before {
-		t.Fatalf("migration counts before/after = %d/%d, want 4/4", before, after)
+	if before != 5 || after != before {
+		t.Fatalf("migration counts before/after = %d/%d, want 5/5", before, after)
 	}
 }
 
@@ -87,10 +87,51 @@ func TestConcurrentMigrateOnIndependentDatabases(t *testing.T) {
 			if err := databases[0].QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&versions); err != nil {
 				t.Fatal(err)
 			}
-			if versions != 4 {
-				t.Fatalf("schema migration count = %d, want 4", versions)
+			if versions != 5 {
+				t.Fatalf("schema migration count = %d, want 5", versions)
 			}
 		})
+	}
+}
+
+func TestCredentialIdempotencyMigrationAddsExplicitResultColumns(t *testing.T) {
+	db := openTempDB(t)
+	for _, column := range []string{
+		"request_hash", "resource_id", "resource_version",
+	} {
+		var count int
+		if err := db.Reader.QueryRow(`
+			SELECT count(*) FROM pragma_table_info('idempotency_records')
+			WHERE name = ?
+		`, column).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("missing idempotency column %q", column)
+		}
+	}
+}
+
+func TestCredentialIdempotencyRequiresExplicitResultFields(t *testing.T) {
+	db := openTempDB(t)
+	mustExec(t, db.Writer, `
+		INSERT INTO users (id, email, normalized_email, password_hash)
+		VALUES ('idem-user', 'idem@example.test', 'idem@example.test', X'01')
+	`)
+	mustExec(t, db.Writer, `
+		INSERT INTO agents (id, name, created_by_user_id)
+		VALUES ('idem-agent', 'Idempotency Agent', 'idem-user')
+	`)
+	if _, err := db.Writer.Exec(`
+		INSERT INTO idempotency_records (
+			id, agent_id, endpoint, key_hash, response_status,
+			created_at, expires_at
+		) VALUES (
+			'idem-invalid', 'idem-agent', 'credential.create', X'01', 201,
+			'2026-07-28T00:00:00Z', '2026-07-29T00:00:00Z'
+		)
+	`); err == nil {
+		t.Fatal("idempotency row without explicit result fields succeeded")
 	}
 }
 

@@ -110,6 +110,9 @@ func ValidatePayload(credentialType Type, raw json.RawMessage) (json.RawMessage,
 }
 
 func strictDecode(raw []byte, destination any) error {
+	if err := rejectDuplicateJSONFields(raw); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
@@ -117,6 +120,75 @@ func strictDecode(raw []byte, destination any) error {
 	}
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return ErrInvalidPayload
+	}
+	return nil
+}
+
+func rejectDuplicateJSONFields(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	first, err := decoder.Token()
+	if err != nil {
+		return ErrInvalidPayload
+	}
+	if err := consumeJSONValue(decoder, first); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return ErrInvalidPayload
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder, token json.Token) error {
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return ErrInvalidPayload
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return ErrInvalidPayload
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return ErrInvalidPayload
+			}
+			seen[key] = struct{}{}
+			valueToken, err := decoder.Token()
+			if err != nil {
+				return ErrInvalidPayload
+			}
+			if err := consumeJSONValue(decoder, valueToken); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim('}') {
+			return ErrInvalidPayload
+		}
+	case '[':
+		for decoder.More() {
+			valueToken, err := decoder.Token()
+			if err != nil {
+				return ErrInvalidPayload
+			}
+			if err := consumeJSONValue(decoder, valueToken); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil || closing != json.Delim(']') {
+			return ErrInvalidPayload
+		}
+	default:
 		return ErrInvalidPayload
 	}
 	return nil

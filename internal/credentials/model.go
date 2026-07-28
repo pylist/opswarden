@@ -88,6 +88,12 @@ type Decrypted struct {
 	Payload  json.RawMessage
 }
 
+type MutationResult struct {
+	ID      string
+	Version uint64
+	Status  int
+}
+
 type ListFilter struct {
 	SpaceID        string
 	Type           Type

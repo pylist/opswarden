@@ -23,9 +23,10 @@ type credentialRecord struct {
 }
 
 type idempotencyResult struct {
-	RequestHash string `json:"request_hash"`
-	ResourceID  string `json:"resource_id"`
-	Version     uint64 `json:"version"`
+	RequestHash string
+	ResourceID  string
+	Version     uint64
+	Status      int
 }
 
 type queryer interface {
@@ -50,13 +51,15 @@ func (r *Repository) withTx(
 func (r *Repository) list(
 	ctx context.Context,
 	filter ListFilter,
+	after string,
+	limit int,
 ) ([]Metadata, error) {
 	query := `
 		SELECT id, space_id, name, type, current_version, deleted_at
 		FROM credentials
 		WHERE space_id = ? AND id > ?
 	`
-	args := []any{filter.SpaceID, filter.After}
+	args := []any{filter.SpaceID, after}
 	if filter.Type != "" {
 		query += ` AND type = ?`
 		args = append(args, filter.Type)
@@ -67,7 +70,8 @@ func (r *Repository) list(
 	case !filter.IncludeDeleted:
 		query += ` AND deleted_at IS NULL`
 	}
-	query += ` ORDER BY id`
+	query += ` ORDER BY id LIMIT ?`
+	args = append(args, limit)
 	rows, err := r.db.Reader.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list credentials: %w", err)
@@ -88,16 +92,12 @@ func (r *Repository) list(
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close credential rows: %w", err)
 	}
-	filtered := make([]Metadata, 0, len(result))
 	for index := range result {
 		if err := r.loadRelations(ctx, r.db.Reader, &result[index]); err != nil {
 			return nil, err
 		}
-		if labelsContain(result[index].Tags, filter.Tags) {
-			filtered = append(filtered, result[index])
-		}
 	}
-	return filtered, nil
+	return result, nil
 }
 
 func (r *Repository) recordByID(
@@ -365,13 +365,19 @@ func lookupIdempotency(
 	keyHash []byte,
 	now time.Time,
 ) (idempotencyResult, bool, error) {
-	var encoded []byte
+	var result idempotencyResult
 	var expiresAt string
 	err := tx.QueryRowContext(ctx, `
-		SELECT response_headers, expires_at
+		SELECT request_hash, resource_id, resource_version, response_status, expires_at
 		FROM idempotency_records
 		WHERE agent_id = ? AND endpoint = ? AND key_hash = ?
-	`, agentID, endpoint, keyHash).Scan(&encoded, &expiresAt)
+	`, agentID, endpoint, keyHash).Scan(
+		&result.RequestHash,
+		&result.ResourceID,
+		&result.Version,
+		&result.Status,
+		&expiresAt,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return idempotencyResult{}, false, nil
 	}
@@ -391,9 +397,8 @@ func lookupIdempotency(
 		}
 		return idempotencyResult{}, false, nil
 	}
-	var result idempotencyResult
-	if err := json.Unmarshal(encoded, &result); err != nil ||
-		result.RequestHash == "" || result.ResourceID == "" {
+	if len(result.RequestHash) != 64 || result.ResourceID == "" ||
+		result.Version == 0 || result.Status < 200 || result.Status > 299 {
 		return idempotencyResult{}, false, errors.New("invalid idempotency result")
 	}
 	return result, true, nil
@@ -404,21 +409,18 @@ func storeIdempotency(
 	tx *sql.Tx,
 	id, agentID, endpoint string,
 	keyHash []byte,
-	status int,
 	result idempotencyResult,
 	now time.Time,
 ) error {
-	encoded, err := json.Marshal(result)
-	if err != nil {
-		return errors.New("encode idempotency result")
-	}
-	_, err = tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO idempotency_records (
 			id, agent_id, endpoint, key_hash, response_status,
-			response_headers, response_body, created_at, expires_at
-		) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
-	`, id, agentID, endpoint, keyHash, status, encoded,
-		formatCredentialTime(now), formatCredentialTime(now.Add(24*time.Hour)))
+			response_headers, response_body, created_at, expires_at,
+			request_hash, resource_id, resource_version
+		) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?)
+	`, id, agentID, endpoint, keyHash, result.Status,
+		formatCredentialTime(now), formatCredentialTime(now.Add(24*time.Hour)),
+		result.RequestHash, result.ResourceID, result.Version)
 	if err != nil {
 		return fmt.Errorf("store idempotency result: %w", err)
 	}

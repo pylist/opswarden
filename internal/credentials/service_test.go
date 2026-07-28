@@ -89,6 +89,9 @@ func newCredentialHarness(t *testing.T) *credentialHarness {
 		  ('spc_main', 'usr_reader', 'reader'),
 		  ('spc_other', 'usr_other', 'reader');
 		INSERT INTO agents (id, name, created_by_user_id) VALUES ('agt_writer', 'Writer', 'usr_editor');
+		INSERT INTO assets (id, space_id, name, type) VALUES
+		  ('ast_main', 'spc_main', 'Main host', 'server'),
+		  ('ast_other', 'spc_other', 'Other host', 'server');
 	`)
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +172,7 @@ func (h *credentialHarness) writeContext(key string, actor audit.Actor) WriteCon
 	return WriteContext{Actor: actor, IdempotencyKey: key, Reason: "test mutation"}
 }
 
-func (h *credentialHarness) create(principal Principal) Metadata {
+func (h *credentialHarness) create(principal Principal) MutationResult {
 	h.t.Helper()
 	created, err := h.service.Create(
 		h.ctx, principal, h.createInput(), h.writeContext("idem-create", principal.Actor),
@@ -287,6 +290,174 @@ func TestAgentUpdateReturnsOriginalIdempotentResult(t *testing.T) {
 	}
 }
 
+func TestAgentCreateReplayUsesStableMinimalResult(t *testing.T) {
+	h := newCredentialHarness(t)
+	input := h.createInput()
+	wc := h.writeContext("idem-agent-create-stable", h.agent.Actor)
+	first, err := h.service.Create(h.ctx, h.agent, input, wc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := "Human changed metadata"
+	if _, err := h.service.Update(
+		h.ctx,
+		h.editor,
+		UpdateInput{
+			CredentialID: first.ID, ExpectedVersion: first.Version,
+			DisplayName: &changed,
+		},
+		h.writeContext("human-change", h.editor.Actor),
+	); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := h.service.Create(h.ctx, h.agent, input, wc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, replayed) {
+		t.Fatalf("first=%+v replayed=%+v", first, replayed)
+	}
+	if first.Status != 201 {
+		t.Fatalf("create status=%d", first.Status)
+	}
+}
+
+func TestAgentUpdateReplayUsesStableMinimalResult(t *testing.T) {
+	h := newCredentialHarness(t)
+	created := h.create(h.editor)
+	agentName := "Agent update"
+	input := UpdateInput{
+		CredentialID: created.ID, ExpectedVersion: created.Version,
+		DisplayName: &agentName,
+	}
+	wc := h.writeContext("idem-agent-update-stable", h.agent.Actor)
+	first, err := h.service.Update(h.ctx, h.agent, input, wc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	humanName := "Later human update"
+	if _, err := h.service.Update(
+		h.ctx,
+		h.editor,
+		UpdateInput{
+			CredentialID: created.ID, ExpectedVersion: first.Version,
+			DisplayName: &humanName,
+		},
+		h.writeContext("human-later", h.editor.Actor),
+	); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := h.service.Update(h.ctx, h.agent, input, wc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, replayed) {
+		t.Fatalf("first=%+v replayed=%+v", first, replayed)
+	}
+	if first.Status != 200 {
+		t.Fatalf("update status=%d", first.Status)
+	}
+}
+
+func TestCreateReplayReauthorizesCurrentLabels(t *testing.T) {
+	h := newCredentialHarness(t)
+	h.agent.Agent.Grants[0].Labels = map[string]string{"environment": "prod"}
+	input := h.createInput()
+	wc := h.writeContext("idem-agent-create-reauth", h.agent.Actor)
+	first, err := h.service.Create(h.ctx, h.agent, input, wc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedTags := map[string]string{"environment": "stage"}
+	if _, err := h.service.Update(
+		h.ctx,
+		h.editor,
+		UpdateInput{
+			CredentialID: first.ID, ExpectedVersion: first.Version,
+			Tags: changedTags,
+		},
+		h.writeContext("human-relabeled", h.editor.Actor),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.Create(h.ctx, h.agent, input, wc); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestUpdateReplayReauthorizesCurrentLabels(t *testing.T) {
+	h := newCredentialHarness(t)
+	h.agent.Agent.Grants[0].Labels = map[string]string{"environment": "prod"}
+	created := h.create(h.editor)
+	name := "Agent update"
+	input := UpdateInput{
+		CredentialID: created.ID, ExpectedVersion: created.Version,
+		DisplayName: &name,
+	}
+	wc := h.writeContext("idem-agent-update-reauth", h.agent.Actor)
+	first, err := h.service.Update(h.ctx, h.agent, input, wc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.Update(
+		h.ctx,
+		h.editor,
+		UpdateInput{
+			CredentialID: created.ID, ExpectedVersion: first.Version,
+			Tags: map[string]string{"environment": "stage"},
+		},
+		h.writeContext("human-update-label", h.editor.Actor),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.Update(h.ctx, h.agent, input, wc); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestAgentCannotCreateOrUpdateCredentialAssetLinks(t *testing.T) {
+	h := newCredentialHarness(t)
+	input := h.createInput()
+	input.AssetIDs = []string{"ast_main"}
+	if _, err := h.service.Create(
+		h.ctx, h.agent, input,
+		h.writeContext("idem-agent-link", h.agent.Actor),
+	); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("create got %v", err)
+	}
+	if h.countCredentials() != 0 {
+		t.Fatal("agent link denial did not roll back create")
+	}
+
+	created := h.create(h.editor)
+	if _, err := h.service.Update(
+		h.ctx,
+		h.agent,
+		UpdateInput{
+			CredentialID: created.ID, ExpectedVersion: created.Version,
+			AssetIDs: []string{},
+		},
+		h.writeContext("idem-agent-unlink", h.agent.Actor),
+	); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update got %v", err)
+	}
+}
+
+func TestCredentialAssetLinksRequireSameSpace(t *testing.T) {
+	h := newCredentialHarness(t)
+	input := h.createInput()
+	input.AssetIDs = []string{"ast_other"}
+	if _, err := h.service.Create(
+		h.ctx, h.editor, input,
+		h.writeContext("human-cross-space-link", h.editor.Actor),
+	); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+	if h.countCredentials() != 0 {
+		t.Fatal("cross-Space link did not roll back create")
+	}
+}
+
 func TestCrossSpaceGetReturnsConcealedNotFound(t *testing.T) {
 	h := newCredentialHarness(t)
 	created := h.create(h.editor)
@@ -360,35 +531,94 @@ func TestOnlyOneConcurrentUpdateWins(t *testing.T) {
 
 func TestPayloadAndIdempotencyRecordsDoNotContainPlaintext(t *testing.T) {
 	h := newCredentialHarness(t)
-	input := h.createInput()
-	input.Payload = json.RawMessage(
-		`{"engine":"postgres","host":"db.example.test","port":5432,"database":"app","username":"alice","password":"fixture-db-password","connection_string":"fixture-connection-string"}`,
-	)
-	input.Type = TypeDatabase
-	_, err := h.service.Create(
-		h.ctx, h.agent, input, h.writeContext("idem-agent-create", h.agent.Actor),
+	fixtures := []struct {
+		credentialType Type
+		payload        string
+		sensitive      []string
+	}{
+		{TypeLogin, `{"url":"https://login.test","username":"alice","password":"fixture-login-password"}`, []string{"fixture-login-password"}},
+		{TypeAPIToken, `{"service":"api","token":"fixture-api-token"}`, []string{"fixture-api-token"}},
+		{TypeSSHKey, `{"username":"root","private_key":"fixture-ssh-private-key","passphrase":"fixture-ssh-passphrase"}`, []string{"fixture-ssh-private-key", "fixture-ssh-passphrase"}},
+		{TypeDatabase, `{"engine":"postgres","host":"db.test","password":"fixture-db-password","connection_string":"fixture-connection-string"}`, []string{"fixture-db-password", "fixture-connection-string"}},
+		{TypeTOTP, `{"issuer":"Example","account":"alice","seed":"fixture-totp-seed","algorithm":"SHA1","digits":6,"period":30}`, []string{"fixture-totp-seed"}},
+	}
+	var sensitive [][]byte
+	for index, fixture := range fixtures {
+		input := h.createInput()
+		input.Type = fixture.credentialType
+		input.DisplayName = string(fixture.credentialType)
+		input.Payload = json.RawMessage(fixture.payload)
+		if _, err := h.service.Create(
+			h.ctx, h.agent, input,
+			h.writeContext(
+				"idem-sensitive-"+string(rune('a'+index)), h.agent.Actor,
+			),
+		); err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range fixture.sensitive {
+			sensitive = append(sensitive, []byte(value))
+		}
+	}
+	var ciphertext, idempotency []byte
+	rows, err := h.db.Reader.QueryContext(
+		h.ctx, `SELECT payload_ciphertext FROM credential_versions`,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var ciphertext, metadata []byte
-	if err := h.db.Reader.QueryRowContext(
-		h.ctx,
-		`SELECT payload_ciphertext FROM credential_versions LIMIT 1`,
-	).Scan(&ciphertext); err != nil {
+	for rows.Next() {
+		var value []byte
+		if err := rows.Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		ciphertext = append(ciphertext, value...)
+	}
+	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.db.Reader.QueryRowContext(
-		h.ctx,
-		`SELECT COALESCE(response_headers, X'') FROM idempotency_records LIMIT 1`,
-	).Scan(&metadata); err != nil {
+	if err := rows.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, sensitive := range [][]byte{
-		[]byte("fixture-db-password"), []byte("fixture-connection-string"),
-	} {
-		if bytes.Contains(ciphertext, sensitive) || bytes.Contains(metadata, sensitive) {
-			t.Fatalf("plaintext leaked: %q", sensitive)
+	rows, err = h.db.Reader.QueryContext(h.ctx, `
+		SELECT printf(
+			'%s|%s|%s|%s|%d|%s|%s|%s|%s|%s|%s|%d',
+			id, agent_id, endpoint, hex(key_hash), response_status,
+			COALESCE(CAST(response_headers AS TEXT), ''),
+			COALESCE(CAST(response_body AS TEXT), ''),
+			created_at, expires_at, request_hash, resource_id, resource_version
+		)
+		FROM idempotency_records
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var row string
+		if err := rows.Scan(&row); err != nil {
+			t.Fatal(err)
+		}
+		idempotency = append(idempotency, row...)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var legacyEnvelopeCount int
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT count(*) FROM idempotency_records
+		WHERE response_headers IS NOT NULL OR response_body IS NOT NULL
+	`).Scan(&legacyEnvelopeCount); err != nil {
+		t.Fatal(err)
+	}
+	if legacyEnvelopeCount != 0 {
+		t.Fatalf("legacy idempotency envelopes=%d", legacyEnvelopeCount)
+	}
+	for _, value := range sensitive {
+		if bytes.Contains(ciphertext, value) || bytes.Contains(idempotency, value) {
+			t.Fatalf("plaintext leaked: %q", value)
 		}
 	}
 	if _, err := h.db.Writer.ExecContext(h.ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
@@ -398,11 +628,9 @@ func TestPayloadAndIdempotencyRecordsDoNotContainPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, sensitive := range [][]byte{
-		[]byte("fixture-db-password"), []byte("fixture-connection-string"),
-	} {
-		if bytes.Contains(raw, sensitive) {
-			t.Fatalf("plaintext leaked to database file: %q", sensitive)
+	for _, value := range sensitive {
+		if bytes.Contains(raw, value) {
+			t.Fatalf("plaintext leaked to database file: %q", value)
 		}
 	}
 }

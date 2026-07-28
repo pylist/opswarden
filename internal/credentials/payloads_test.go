@@ -18,6 +18,33 @@ func TestValidatePayloadRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestValidatePayloadRejectsDuplicateTopLevelFields(t *testing.T) {
+	tests := map[Type]string{
+		TypeLogin:    `{"url":"https://one.test","url":"https://two.test","username":"alice","password":"password"}`,
+		TypeAPIToken: `{"service":"one","service":"two","token":"token"}`,
+		TypeSSHKey:   `{"username":"root","username":"admin","private_key":"private"}`,
+		TypeDatabase: `{"engine":"postgres","engine":"mysql","host":"db.test"}`,
+		TypeTOTP:     `{"issuer":"one","issuer":"two","account":"alice","seed":"seed","algorithm":"SHA1","digits":6,"period":30}`,
+	}
+	for credentialType, raw := range tests {
+		t.Run(string(credentialType), func(t *testing.T) {
+			_, err := ValidatePayload(credentialType, []byte(raw))
+			if !errors.Is(err, ErrInvalidPayload) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}
+
+func TestValidatePayloadRejectsNestedDuplicateFields(t *testing.T) {
+	_, err := ValidatePayload(TypeDatabase, []byte(
+		`{"engine":"postgres","host":"db.test","parameters":{"sslmode":"require","sslmode":"disable"}}`,
+	))
+	if !errors.Is(err, ErrInvalidPayload) {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestValidatePayloadAcceptsTypedPayloads(t *testing.T) {
 	tests := map[Type]string{
 		TypeLogin:    `{"url":"https://example.test","username":"alice","password":"fixture-password"}`,

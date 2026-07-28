@@ -25,6 +25,8 @@ import (
 const (
 	defaultListLimit = 100
 	maxListLimit     = 500
+	listScanBatch    = 256
+	maxListScan      = 4096
 	recycleRetention = 30 * 24 * time.Hour
 )
 
@@ -107,32 +109,54 @@ func (s *Service) List(
 	} else {
 		return nil, "", authorization.ErrUnauthenticated
 	}
-	rows, err := s.repository.list(ctx, filter)
-	if err != nil {
-		return nil, "", err
-	}
-	authorized := make([]Metadata, 0, min(len(rows), limit+1))
-	for _, metadata := range rows {
-		if err := authorize(
-			principal,
-			resourceForMetadata(metadata),
-			authorization.ListCredential,
-		); err != nil {
-			if principal.Agent != nil && errors.Is(err, ErrNotFound) {
-				continue
-			}
+	authorized := make([]Metadata, 0, limit+1)
+	after := filter.After
+	scanned := 0
+	exhausted := false
+	for scanned < maxListScan && len(authorized) <= limit {
+		batchLimit := min(listScanBatch, maxListScan-scanned)
+		rows, err := s.repository.list(ctx, filter, after, batchLimit)
+		if err != nil {
 			return nil, "", err
 		}
-		authorized = append(authorized, metadata)
-		if len(authorized) == limit+1 {
+		if len(rows) == 0 {
+			exhausted = true
+			break
+		}
+		for _, metadata := range rows {
+			scanned++
+			after = metadata.ID
+			if !labelsContain(metadata.Tags, filter.Tags) {
+				continue
+			}
+			if err := authorize(
+				principal,
+				resourceForMetadata(metadata),
+				authorization.ListCredential,
+			); err != nil {
+				if principal.Agent != nil && errors.Is(err, ErrNotFound) {
+					continue
+				}
+				return nil, "", err
+			}
+			authorized = append(authorized, metadata)
+			if len(authorized) == limit+1 {
+				break
+			}
+		}
+		if len(rows) < batchLimit {
+			exhausted = true
 			break
 		}
 	}
-	if len(authorized) <= limit {
+	if len(authorized) > limit {
+		next := authorized[limit-1].ID
+		return authorized[:limit], next, nil
+	}
+	if exhausted {
 		return authorized, "", nil
 	}
-	next := authorized[limit-1].ID
-	return authorized[:limit], next, nil
+	return authorized, after, nil
 }
 
 func (s *Service) Get(
@@ -192,17 +216,17 @@ func (s *Service) Create(
 	principal Principal,
 	input CreateInput,
 	writeContext WriteContext,
-) (Metadata, error) {
+) (MutationResult, error) {
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 	if err := validateCreateInput(input); err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	if err := validateMutationContext(principal, writeContext); err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	canonicalPayload, err := ValidatePayload(input.Type, input.Payload)
 	if err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	defer clearBytes(canonicalPayload)
 	input.Tags = cloneTags(input.Tags)
@@ -212,11 +236,11 @@ func (s *Service) Create(
 		authorization.Resource{SpaceID: input.SpaceID, Labels: input.Tags},
 		authorization.CreateCredential,
 	); err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	id, err := randomCredentialID("crd_")
 	if err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	metadata := Metadata{
 		ID: id, SpaceID: input.SpaceID, DisplayName: input.DisplayName,
@@ -232,7 +256,7 @@ func (s *Service) Create(
 		canonicalPayload,
 	)
 	if err != nil {
-		return Metadata{}, errors.New("encrypt credential")
+		return MutationResult{}, errors.New("encrypt credential")
 	}
 	requestHash, err := requestFingerprint(struct {
 		Operation string          `json:"operation"`
@@ -240,23 +264,35 @@ func (s *Service) Create(
 		Payload   json.RawMessage `json:"payload"`
 	}{Operation: "create", Input: inputWithoutPayload(input), Payload: canonicalPayload})
 	if err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	now := s.clock.Now().UTC()
 	var replayed *idempotencyResult
 	err = s.repository.withTx(ctx, func(tx *sql.Tx) error {
 		replay, err := s.checkIdempotency(
-			ctx, tx, principal, writeContext, "credential.create", requestHash, now,
+			ctx, tx, principal, writeContext, "credential.create", requestHash, 201, now,
 		)
 		if err != nil {
 			return err
 		}
 		if replay != nil {
+			if err := s.authorizeReplayTx(
+				ctx, tx, principal, replay, authorization.CreateCredential,
+			); err != nil {
+				return err
+			}
 			replayed = replay
 			return nil
 		}
 		if err := requireActiveSpace(ctx, tx, metadata.SpaceID); err != nil {
 			return err
+		}
+		if len(metadata.AssetIDs) > 0 {
+			if err := authorizeAssetLinksTx(
+				ctx, tx, principal, metadata.ID, metadata.SpaceID, metadata.AssetIDs,
+			); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO credentials (
@@ -299,19 +335,14 @@ func (s *Service) Create(
 		)
 	})
 	if err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	if replayed != nil {
-		replayedMetadata, err := s.repository.metadataByID(
-			ctx, s.repository.db.Reader, replayed.ResourceID, true,
-		)
-		if err != nil {
-			return Metadata{}, err
-		}
-		replayedMetadata.Version = replayed.Version
-		return replayedMetadata, nil
+		return mutationResult(*replayed), nil
 	}
-	return cloneMetadata(metadata), nil
+	return mutationResult(idempotencyResult{
+		ResourceID: metadata.ID, Version: metadata.Version, Status: 201,
+	}), nil
 }
 
 func (s *Service) Update(
@@ -319,36 +350,36 @@ func (s *Service) Update(
 	principal Principal,
 	input UpdateInput,
 	writeContext WriteContext,
-) (Metadata, error) {
+) (MutationResult, error) {
 	if input.ExpectedVersion == 0 {
-		return Metadata{}, ErrVersionConflict
+		return MutationResult{}, ErrVersionConflict
 	}
 	if input.CredentialID == "" ||
 		(input.DisplayName == nil && input.Tags == nil &&
 			input.AssetIDs == nil && input.Payload == nil) {
-		return Metadata{}, ErrInvalidInput
+		return MutationResult{}, ErrInvalidInput
 	}
 	if err := validateMutationContext(principal, writeContext); err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	requestHash, err := requestFingerprint(struct {
 		Operation string      `json:"operation"`
 		Input     UpdateInput `json:"input"`
 	}{Operation: "update", Input: input})
 	if err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	now := s.clock.Now().UTC()
 	current, err := s.repository.recordByID(
 		ctx, s.repository.db.Reader, input.CredentialID, true,
 	)
 	if err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	if err := authorize(
 		principal, resourceForMetadata(current.metadata), authorization.UpdateCredential,
 	); err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	if principal.Agent != nil {
 		var replayed *idempotencyResult
@@ -356,24 +387,27 @@ func (s *Service) Update(
 			var err error
 			replayed, err = s.checkIdempotency(
 				ctx, tx, principal, writeContext,
-				"credential.update/"+input.CredentialID, requestHash, now,
+				"credential.update/"+input.CredentialID, requestHash, 200, now,
 			)
+			if err == nil && replayed != nil {
+				err = s.authorizeReplayTx(
+					ctx, tx, principal, replayed, authorization.UpdateCredential,
+				)
+			}
 			return err
 		})
 		if err != nil {
-			return Metadata{}, err
+			return MutationResult{}, err
 		}
 		if replayed != nil {
-			metadata := cloneMetadata(current.metadata)
-			metadata.Version = replayed.Version
-			return metadata, nil
+			return mutationResult(*replayed), nil
 		}
 	}
 	if current.metadata.DeletedAt != nil {
-		return Metadata{}, ErrNotFound
+		return MutationResult{}, ErrNotFound
 	}
 	if current.metadata.Version != input.ExpectedVersion {
-		return Metadata{}, ErrVersionConflict
+		return MutationResult{}, ErrVersionConflict
 	}
 	updated := cloneMetadata(current.metadata)
 	updated.Version++
@@ -381,21 +415,21 @@ func (s *Service) Update(
 	if input.DisplayName != nil {
 		name := strings.TrimSpace(*input.DisplayName)
 		if !validText(name, 256, false) {
-			return Metadata{}, ErrInvalidInput
+			return MutationResult{}, ErrInvalidInput
 		}
 		updated.DisplayName = name
 		changeFields = append(changeFields, audit.FieldDisplayName)
 	}
 	if input.Tags != nil {
 		if err := validateTags(input.Tags); err != nil {
-			return Metadata{}, err
+			return MutationResult{}, err
 		}
 		updated.Tags = cloneTags(input.Tags)
 		changeFields = append(changeFields, audit.FieldTags)
 	}
 	if input.AssetIDs != nil {
 		if err := validateAssetIDs(input.AssetIDs); err != nil {
-			return Metadata{}, err
+			return MutationResult{}, err
 		}
 		updated.AssetIDs = normalizedAssetIDs(input.AssetIDs)
 		changeFields = append(changeFields, audit.FieldAssetLinks)
@@ -403,7 +437,7 @@ func (s *Service) Update(
 	if err := authorize(
 		principal, resourceForMetadata(updated), authorization.UpdateCredential,
 	); err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	var plaintext []byte
 	if input.Payload != nil {
@@ -421,9 +455,9 @@ func (s *Service) Update(
 	}
 	if err != nil {
 		if errors.Is(err, ErrInvalidPayload) {
-			return Metadata{}, err
+			return MutationResult{}, err
 		}
-		return Metadata{}, errors.New("prepare credential version")
+		return MutationResult{}, errors.New("prepare credential version")
 	}
 	defer clearBytes(plaintext)
 	envelope, err := s.box.EncryptCredential(
@@ -434,20 +468,32 @@ func (s *Service) Update(
 		plaintext,
 	)
 	if err != nil {
-		return Metadata{}, errors.New("encrypt credential")
+		return MutationResult{}, errors.New("encrypt credential")
 	}
 	var replayed *idempotencyResult
 	err = s.repository.withTx(ctx, func(tx *sql.Tx) error {
 		endpoint := "credential.update/" + input.CredentialID
 		replay, err := s.checkIdempotency(
-			ctx, tx, principal, writeContext, endpoint, requestHash, now,
+			ctx, tx, principal, writeContext, endpoint, requestHash, 200, now,
 		)
 		if err != nil {
 			return err
 		}
 		if replay != nil {
+			if err := s.authorizeReplayTx(
+				ctx, tx, principal, replay, authorization.UpdateCredential,
+			); err != nil {
+				return err
+			}
 			replayed = replay
 			return nil
+		}
+		if input.AssetIDs != nil {
+			if err := authorizeAssetLinksTx(
+				ctx, tx, principal, updated.ID, updated.SpaceID, updated.AssetIDs,
+			); err != nil {
+				return err
+			}
 		}
 		result, err := tx.ExecContext(ctx, `
 			UPDATE credentials
@@ -496,19 +542,14 @@ func (s *Service) Update(
 		)
 	})
 	if err != nil {
-		return Metadata{}, err
+		return MutationResult{}, err
 	}
 	if replayed != nil {
-		metadata, err := s.repository.metadataByID(
-			ctx, s.repository.db.Reader, replayed.ResourceID, true,
-		)
-		if err != nil {
-			return Metadata{}, err
-		}
-		metadata.Version = replayed.Version
-		return metadata, nil
+		return mutationResult(*replayed), nil
 	}
-	return cloneMetadata(updated), nil
+	return mutationResult(idempotencyResult{
+		ResourceID: updated.ID, Version: updated.Version, Status: 200,
+	}), nil
 }
 
 func (s *Service) Delete(
@@ -548,7 +589,7 @@ func (s *Service) Delete(
 			return err
 		}
 		replay, err := s.checkIdempotency(
-			ctx, tx, principal, writeContext, endpoint, requestHash, now,
+			ctx, tx, principal, writeContext, endpoint, requestHash, 204, now,
 		)
 		if err != nil || replay != nil {
 			return err
@@ -741,6 +782,7 @@ func (s *Service) checkIdempotency(
 	principal Principal,
 	writeContext WriteContext,
 	endpoint, requestHash string,
+	expectedStatus int,
 	now time.Time,
 ) (*idempotencyResult, error) {
 	if principal.Agent == nil {
@@ -759,7 +801,32 @@ func (s *Service) checkIdempotency(
 	if result.RequestHash != requestHash {
 		return nil, ErrIdempotencyConflict
 	}
+	if result.Status != expectedStatus {
+		return nil, errors.New("invalid idempotency status")
+	}
 	return &result, nil
+}
+
+func (s *Service) authorizeReplayTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	principal Principal,
+	result *idempotencyResult,
+	action authorization.Action,
+) error {
+	if result == nil {
+		return errors.New("idempotency replay is required")
+	}
+	metadata, err := s.repository.metadataByID(
+		ctx, tx, result.ResourceID, true,
+	)
+	if err != nil {
+		return err
+	}
+	if metadata.DeletedAt != nil {
+		return ErrNotFound
+	}
+	return authorize(principal, resourceForMetadata(metadata), action)
 }
 
 func (s *Service) saveIdempotency(
@@ -781,12 +848,63 @@ func (s *Service) saveIdempotency(
 	}
 	keyHash := sha256.Sum256([]byte(writeContext.IdempotencyKey))
 	return storeIdempotency(
-		ctx, tx, id, principal.Agent.AgentID, endpoint, keyHash[:], status,
+		ctx, tx, id, principal.Agent.AgentID, endpoint, keyHash[:],
 		idempotencyResult{
-			RequestHash: requestHash, ResourceID: resourceID, Version: version,
+			RequestHash: requestHash, ResourceID: resourceID,
+			Version: version, Status: status,
 		},
 		now,
 	)
+}
+
+func mutationResult(result idempotencyResult) MutationResult {
+	return MutationResult{
+		ID: result.ResourceID, Version: result.Version, Status: result.Status,
+	}
+}
+
+func authorizeAssetLinksTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	principal Principal,
+	credentialID, spaceID string,
+	assetIDs []string,
+) error {
+	if err := authorize(
+		principal,
+		authorization.Resource{
+			SpaceID: spaceID, ResourceID: credentialID,
+		},
+		authorization.LinkCredential,
+	); err != nil {
+		return err
+	}
+	for _, assetID := range assetIDs {
+		var actualSpaceID string
+		err := tx.QueryRowContext(ctx, `
+			SELECT space_id FROM assets
+			WHERE id = ? AND deleted_at IS NULL
+		`, assetID).Scan(&actualSpaceID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("validate credential asset authorization: %w", err)
+		}
+		if actualSpaceID != spaceID {
+			return ErrNotFound
+		}
+		if err := authorize(
+			principal,
+			authorization.Resource{
+				SpaceID: actualSpaceID, ResourceID: assetID,
+			},
+			authorization.LinkCredential,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) auditEvent(
