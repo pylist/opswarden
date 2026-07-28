@@ -28,6 +28,10 @@ func TestInitialMigrationCreatesAllTables(t *testing.T) {
 
 func TestMigrateIsIdempotent(t *testing.T) {
 	db := openTempDB(t)
+	available, err := loadMigrations(migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var before int
 	if err := db.Writer.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&before); err != nil {
@@ -40,12 +44,19 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := db.Writer.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	if before != 6 || after != before {
-		t.Fatalf("migration counts before/after = %d/%d, want 6/6", before, after)
+	if before != len(available) || after != before {
+		t.Fatalf(
+			"migration counts before/after = %d/%d, want %d/%d",
+			before, after, len(available), len(available),
+		)
 	}
 }
 
 func TestConcurrentMigrateOnIndependentDatabases(t *testing.T) {
+	available, err := loadMigrations(migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for iteration := range 10 {
 		t.Run(string(rune('A'+iteration)), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "concurrent.db")
@@ -87,10 +98,86 @@ func TestConcurrentMigrateOnIndependentDatabases(t *testing.T) {
 			if err := databases[0].QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&versions); err != nil {
 				t.Fatal(err)
 			}
-			if versions != 6 {
-				t.Fatalf("schema migration count = %d, want 6", versions)
+			if versions != len(available) {
+				t.Fatalf(
+					"schema migration count = %d, want %d",
+					versions, len(available),
+				)
 			}
 		})
+	}
+}
+
+func TestAgentScopeMigrationPreservesRowsAndFailsLegacyGrantsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-scope-upgrade.db")
+	db, err := sql.Open(driverName, sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	available, err := loadMigrations(migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+			applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	for _, candidate := range available {
+		if candidate.version > 6 {
+			continue
+		}
+		mustExec(t, db, string(candidate.contents))
+		mustExec(t, db, `
+			INSERT INTO schema_migrations (version, name, checksum)
+			VALUES (?, ?, ?)
+		`, candidate.version, candidate.name, candidate.checksum)
+	}
+	mustExec(t, db, `
+		INSERT INTO users (id, email, normalized_email, password_hash)
+		VALUES ('legacy-agent-user', 'agent@example.test', 'agent@example.test', X'01')
+	`)
+	mustExec(t, db, `INSERT INTO spaces (id, name) VALUES ('legacy-agent-space', 'Legacy')`)
+	mustExec(t, db, `
+		INSERT INTO agents (id, name, created_by_user_id)
+		VALUES ('legacy-agent', 'Legacy Agent', 'legacy-agent-user')
+	`)
+	mustExec(t, db, `
+		INSERT INTO agent_tokens (id, agent_id, token_hash)
+		VALUES ('legacy-token', 'legacy-agent', zeroblob(32))
+	`)
+	mustExec(t, db, `
+		INSERT INTO agent_space_grants (agent_id, space_id, role)
+		VALUES ('legacy-agent', 'legacy-agent-space', 'reader')
+	`)
+
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	var prefix, scopes, labels string
+	var lastUsed any
+	if err := db.QueryRow(`
+		SELECT token_prefix, last_used_at
+		FROM agent_tokens WHERE id = 'legacy-token'
+	`).Scan(&prefix, &lastUsed); err != nil {
+		t.Fatal(err)
+	}
+	if prefix != "" || lastUsed != nil {
+		t.Fatalf("legacy token unexpectedly activated: prefix=%q last_used=%v", prefix, lastUsed)
+	}
+	if err := db.QueryRow(`
+		SELECT scopes_json, labels_json
+		FROM agent_space_grants
+		WHERE agent_id = 'legacy-agent' AND space_id = 'legacy-agent-space'
+	`).Scan(&scopes, &labels); err != nil {
+		t.Fatal(err)
+	}
+	if scopes != "[]" || labels != "{}" {
+		t.Fatalf("legacy grant did not fail closed: scopes=%q labels=%q", scopes, labels)
 	}
 }
 
