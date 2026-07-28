@@ -1244,6 +1244,19 @@ func (service *countingAgentService) Authenticate(
 	return service.fakeAgentService.Authenticate(ctx, raw)
 }
 
+type mismatchedAgentIdentityService struct {
+	fakeAgentService
+}
+
+func (service mismatchedAgentIdentityService) Authenticate(
+	ctx context.Context,
+	raw string,
+) (agents.AuthenticatedPrincipal, error) {
+	principal, err := service.fakeAgentService.Authenticate(ctx, raw)
+	principal.TokenID = "tok_changed_after_inspection"
+	return principal, err
+}
+
 func TestCredentialListOmitsPayload(t *testing.T) {
 	fixture := "fixture-password-must-not-appear"
 	handler, token, _ := authenticatedTestHandler(
@@ -1592,6 +1605,31 @@ func TestProtectedAssetQuotaRunsBeforeAgentLastUsedAndIsNamespaced(t *testing.T)
 	}
 	if recorder.eventCount() != 1 {
 		t.Fatalf("Agent success audit writes=%d want 1", recorder.eventCount())
+	}
+}
+
+func TestAgentAuthenticationRejectsIdentityChangedAfterInspection(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	recorder := &recordingAuthAudit{}
+	handler := newTestHandler(Dependencies{
+		Identity: &fakeIdentityService{}, Spaces: fakeSpaceService{},
+		Assets: &fakeAssetService{}, Agents: mismatchedAgentIdentityService{},
+		AuthAudit: recorder, Clock: &fixedClock{now: now},
+		MasterKey: [32]byte{1},
+	})
+	response := serveAuthorized(
+		handler, "owat_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+		http.MethodGet, "/api/v1/spaces/spc_test/assets", nil,
+	)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	for _, event := range recorder.events {
+		if event.Success {
+			t.Fatalf("identity mismatch wrote success audit event: %+v", event)
+		}
 	}
 }
 

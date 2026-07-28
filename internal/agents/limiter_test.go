@@ -322,7 +322,9 @@ func TestLimiterGenerationDoesNotResetBeforeNaturalRecovery(t *testing.T) {
 	}
 }
 
-func TestLimiterGenerationSwapIsConstantWorkAndBounded(t *testing.T) {
+func TestLimiterGenerationLargeGapDropsBothOldGenerationsInConstantWork(
+	t *testing.T,
+) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	const subjectCap = 10_000
 	limiter := NewLimiter(LimiterConfig{
@@ -340,14 +342,21 @@ func TestLimiterGenerationSwapIsConstantWorkAndBounded(t *testing.T) {
 			t.Fatalf("old generation subject %d denied", index)
 		}
 	}
+	firstBoundary := now.Add(time.Second)
 	if !limiter.Allow(
-		"boundary-overflow", OperationAgentRequestRead, now.Add(time.Second),
+		"old-0", OperationAgentRequestRead, firstBoundary,
 	).Allowed {
-		t.Fatal("boundary overflow subject denied")
+		t.Fatal("failed to migrate one active subject into current generation")
+	}
+	if !limiter.Allow(
+		"old-overflow", OperationAgentRequestRead, firstBoundary,
+	).Allowed {
+		t.Fatal("failed to create current-generation overflow")
 	}
 	before := limiter.WorkUnitsFor(OperationAgentRequestRead)
 	if !limiter.Allow(
-		"new-generation", OperationAgentRequestRead, now.Add(2*time.Second),
+		"new-generation", OperationAgentRequestRead,
+		now.Add(3*time.Second+time.Nanosecond),
 	).Allowed {
 		t.Fatal("new generation subject denied")
 	}
@@ -356,6 +365,80 @@ func TestLimiterGenerationSwapIsConstantWorkAndBounded(t *testing.T) {
 	}
 	if count := limiter.SubjectCountFor(OperationAgentRequestRead); count != 1 {
 		t.Fatalf("new generation retained %d subjects", count)
+	}
+	limiter.mu.Lock()
+	newBucket := limiter.buckets[OperationAgentRequestRead]["new-generation"]
+	previousCount := len(limiter.previousBuckets[OperationAgentRequestRead])
+	overflow := limiter.overflow[OperationAgentRequestRead]
+	previousOverflow := limiter.previousOverflow[OperationAgentRequestRead]
+	limiter.mu.Unlock()
+	if newBucket == nil || previousCount != 0 ||
+		overflow != nil || previousOverflow != nil {
+		t.Fatal("large gap retained an old direct or overflow generation")
+	}
+}
+
+func TestLimiterGenerationLargeGapPreservesPhaseAlignment(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{OperationAgentRequestRead: 1},
+		RefillPerSecond: map[Operation]float64{
+			OperationAgentRequestRead: 1,
+		},
+		GenerationTTL: time.Second,
+	})
+	if !limiter.Allow("old", OperationAgentRequestRead, now).Allowed {
+		t.Fatal("old generation subject denied")
+	}
+	jumped := now.Add(2*time.Second + 250*time.Millisecond)
+	if !limiter.Allow("current", OperationAgentRequestRead, jumped).Allowed {
+		t.Fatal("large-gap current subject denied")
+	}
+	before := limiter.WorkUnitsFor(OperationAgentRequestRead)
+	if limiter.Allow(
+		"current", OperationAgentRequestRead, now.Add(3*time.Second),
+	).Allowed {
+		t.Fatal("phase-aligned boundary reset a partially recovered bucket")
+	}
+	if work := limiter.WorkUnitsFor(OperationAgentRequestRead) - before; work != 2 {
+		t.Fatalf("phase alignment work=%d want lookup+rotation=2", work)
+	}
+}
+
+func TestLimiterGenerationVeryLargeGapIsConstantWorkAndSafe(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{OperationAgentRequestRead: 1},
+		RefillPerSecond: map[Operation]float64{
+			OperationAgentRequestRead: 1_000_000_000,
+		},
+		MaxSubjects:   1,
+		GenerationTTL: time.Nanosecond,
+	})
+	if !limiter.Allow("old", OperationAgentRequestRead, now).Allowed {
+		t.Fatal("old generation subject denied")
+	}
+	before := limiter.WorkUnitsFor(OperationAgentRequestRead)
+	future := now.Add(time.Duration(1<<63 - 1))
+	if !limiter.Allow("future", OperationAgentRequestRead, future).Allowed {
+		t.Fatal("very-large-gap subject denied")
+	}
+	if work := limiter.WorkUnitsFor(OperationAgentRequestRead) - before; work > 3 {
+		t.Fatalf("very-large-gap work=%d want <=3", work)
+	}
+	if count := limiter.SubjectCountFor(OperationAgentRequestRead); count != 1 {
+		t.Fatalf("very-large-gap retained %d subjects", count)
+	}
+	limiter.mu.Lock()
+	futureBucket := limiter.buckets[OperationAgentRequestRead]["future"]
+	oldBucket := limiter.buckets[OperationAgentRequestRead]["old"]
+	oldPreviousBucket := limiter.previousBuckets[OperationAgentRequestRead]["old"]
+	overflow := limiter.overflow[OperationAgentRequestRead]
+	previousOverflow := limiter.previousOverflow[OperationAgentRequestRead]
+	limiter.mu.Unlock()
+	if futureBucket == nil || oldBucket != nil || oldPreviousBucket != nil ||
+		overflow != nil || previousOverflow != nil {
+		t.Fatal("very-large gap did not start with one fresh direct subject")
 	}
 }
 

@@ -520,18 +520,30 @@ func (limiter *Limiter) rotateGenerationLocked(
 		limiter.generationStart[operation] = now
 		return
 	}
-	if now.Sub(start) < limiter.generationTTL[operation] {
+	if now.Before(start) {
 		return
 	}
-	// Keep one grace generation. A bucket used during the next generation is
-	// migrated into the current map in O(1); only an entire generation of
-	// inactivity makes it eligible for this O(1) map replacement.
-	limiter.previousBuckets[operation] = limiter.buckets[operation]
-	limiter.previousOverflow[operation] = limiter.overflow[operation]
+	ttl := limiter.generationTTL[operation]
+	elapsed := now.Sub(start)
+	if elapsed < ttl {
+		return
+	}
+	generationsSkipped := elapsed / ttl
+	if generationsSkipped >= 2 {
+		limiter.previousBuckets[operation] = make(map[string]*limiterBucket)
+		limiter.previousOverflow[operation] = nil
+	} else {
+		// Keep one grace generation. A bucket used during the next generation
+		// is migrated into the current map in O(1).
+		limiter.previousBuckets[operation] = limiter.buckets[operation]
+		limiter.previousOverflow[operation] = limiter.overflow[operation]
+	}
 	limiter.buckets[operation] = make(map[string]*limiterBucket)
 	limiter.overflow[operation] = nil
 	limiter.generation[operation]++
-	limiter.generationStart[operation] = now
+	// Advance to the latest phase boundary without multiplying a potentially
+	// huge generation count by ttl.
+	limiter.generationStart[operation] = now.Add(-(elapsed % ttl))
 	limiter.workUnits[operation]++
 }
 
