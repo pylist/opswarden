@@ -993,6 +993,39 @@ func (s *Service) PurgeExpired(
 	return purged, nil
 }
 
+// PurgeExpiredMaintenance is an internal lifecycle capability. It deliberately
+// does not accept a request principal, so scheduled work cannot manufacture a
+// human or Agent identity and accidentally expose that identity at a user
+// authorization boundary.
+func (s *Service) PurgeExpiredMaintenance(
+	ctx context.Context,
+	cutoff time.Time,
+) (int64, error) {
+	if s == nil || s.repository == nil || cutoff.IsZero() ||
+		cutoff.Location() != time.UTC {
+		return 0, ErrInvalidInput
+	}
+	var purged int64
+	err := s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `
+			DELETE FROM credentials
+			WHERE deleted_at IS NOT NULL AND deleted_at <= ?
+		`, formatCredentialTime(cutoff))
+		if err != nil {
+			return fmt.Errorf("purge expired credentials: %w", err)
+		}
+		purged, err = result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count expired credentials: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return purged, nil
+}
+
 func (s *Service) checkIdempotency(
 	ctx context.Context,
 	tx *sql.Tx,

@@ -1120,7 +1120,7 @@ func TestStateChangeRequiresAuthorizationHeaderEvenWithCookie(t *testing.T) {
 	}
 }
 
-type fakeSpaceService struct{}
+type fakeSpaceService struct{ systemRole string }
 
 func (fakeSpaceService) CreateAudited(
 	_ context.Context,
@@ -1180,13 +1180,17 @@ func (fakeSpaceService) RemoveMemberAudited(
 	return nil
 }
 
-func (fakeSpaceService) ResolveAuthorizationPrincipal(
+func (service fakeSpaceService) ResolveAuthorizationPrincipal(
 	_ context.Context,
 	session identity.SessionPrincipal,
 	spaceID string,
 ) (authorization.HumanPrincipal, error) {
+	role := service.systemRole
+	if role == "" {
+		role = identity.SystemRoleMember
+	}
 	return authorization.HumanPrincipal{
-		Session: session, SystemRole: identity.SystemRoleMember,
+		Session: session, SystemRole: role,
 		SpaceRoles: map[string]authorization.Role{spaceID: authorization.RoleOwner},
 	}, nil
 }

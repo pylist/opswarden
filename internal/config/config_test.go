@@ -63,3 +63,25 @@ func TestLoadParsesBootstrapInternalCIDRs(t *testing.T) {
 		t.Fatalf("internal CIDRs=%v", config.InternalCIDRs)
 	}
 }
+
+func TestAuditRetentionDefaultsToOneYearAndCanBeExplicitlyDisabled(t *testing.T) {
+	t.Setenv("OPSWARDEN_DATA_DIR", t.TempDir())
+	t.Setenv("OPSWARDEN_MASTER_KEY_FILE", "/run/secrets/key")
+	t.Setenv("OPSWARDEN_DISABLE_AUDIT_RETENTION", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DisableAuditRetention {
+		t.Fatal("one-year audit retention was disabled by default")
+	}
+
+	t.Setenv("OPSWARDEN_DISABLE_AUDIT_RETENTION", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.DisableAuditRetention {
+		t.Fatal("explicit audit retention disable was ignored")
+	}
+}

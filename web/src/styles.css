@@ -1010,6 +1010,30 @@ td code {
   font-weight: 650;
 }
 
+.settings-backup-list {
+  display: grid;
+  gap: 0;
+  margin-top: 8px;
+}
+
+.settings-backup-row {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid #f3f4f6;
+  font-size: 13px;
+}
+
+.settings-backup-row span {
+  color: #374151;
+}
+
+.settings-backup-row small {
+  color: #6b7280;
+}
+
 .drawer-backdrop {
   display: none;
 }

@@ -86,7 +86,8 @@ func (router *Router) securityHeadersMiddleware(next http.Handler) http.Handler 
 			"Content-Security-Policy",
 			"default-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
 		)
-		if strings.HasPrefix(request.URL.Path, "/api/v1/") {
+		if strings.HasPrefix(request.URL.Path, "/api/v1/") ||
+			request.URL.Path == "/health/live" {
 			writer.Header().Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(writer, request)

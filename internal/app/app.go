@@ -10,11 +10,14 @@ import (
 	"opswarden/internal/agents"
 	"opswarden/internal/assets"
 	"opswarden/internal/audit"
+	"opswarden/internal/backup"
 	"opswarden/internal/config"
 	"opswarden/internal/credentials"
 	"opswarden/internal/cryptobox"
+	"opswarden/internal/health"
 	"opswarden/internal/httpapi"
 	"opswarden/internal/identity"
+	"opswarden/internal/maintenance"
 	"opswarden/internal/mcpserver"
 	"opswarden/internal/platform"
 	"opswarden/internal/spaces"
@@ -23,11 +26,14 @@ import (
 )
 
 type App struct {
-	handler   http.Handler
-	server    *http.Server
-	db        *storage.DB
-	apiCloser interface{ Close() error }
+	handler     http.Handler
+	server      *http.Server
+	db          *storage.DB
+	apiCloser   interface{ Close() error }
+	maintenance *maintenance.Scheduler
 }
+
+var Version = "dev"
 
 func New(cfg config.Config) (_ *App, err error) {
 	masterKey, err := cryptobox.LoadMasterKey(cfg.MasterKeyFile)
@@ -83,11 +89,34 @@ func New(cfg config.Config) (_ *App, err error) {
 	if err != nil {
 		return nil, err
 	}
+	backupDir := cfg.BackupDir
+	if backupDir == "" {
+		backupDir = filepath.Join(cfg.DataDir, "backups")
+	}
+	backupService, err := backup.NewService(db, backupDir, clock)
+	if err != nil {
+		return nil, err
+	}
+	maintenanceScheduler, err := maintenance.NewScheduler(
+		db, backupService, auditService, credentialService, clock, nil,
+		!cfg.DisableAuditRetention,
+	)
+	if err != nil {
+		return nil, err
+	}
+	healthService, err := health.NewService(
+		db, backupDir, Version, clock, backupService,
+	)
+	if err != nil {
+		return nil, err
+	}
+	healthService.SetMaintenance(maintenanceScheduler)
 	limiter := agents.NewLimiter(agents.LimiterConfig{})
 	apiHandler := httpapi.New(httpapi.Dependencies{
 		Identity: identityService, Spaces: spaceService,
 		Credentials: credentialService, Assets: assetService,
 		Agents: agentService, Audit: auditService, AuthAudit: auditService,
+		Backups: backupService, Health: healthService,
 		Limiter: limiter, Clock: clock, MasterKey: masterKey,
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
 		Fallback:          webui.Handler(),
@@ -109,8 +138,9 @@ func New(cfg config.Config) (_ *App, err error) {
 	mux.Handle("/", apiHandler)
 	handler := http.Handler(mux)
 	application := &App{
-		handler: handler,
-		db:      db,
+		handler:     handler,
+		db:          db,
+		maintenance: maintenanceScheduler,
 		server: &http.Server{
 			Addr:              cfg.ListenAddr,
 			Handler:           handler,
@@ -130,6 +160,12 @@ func (a *App) Handler() http.Handler {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	if a.maintenance != nil {
+		if err := a.maintenance.Start(ctx); err != nil {
+			return err
+		}
+		defer a.maintenance.Stop()
+	}
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- a.server.ListenAndServe()
@@ -153,6 +189,9 @@ func (a *App) Run(ctx context.Context) error {
 
 func (a *App) Close() error {
 	var errs []error
+	if a.maintenance != nil {
+		a.maintenance.Stop()
+	}
 	if a.server != nil {
 		errs = append(errs, normalizeServerError(a.server.Close()))
 	}

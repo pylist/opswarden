@@ -16,7 +16,9 @@ import (
 	"opswarden/internal/assets"
 	"opswarden/internal/audit"
 	"opswarden/internal/authorization"
+	"opswarden/internal/backup"
 	"opswarden/internal/credentials"
+	"opswarden/internal/health"
 	"opswarden/internal/identity"
 	"opswarden/internal/platform"
 	"opswarden/internal/spaces"
@@ -85,6 +87,15 @@ type AuditService interface {
 	List(context.Context, audit.Filter) ([]audit.Event, audit.Cursor, error)
 }
 
+type BackupService interface {
+	ListRuns(context.Context, int) ([]backup.RunRecord, error)
+}
+
+type HealthService interface {
+	Liveness() health.Liveness
+	Detailed(context.Context) (health.Detail, error)
+}
+
 type AuthenticationAuditRecorder interface {
 	RecordReadBeforeReturn(context.Context, audit.Event) error
 }
@@ -96,6 +107,8 @@ type Dependencies struct {
 	Assets            AssetService
 	Agents            AgentService
 	Audit             AuditService
+	Backups           BackupService
+	Health            HealthService
 	AuthAudit         AuthenticationAuditRecorder
 	Limiter           *agents.Limiter
 	Clock             platform.Clock
@@ -187,6 +200,8 @@ func (router *Router) dispatch(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	switch {
+	case request.URL.Path == "/health/live":
+		router.handleLiveness(writer, request)
 	case request.URL.Path == "/api/v1/bootstrap/status":
 		router.handleBootstrapStatus(writer, request)
 	case request.URL.Path == "/api/v1/bootstrap/initial-owner":
@@ -204,6 +219,10 @@ func (router *Router) dispatch(writer http.ResponseWriter, request *http.Request
 		router.handleAgents(writer, request)
 	case request.URL.Path == "/api/v1/audit-events":
 		router.handleAudit(writer, request)
+	case request.URL.Path == "/api/v1/health":
+		router.handleDetailedHealth(writer, request)
+	case request.URL.Path == "/api/v1/backups":
+		router.handleBackups(writer, request)
 	case strings.HasPrefix(request.URL.Path, "/api/"):
 		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
 	default:
@@ -220,6 +239,9 @@ func routeAllowsQuery(request *http.Request) bool {
 		return false
 	}
 	if request.URL.Path == "/api/v1/audit-events" {
+		return true
+	}
+	if request.URL.Path == "/api/v1/backups" {
 		return true
 	}
 	segments := pathSegments(request.URL.Path)

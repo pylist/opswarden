@@ -18,6 +18,56 @@ const space: Space = {
 };
 
 describe("settings", () => {
+  it("renders verified health and backup response data", async () => {
+    const runId = "bkp_0123456789abcdef0123456789abcdef";
+    const api = {
+      request: vi.fn(async (path: string) => {
+        if (path.endsWith("/health")) {
+          return {
+            status: "ok",
+            version: "dev",
+            uptimeSeconds: 120,
+            database: "ok",
+            journalMode: "wal",
+            diskFreeBytes: 1024 * 1024,
+            migrationVersion: 10,
+            maintenance: {
+              running: false,
+              errorCodes: [],
+              auditRetentionEnabled: true,
+            },
+          };
+        }
+        return {
+          items: [{
+            id: runId,
+            status: "succeeded",
+            filename:
+              `opswarden-20260729T010203.000000000Z-${runId}.sqlite3`,
+            checksum: "a".repeat(64),
+            sizeBytes: 4096,
+            startedAt: "2026-07-29T01:02:02Z",
+            completedAt: "2026-07-29T01:02:03Z",
+            retained: true,
+          }],
+        };
+      }),
+      reverifyTOTP: vi.fn(),
+    } as unknown as WorkflowAPI;
+    render(
+      <SettingsPage
+        api={api}
+        space={space}
+        principal={principal}
+        sessionActive
+      />,
+    );
+    expect(await screen.findByText("ok / wal")).toBeVisible();
+    expect(screen.getByText("1.0 MB")).toBeVisible();
+    expect(screen.getByText("成功")).toBeVisible();
+    expect(screen.getByText("4.0 KB")).toBeVisible();
+  });
+
   it("shows precise unavailable states for Task 15 endpoints without fake metrics", async () => {
     const api = {
       request: vi.fn(async () => {

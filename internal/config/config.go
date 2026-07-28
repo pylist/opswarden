@@ -4,6 +4,8 @@ import (
 	"errors"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -12,14 +14,17 @@ var (
 	ErrMasterKeyFileRequired = errors.New("master key file is required")
 	ErrTrustedProxyCIDRs     = errors.New("trusted proxy CIDRs are invalid")
 	ErrInternalCIDRs         = errors.New("internal CIDRs are invalid")
+	ErrAuditRetention        = errors.New("audit retention setting is invalid")
 )
 
 type Config struct {
-	ListenAddr        string
-	DataDir           string
-	MasterKeyFile     string
-	TrustedProxyCIDRs []netip.Prefix
-	InternalCIDRs     []netip.Prefix
+	ListenAddr            string
+	DataDir               string
+	MasterKeyFile         string
+	BackupDir             string
+	DisableAuditRetention bool
+	TrustedProxyCIDRs     []netip.Prefix
+	InternalCIDRs         []netip.Prefix
 }
 
 func Load() (Config, error) {
@@ -27,6 +32,7 @@ func Load() (Config, error) {
 		ListenAddr:    os.Getenv("OPSWARDEN_LISTEN_ADDR"),
 		DataDir:       os.Getenv("OPSWARDEN_DATA_DIR"),
 		MasterKeyFile: os.Getenv("OPSWARDEN_MASTER_KEY_FILE"),
+		BackupDir:     os.Getenv("OPSWARDEN_BACKUP_DIR"),
 	}
 	trusted, err := parseCIDRs(
 		os.Getenv("OPSWARDEN_TRUSTED_PROXY_CIDRS"), ErrTrustedProxyCIDRs,
@@ -50,6 +56,16 @@ func Load() (Config, error) {
 	}
 	if cfg.MasterKeyFile == "" {
 		return Config{}, ErrMasterKeyFileRequired
+	}
+	if cfg.BackupDir == "" {
+		cfg.BackupDir = filepath.Join(cfg.DataDir, "backups")
+	}
+	if encoded := os.Getenv("OPSWARDEN_DISABLE_AUDIT_RETENTION"); encoded != "" {
+		disabled, err := strconv.ParseBool(encoded)
+		if err != nil || (encoded != "true" && encoded != "false") {
+			return Config{}, ErrAuditRetention
+		}
+		cfg.DisableAuditRetention = disabled
 	}
 
 	return cfg, nil
