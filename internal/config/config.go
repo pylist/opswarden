@@ -5,7 +5,10 @@ import (
 	"os"
 )
 
-var ErrDataDirRequired = errors.New("data directory is required")
+var (
+	ErrDataDirRequired       = errors.New("data directory is required")
+	ErrMasterKeyFileRequired = errors.New("master key file is required")
+)
 
 type Config struct {
 	ListenAddr    string
@@ -24,6 +27,9 @@ func Load() (Config, error) {
 	}
 	if cfg.DataDir == "" {
 		return Config{}, ErrDataDirRequired
+	}
+	if cfg.MasterKeyFile == "" {
+		return Config{}, ErrMasterKeyFileRequired
 	}
 
 	return cfg, nil
