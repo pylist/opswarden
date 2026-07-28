@@ -31,20 +31,34 @@ func (a *App) Handler() http.Handler {
 }
 
 func (a *App) Run(ctx context.Context) error {
+	serveErr := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = a.server.Shutdown(shutdownCtx)
+		serveErr <- a.server.ListenAndServe()
 	}()
 
-	err := a.server.ListenAndServe()
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
+	select {
+	case err := <-serveErr:
+		return normalizeServerError(err)
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := a.server.Shutdown(shutdownCtx); err != nil {
+			if closeErr := a.server.Close(); closeErr != nil {
+				return errors.Join(err, closeErr)
+			}
+			return err
+		}
+		return normalizeServerError(<-serveErr)
 	}
-	return err
 }
 
 func (a *App) Close() error {
 	return a.server.Close()
+}
+
+func normalizeServerError(err error) error {
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }

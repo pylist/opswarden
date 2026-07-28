@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"opswarden/internal/app"
 	"opswarden/internal/config"
@@ -29,17 +27,6 @@ func main() {
 
 	err = application.Run(ctx)
 	if err != nil {
-		log.Fatal(err)
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	select {
-	case <-shutdownCtx.Done():
-		log.Fatal(errors.New("shutdown deadline exceeded"))
-	default:
-	}
-	if err := application.Close(); err != nil {
 		log.Fatal(err)
 	}
 }

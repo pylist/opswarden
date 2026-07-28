@@ -20,15 +20,12 @@ func Handler() http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
-		if name == "." {
-			name = "index.html"
+		if name != "." {
+			if info, err := fs.Stat(dist, name); err == nil && !info.IsDir() {
+				files.ServeHTTP(w, r)
+				return
+			}
 		}
-		if _, err := fs.Stat(dist, name); err == nil {
-			files.ServeHTTP(w, r)
-			return
-		}
-
-		r.URL.Path = "/index.html"
-		files.ServeHTTP(w, r)
+		http.ServeFileFS(w, r, dist, "index.html")
 	})
 }
