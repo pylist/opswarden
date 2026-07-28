@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -221,32 +222,142 @@ func TestLimiterSubjectCapacityIsPerOperation(t *testing.T) {
 	}
 }
 
-func TestLimiterFullOperationEvictsOldestForNewLegitimateSubject(t *testing.T) {
+func TestLimiterFixedOverflowDoesNotEvictEstablishedSubject(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	limiter := NewLimiter(LimiterConfig{
-		Capacity: map[Operation]int{OperationAuthFailure: 1},
+		Capacity: map[Operation]int{OperationAuthFailure: 2},
 		RefillPerSecond: map[Operation]float64{
-			OperationAuthFailure: 1,
+			OperationAuthFailure: 0.000001,
 		},
 		MaxSubjects: 2,
 		IdleTTL:     time.Hour,
 	})
 	if !limiter.Allow("attacker-a", OperationAuthFailure, now).Allowed ||
-		!limiter.Allow(
-			"attacker-b", OperationAuthFailure, now.Add(time.Second),
-		).Allowed {
-		t.Fatal("attack subjects did not enter")
+		!limiter.Allow("attacker-a", OperationAuthFailure, now).Allowed ||
+		!limiter.Allow("attacker-b", OperationAuthFailure, now).Allowed {
+		t.Fatal("established subjects did not enter")
 	}
-	if !limiter.Allow(
-		"legitimate", OperationAuthFailure, now.Add(2*time.Second),
-	).Allowed {
-		t.Fatal("full bucket map permanently locked out new subject")
+	for _, unknown := range []string{"unknown-a", "unknown-b"} {
+		if !limiter.Allow(unknown, OperationAuthFailure, now).Allowed {
+			t.Fatalf("overflow allowance denied %s too early", unknown)
+		}
+	}
+	if limiter.Allow("unknown-c", OperationAuthFailure, now).Allowed {
+		t.Fatal("unknown subjects received independent fresh allowances")
+	}
+	if limiter.Allow("attacker-a", OperationAuthFailure, now).Allowed {
+		t.Fatal("overflow evicted and reset an established subject")
 	}
 	if limiter.SubjectCountFor(OperationAuthFailure) != 2 {
 		t.Fatalf(
 			"auth subjects=%d",
 			limiter.SubjectCountFor(OperationAuthFailure),
 		)
+	}
+}
+
+func TestLimiterFixedWorkWithTenThousandEstablishedAndRotatingSubjects(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	const subjectCap = 10_000
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{OperationRequestRead: 1},
+		RefillPerSecond: map[Operation]float64{
+			OperationRequestRead: 0.000001,
+		},
+		MaxSubjects: subjectCap,
+	})
+	for index := range subjectCap {
+		if !limiter.Allow(
+			fmt.Sprintf("established-%d", index),
+			OperationRequestRead, now,
+		).Allowed {
+			t.Fatalf("established subject %d denied", index)
+		}
+	}
+	before := limiter.WorkUnitsFor(OperationRequestRead)
+	started := time.Now()
+	for index := range 20_000 {
+		limiter.Allow(
+			fmt.Sprintf("rotating-%d", index),
+			OperationRequestRead, now,
+		)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("rotating subjects took %s; request path is not bounded", elapsed)
+	}
+	work := limiter.WorkUnitsFor(OperationRequestRead) - before
+	if work > 20_000*2 {
+		t.Fatalf("work units=%d want <=%d", work, 20_000*2)
+	}
+	if count := limiter.SubjectCountFor(OperationRequestRead); count != subjectCap {
+		t.Fatalf("subject count=%d want fixed cap %d", count, subjectCap)
+	}
+}
+
+func TestLimiterExistingSubjectRemainsConstantWorkAfterOverflow(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{OperationRequestRead: 2},
+		RefillPerSecond: map[Operation]float64{
+			OperationRequestRead: 0.000001,
+		},
+		MaxSubjects: 1,
+	})
+	if !limiter.Allow("established", OperationRequestRead, now).Allowed {
+		t.Fatal("established subject denied")
+	}
+	for index := range 1000 {
+		limiter.Allow(
+			fmt.Sprintf("overflow-%d", index), OperationRequestRead, now,
+		)
+	}
+	before := limiter.WorkUnitsFor(OperationRequestRead)
+	if !limiter.Allow("established", OperationRequestRead, now).Allowed {
+		t.Fatal("established subject lost its remaining allowance")
+	}
+	if work := limiter.WorkUnitsFor(OperationRequestRead) - before; work > 2 {
+		t.Fatalf("established lookup work=%d", work)
+	}
+}
+
+func TestLimiterOverflowAllowanceIsSharedConcurrently(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{OperationRequestRead: 4},
+		RefillPerSecond: map[Operation]float64{
+			OperationRequestRead: 0.000001,
+		},
+		MaxSubjects: 1,
+	})
+	if !limiter.Allow("established", OperationRequestRead, now).Allowed {
+		t.Fatal("established subject denied")
+	}
+	const attempts = 64
+	results := make(chan bool, attempts)
+	var workers sync.WaitGroup
+	for index := range attempts {
+		workers.Add(1)
+		go func(index int) {
+			defer workers.Done()
+			results <- limiter.Allow(
+				fmt.Sprintf("rotating-%d", index),
+				OperationRequestRead, now,
+			).Allowed
+		}(index)
+	}
+	workers.Wait()
+	close(results)
+	allowed := 0
+	for result := range results {
+		if result {
+			allowed++
+		}
+	}
+	if allowed != 4 {
+		t.Fatalf("overflow allowed=%d want one shared capacity of 4", allowed)
+	}
+	if count := limiter.SubjectCountFor(OperationRequestRead); count != 1 {
+		t.Fatalf("subject count=%d want fixed map size 1", count)
 	}
 }
 

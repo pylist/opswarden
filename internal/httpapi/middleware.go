@@ -22,6 +22,8 @@ type responseCapture struct {
 	status int
 }
 
+type verifiedJWTContextKey struct{}
+
 func (capture *responseCapture) WriteHeader(status int) {
 	if capture.status == 0 {
 		capture.status = status
@@ -121,6 +123,8 @@ func (router *Router) dependencyMiddleware(next http.Handler) http.Handler {
 func (router *Router) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		raw, hasBearer := bearerToken(request.Header.Values("Authorization"))
+		var verifiedClaims jwtClaims
+		hasVerifiedClaims := false
 		if !isPublicRoute(request) &&
 			strings.HasPrefix(request.URL.Path, "/api/v1/") &&
 			hasBearer {
@@ -131,18 +135,11 @@ func (router *Router) rateLimitMiddleware(next http.Handler) http.Handler {
 			operation := preAuthenticationOperation(request)
 			metadata := requestMetadataFromContext(request.Context())
 			reservation, decision := router.deps.Limiter.Reserve(
-				[]agents.LimitRequest{
-					{
-						Subject: "preauth-source:" + tokenKind + ":" +
-							string(operation) + ":" + metadata.sourceIP,
-						Operation: agents.OperationRequestSource,
-					},
-					{
-						Subject: "preauth-token:" + tokenKind + ":" +
-							inMemoryBearerFingerprint(raw),
-						Operation: operation,
-					},
-				},
+				[]agents.LimitRequest{{
+					Subject: "preauth-source:" + tokenKind + ":" +
+						string(operation) + ":" + metadata.sourceIP,
+					Operation: agents.OperationRequestSource,
+				}},
 				router.deps.Clock.Now(),
 			)
 			if !decision.Allowed {
@@ -150,24 +147,55 @@ func (router *Router) rateLimitMiddleware(next http.Handler) http.Handler {
 				return
 			}
 			reservation.Commit()
+			var strictSubject string
+			if tokenKind == "agent" {
+				strictSubject = "preauth-agent:" +
+					inMemoryBearerFingerprint(raw)
+			} else if router.jwt != nil {
+				claims, err := router.jwt.verify(raw)
+				if err == nil {
+					verifiedClaims = claims
+					hasVerifiedClaims = true
+					strictSubject = "preauth-session:" +
+						inMemoryBearerFingerprint(
+							claims.Session+"\x00"+claims.Subject+"\x00"+
+								string(operation),
+						)
+				}
+			}
+			if strictSubject != "" {
+				strictReservation, strictDecision := router.deps.Limiter.Reserve(
+					[]agents.LimitRequest{{
+						Subject: strictSubject, Operation: operation,
+					}},
+					router.deps.Clock.Now(),
+				)
+				if !strictDecision.Allowed {
+					writeRateLimitError(writer, request, strictDecision)
+					return
+				}
+				strictReservation.Commit()
+			}
+			if hasVerifiedClaims {
+				ctx := context.WithValue(
+					request.Context(), verifiedJWTContextKey{}, verifiedClaims,
+				)
+				request = request.WithContext(ctx)
+			}
 		}
 		if request.Method != http.MethodPost ||
 			request.URL.Path != "/api/v1/auth/reverify" {
 			next.ServeHTTP(writer, request)
 			return
 		}
-		if !hasBearer || strings.HasPrefix(raw, "owat_") || router.jwt == nil {
-			next.ServeHTTP(writer, request)
-			return
-		}
-		claims, err := router.jwt.verify(raw)
-		if err != nil {
+		if !hasBearer || strings.HasPrefix(raw, "owat_") ||
+			!hasVerifiedClaims {
 			next.ServeHTTP(writer, request)
 			return
 		}
 		metadata := requestMetadataFromContext(request.Context())
 		fingerprint := inMemoryBearerFingerprint(
-			claims.Session + "\x00" + claims.Subject,
+			verifiedClaims.Session + "\x00" + verifiedClaims.Subject,
 		)
 		reservation, decision := router.deps.Limiter.Reserve(
 			[]agents.LimitRequest{
@@ -261,12 +289,18 @@ func (router *Router) authenticationMiddleware(next http.Handler) http.Handler {
 				)
 				return
 			}
-			claims, err := router.jwt.verify(raw)
-			if err != nil {
-				router.rejectAnonymousAuthentication(
-					writer, request, "auth.jwt", "INVALID_JWT",
-				)
-				return
+			claims, verified := request.Context().Value(
+				verifiedJWTContextKey{},
+			).(jwtClaims)
+			if !verified {
+				var err error
+				claims, err = router.jwt.verify(raw)
+				if err != nil {
+					router.rejectAnonymousAuthentication(
+						writer, request, "auth.jwt", "INVALID_JWT",
+					)
+					return
+				}
 			}
 			session, err := router.deps.Identity.ResolveSession(
 				request.Context(), claims.Session,

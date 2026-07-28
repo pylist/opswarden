@@ -56,8 +56,15 @@ type LimitRequest struct {
 type Reservation struct {
 	mu       sync.Mutex
 	limiter  *Limiter
-	requests []LimitRequest
+	items    []reservationItem
 	resolved bool
+}
+
+type reservationItem struct {
+	subject   string
+	operation Operation
+	overflow  bool
+	units     float64
 }
 
 func (reservation *Reservation) Commit() {
@@ -80,7 +87,7 @@ func (reservation *Reservation) Refund(now time.Time) {
 	}
 	reservation.resolved = true
 	reservation.mu.Unlock()
-	reservation.limiter.refundMany(reservation.requests, now)
+	reservation.limiter.refundMany(reservation.items, now)
 }
 
 type limiterBucket struct {
@@ -94,9 +101,10 @@ type Limiter struct {
 	capacity    map[Operation]float64
 	refill      map[Operation]float64
 	maxSubjects int
-	idleTTL     time.Duration
 	buckets     map[Operation]map[string]*limiterBucket
+	overflow    map[Operation]*limiterBucket
 	lastNow     map[Operation]time.Time
+	workUnits   map[Operation]uint64
 }
 
 func NewLimiter(config LimiterConfig) *Limiter {
@@ -110,9 +118,10 @@ func NewLimiter(config LimiterConfig) *Limiter {
 		capacity:    make(map[Operation]float64, len(allOperations)),
 		refill:      make(map[Operation]float64, len(allOperations)),
 		maxSubjects: config.MaxSubjects,
-		idleTTL:     config.IdleTTL,
 		buckets:     make(map[Operation]map[string]*limiterBucket),
+		overflow:    make(map[Operation]*limiterBucket),
 		lastNow:     make(map[Operation]time.Time),
+		workUnits:   make(map[Operation]uint64),
 	}
 	defaultCapacity := map[Operation]int{
 		OperationAuthFailure: 5, OperationCredentialList: 60,
@@ -194,10 +203,17 @@ func (limiter *Limiter) Reserve(
 		unique = append(unique, request)
 	}
 
+	type stagedKey struct {
+		operation Operation
+		subject   string
+		overflow  bool
+	}
 	type stagedBucket struct {
-		request LimitRequest
-		bucket  *limiterBucket
-		tokens  float64
+		key    stagedKey
+		bucket *limiterBucket
+		tokens float64
+		spend  float64
+		create bool
 	}
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
@@ -208,10 +224,33 @@ func (limiter *Limiter) Reserve(
 		}
 	}
 	staged := make([]stagedBucket, 0, len(unique))
+	stagedIndexes := make(map[stagedKey]int, len(unique))
+	pendingNew := make(map[Operation]int, len(unique))
 	var retryAfter time.Duration
 	for _, request := range unique {
 		capacity := limiter.capacity[request.Operation]
 		bucket := limiter.buckets[request.Operation][request.Subject]
+		limiter.workUnits[request.Operation]++
+		key := stagedKey{
+			operation: request.Operation,
+			subject:   request.Subject,
+		}
+		create := false
+		if bucket == nil {
+			if len(limiter.buckets[request.Operation])+
+				pendingNew[request.Operation] < limiter.maxSubjects {
+				pendingNew[request.Operation]++
+				create = true
+			} else {
+				key.subject = ""
+				key.overflow = true
+				bucket = limiter.overflow[request.Operation]
+			}
+		}
+		if index, exists := stagedIndexes[key]; exists {
+			staged[index].spend++
+			continue
+		}
 		tokens := capacity
 		if bucket != nil {
 			if now.Before(bucket.last) {
@@ -223,18 +262,22 @@ func (limiter *Limiter) Reserve(
 					now.Sub(bucket.last).Seconds()*limiter.refill[request.Operation],
 			)
 		}
-		if tokens < 1 {
-			missing := 1 - tokens
-			wait := time.Duration(math.Ceil(
-				missing / limiter.refill[request.Operation] * float64(time.Second),
-			))
-			if wait > retryAfter {
-				retryAfter = wait
-			}
-		}
+		stagedIndexes[key] = len(staged)
 		staged = append(staged, stagedBucket{
-			request: request, bucket: bucket, tokens: tokens,
+			key: key, bucket: bucket, tokens: tokens, spend: 1, create: create,
 		})
+	}
+	for _, item := range staged {
+		if item.tokens >= item.spend {
+			continue
+		}
+		missing := item.spend - item.tokens
+		wait := time.Duration(math.Ceil(
+			missing / limiter.refill[item.key.operation] * float64(time.Second),
+		))
+		if wait > retryAfter {
+			retryAfter = wait
+		}
 	}
 	for _, request := range unique {
 		limiter.lastNow[request.Operation] = now
@@ -245,19 +288,26 @@ func (limiter *Limiter) Reserve(
 	for index := range staged {
 		item := &staged[index]
 		if item.bucket == nil {
-			limiter.removeIdleLocked(item.request.Operation, now)
-			if len(limiter.buckets[item.request.Operation]) >= limiter.maxSubjects {
-				limiter.evictOldestLocked(item.request.Operation)
-			}
 			item.bucket = &limiterBucket{}
-			limiter.buckets[item.request.Operation][item.request.Subject] = item.bucket
+			if item.key.overflow {
+				limiter.overflow[item.key.operation] = item.bucket
+			} else {
+				limiter.buckets[item.key.operation][item.key.subject] = item.bucket
+			}
 		}
-		item.bucket.tokens = item.tokens - 1
+		item.bucket.tokens = item.tokens - item.spend
 		item.bucket.last = now
 		item.bucket.lastSeen = now
 	}
+	reservationItems := make([]reservationItem, 0, len(staged))
+	for _, item := range staged {
+		reservationItems = append(reservationItems, reservationItem{
+			subject: item.key.subject, operation: item.key.operation,
+			overflow: item.key.overflow, units: item.spend,
+		})
+	}
 	return &Reservation{
-		limiter: limiter, requests: unique,
+		limiter: limiter, items: reservationItems,
 	}, Decision{Allowed: true}
 }
 
@@ -268,27 +318,34 @@ func (limiter *Limiter) Refund(
 	operation Operation,
 	now time.Time,
 ) {
-	limiter.refundMany([]LimitRequest{{
-		Subject: subject, Operation: operation,
+	limiter.refundMany([]reservationItem{{
+		subject: subject, operation: operation, units: 1,
 	}}, now)
 }
 
 func (limiter *Limiter) refundMany(
-	requests []LimitRequest,
+	items []reservationItem,
 	now time.Time,
 ) {
-	if limiter == nil || len(requests) == 0 || now.IsZero() {
+	if limiter == nil || len(items) == 0 || now.IsZero() {
 		return
 	}
 	now = now.UTC()
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
-	for _, request := range requests {
-		capacity, known := limiter.capacity[request.Operation]
-		if !known || request.Subject == "" {
+	for _, item := range items {
+		capacity, known := limiter.capacity[item.operation]
+		if !known || (!item.overflow && item.subject == "") ||
+			item.units <= 0 {
 			continue
 		}
-		bucket := limiter.buckets[request.Operation][request.Subject]
+		var bucket *limiterBucket
+		if item.overflow {
+			bucket = limiter.overflow[item.operation]
+		} else {
+			bucket = limiter.buckets[item.operation][item.subject]
+		}
+		limiter.workUnits[item.operation]++
 		if bucket == nil {
 			continue
 		}
@@ -296,12 +353,12 @@ func (limiter *Limiter) refundMany(
 			elapsed := now.Sub(bucket.last).Seconds()
 			bucket.tokens = math.Min(
 				capacity,
-				bucket.tokens+elapsed*limiter.refill[request.Operation],
+				bucket.tokens+elapsed*limiter.refill[item.operation],
 			)
 			bucket.last = now
 			bucket.lastSeen = now
 		}
-		bucket.tokens = math.Min(capacity, bucket.tokens+1)
+		bucket.tokens = math.Min(capacity, bucket.tokens+item.units)
 	}
 }
 
@@ -328,16 +385,28 @@ func (limiter *Limiter) decide(
 	limiter.lastNow[operation] = now
 	subjects := limiter.buckets[operation]
 	bucket, exists := subjects[subject]
+	limiter.workUnits[operation]++
 	if !exists {
 		if !consume {
-			return Decision{Allowed: true}
+			if len(subjects) < limiter.maxSubjects {
+				return Decision{Allowed: true}
+			}
+			bucket = limiter.overflow[operation]
+			if bucket == nil {
+				return Decision{Allowed: true}
+			}
+		} else if len(subjects) >= limiter.maxSubjects {
+			bucket = limiter.overflow[operation]
+			if bucket == nil {
+				bucket = &limiterBucket{
+					tokens: capacity, last: now, lastSeen: now,
+				}
+				limiter.overflow[operation] = bucket
+			}
+		} else {
+			bucket = &limiterBucket{tokens: capacity, last: now, lastSeen: now}
+			subjects[subject] = bucket
 		}
-		limiter.removeIdleLocked(operation, now)
-		if len(subjects) >= limiter.maxSubjects {
-			limiter.evictOldestLocked(operation)
-		}
-		bucket = &limiterBucket{tokens: capacity, last: now, lastSeen: now}
-		subjects[subject] = bucket
 	}
 	if now.Before(bucket.last) {
 		return Decision{RetryAfter: bucket.last.Sub(now)}
@@ -382,26 +451,11 @@ func (limiter *Limiter) SubjectCountFor(operation Operation) int {
 	return len(limiter.buckets[operation])
 }
 
-func (limiter *Limiter) removeIdleLocked(operation Operation, now time.Time) {
-	for subject, bucket := range limiter.buckets[operation] {
-		if bucket.lastSeen.IsZero() ||
-			now.Sub(bucket.lastSeen) >= limiter.idleTTL {
-			delete(limiter.buckets[operation], subject)
-		}
+func (limiter *Limiter) WorkUnitsFor(operation Operation) uint64 {
+	if limiter == nil {
+		return 0
 	}
-}
-
-func (limiter *Limiter) evictOldestLocked(operation Operation) {
-	var oldestSubject string
-	var oldest time.Time
-	for subject, bucket := range limiter.buckets[operation] {
-		if oldestSubject == "" || bucket.lastSeen.Before(oldest) ||
-			(bucket.lastSeen.Equal(oldest) && subject < oldestSubject) {
-			oldestSubject = subject
-			oldest = bucket.lastSeen
-		}
-	}
-	if oldestSubject != "" {
-		delete(limiter.buckets[operation], oldestSubject)
-	}
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	return limiter.workUnits[operation]
 }

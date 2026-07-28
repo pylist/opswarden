@@ -1569,6 +1569,144 @@ func TestProtectedAssetQuotaRunsBeforeAgentLastUsedAndIsNamespaced(t *testing.T)
 	}
 }
 
+func TestInvalidJWTRotationUsesOnlyBoundedSourceAdmission(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := agents.NewLimiter(agents.LimiterConfig{
+		Capacity: map[agents.Operation]int{
+			agents.OperationRequestSource: 30_000,
+			agents.OperationRequestRead:   30_000,
+		},
+		RefillPerSecond: map[agents.Operation]float64{
+			agents.OperationRequestSource: 0.000001,
+			agents.OperationRequestRead:   0.000001,
+		},
+		MaxSubjects: 128,
+	})
+	service := &fakeIdentityService{}
+	handler := newTestHandler(Dependencies{
+		Identity: service, Spaces: fakeSpaceService{}, Limiter: limiter,
+		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
+	})
+	started := time.Now()
+	for index := range 20_000 {
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+		request.RemoteAddr = "198.51.100.230:4242"
+		request.Header.Set(
+			"Authorization", fmt.Sprintf("Bearer invalid-jwt-%d", index),
+		)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized &&
+			response.Code != http.StatusTooManyRequests {
+			t.Fatalf("request %d status=%d", index, response.Code)
+		}
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("invalid JWT rotation took %s", elapsed)
+	}
+	if count := limiter.SubjectCountFor(agents.OperationRequestSource); count != 1 {
+		t.Fatalf("source subjects=%d want 1", count)
+	}
+	if count := limiter.SubjectCountFor(agents.OperationRequestRead); count != 0 {
+		t.Fatalf("invalid JWTs created %d strict subjects", count)
+	}
+	if work := limiter.WorkUnitsFor(agents.OperationRequestRead); work != 0 {
+		t.Fatalf("invalid JWT strict work=%d want 0", work)
+	}
+	if service.resolveCalls.Load() != 0 {
+		t.Fatalf("invalid JWTs reached session persistence %d times", service.resolveCalls.Load())
+	}
+}
+
+func TestRefreshedJWTsShareStableSessionQuotaAcrossSources(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	clock := &fixedClock{now: now}
+	service := &fakeIdentityService{
+		principals: map[string]identity.SessionPrincipal{
+			"stable-session": {
+				UserID: "usr_stable", SessionID: "ses_stable", IssuedAt: now,
+			},
+			"other-session": {
+				UserID: "usr_other", SessionID: "ses_other", IssuedAt: now,
+			},
+		},
+	}
+	recorder := &recordingAuthAudit{}
+	handler := newTestHandler(Dependencies{
+		Identity: service, Spaces: fakeSpaceService{}, AuthAudit: recorder,
+		Clock: clock, MasterKey: [32]byte{1},
+		Limiter: agents.NewLimiter(agents.LimiterConfig{
+			Capacity: map[agents.Operation]int{
+				agents.OperationRequestSource: 20,
+				agents.OperationRequestWrite:  2,
+			},
+			RefillPerSecond: map[agents.Operation]float64{
+				agents.OperationRequestSource: 0.000001,
+				agents.OperationRequestWrite:  0.000001,
+			},
+		}),
+	})
+	current, err := handler.(*Router).jwt.sign(
+		"usr_stable", identity.Session{
+			RawToken: "stable-session", ExpiresAt: now.Add(time.Hour),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.now = clock.now.Add(time.Second)
+	for index := range 3 {
+		request := httptest.NewRequest(
+			http.MethodPost, "/api/v1/auth/refresh", nil,
+		)
+		request.RemoteAddr = fmt.Sprintf("198.51.100.%d:4242", index+240)
+		request.Header.Set("Authorization", "Bearer "+current)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if index < 2 {
+			if response.Code != http.StatusOK {
+				t.Fatalf("refresh %d status=%d body=%s", index, response.Code, response.Body.String())
+			}
+			var result struct {
+				Token string `json:"token"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			current = result.Token
+			clock.now = clock.now.Add(time.Second)
+		} else if response.Code != http.StatusTooManyRequests {
+			t.Fatalf("refreshed JWT reset session quota: %d", response.Code)
+		}
+	}
+	if calls := service.resolveCalls.Load(); calls != 2 {
+		t.Fatalf("over-limit refresh reached session persistence: %d", calls)
+	}
+	if events := recorder.eventCount(); events != 4 {
+		t.Fatalf("over-limit refresh changed audit rows: %d", events)
+	}
+
+	otherToken, err := handler.(*Router).jwt.sign(
+		"usr_other", identity.Session{
+			RawToken: "other-session", ExpiresAt: now.Add(time.Hour),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", nil)
+	other.RemoteAddr = "198.51.100.250:4242"
+	other.Header.Set("Authorization", "Bearer "+otherToken)
+	otherResponse := httptest.NewRecorder()
+	handler.ServeHTTP(otherResponse, other)
+	if otherResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"one session blocked another: %d %s",
+			otherResponse.Code, otherResponse.Body.String(),
+		)
+	}
+}
+
 type blockingIdentityService struct {
 	*fakeIdentityService
 	started chan struct{}
