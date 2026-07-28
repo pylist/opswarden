@@ -14,8 +14,10 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -36,12 +38,22 @@ type AuthenticationAuditRecorder interface {
 	RecordReadBeforeReturn(context.Context, audit.Event) error
 }
 
+type AgentAuthenticator interface {
+	agents.Authenticator
+	InspectAuthenticationAt(
+		context.Context, string, time.Time,
+	) (agents.AuthenticatedPrincipal, error)
+	AuthenticateAt(
+		context.Context, string, time.Time,
+	) (agents.AuthenticatedPrincipal, error)
+}
+
 type CredentialService interface {
 	List(context.Context, credentials.Principal, credentials.ListFilter) ([]credentials.Metadata, string, error)
-	Get(context.Context, credentials.Principal, string) (credentials.Decrypted, error)
-	Create(context.Context, credentials.Principal, credentials.CreateInput, credentials.WriteContext) (credentials.MutationResult, error)
-	Update(context.Context, credentials.Principal, credentials.UpdateInput, credentials.WriteContext) (credentials.MutationResult, error)
-	Delete(context.Context, credentials.Principal, string, uint64, credentials.WriteContext) error
+	GetAt(context.Context, credentials.Principal, string, time.Time) (credentials.Decrypted, error)
+	CreateAt(context.Context, credentials.Principal, credentials.CreateInput, credentials.WriteContext, time.Time) (credentials.MutationResult, error)
+	UpdateAt(context.Context, credentials.Principal, credentials.UpdateInput, credentials.WriteContext, time.Time) (credentials.MutationResult, error)
+	DeleteAt(context.Context, credentials.Principal, string, uint64, credentials.WriteContext, time.Time) error
 }
 
 type AssetService interface {
@@ -50,7 +62,7 @@ type AssetService interface {
 }
 
 type Dependencies struct {
-	Agents            agents.Authenticator
+	Agents            AgentAuthenticator
 	Credentials       CredentialService
 	Assets            AssetService
 	AuthAudit         AuthenticationAuditRecorder
@@ -68,6 +80,37 @@ type requestContext struct {
 }
 
 type requestContextKey struct{}
+type requestTimeGuardKey struct{}
+
+var ErrClockUnavailable = errors.New("trusted request clock unavailable")
+
+type requestTimeGuard struct {
+	mu     sync.Mutex
+	clock  platform.Clock
+	last   time.Time
+	failed bool
+}
+
+func (guard *requestTimeGuard) Next() (time.Time, error) {
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	if guard.failed || guard.clock == nil {
+		return time.Time{}, ErrClockUnavailable
+	}
+	next := guard.clock.Now().UTC()
+	if next.IsZero() || (!guard.last.IsZero() && next.Before(guard.last)) {
+		guard.failed = true
+		return time.Time{}, ErrClockUnavailable
+	}
+	guard.last = next
+	return next, nil
+}
+
+func (guard *requestTimeGuard) Failed() bool {
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	return guard.failed
+}
 
 func New(dependencies Dependencies) (http.Handler, error) {
 	if dependencies.Agents == nil {
@@ -178,8 +221,16 @@ func (handler *handler) ServeHTTP(
 		)
 		return
 	}
+	timeGuard := &requestTimeGuard{clock: handler.dependencies.Clock}
+	request = request.WithContext(context.WithValue(
+		request.Context(), requestTimeGuardKey{}, timeGuard,
+	))
 	sourceIP := requestSourceIP(request, handler.dependencies.TrustedProxyCIDRs)
-	sourceNow := handler.dependencies.Clock.Now().UTC()
+	sourceNow, err := timeGuard.Next()
+	if err != nil {
+		writeClockUnavailable(writer, requestID)
+		return
+	}
 	sourceReservation, sourceDecision := handler.dependencies.Limiter.Reserve(
 		[]agents.LimitRequest{{
 			Subject:   "mcp-preauth-source:" + sourceIP,
@@ -219,7 +270,11 @@ func (handler *handler) ServeHTTP(
 	operation, sourceOperation := mcpRequestOperation(envelope)
 	// Apply the same credential list/read/write source buckets used by REST once
 	// the bounded JSON-RPC envelope reveals the requested tool.
-	operationSourceNow := handler.dependencies.Clock.Now().UTC()
+	operationSourceNow, err := timeGuard.Next()
+	if err != nil {
+		writeClockUnavailable(writer, requestID)
+		return
+	}
 	operationSourceReservation, sourceDecision :=
 		handler.dependencies.Limiter.Reserve(
 			[]agents.LimitRequest{{
@@ -235,20 +290,33 @@ func (handler *handler) ServeHTTP(
 	operationSourceReservation.Commit()
 	raw, hasBearer := bearerToken(request.Header.Values("Authorization"))
 	if !hasBearer || !strings.HasPrefix(raw, "owat_") {
-		handler.rejectAuthentication(writer, request, requestID, sourceIP)
+		handler.rejectAuthentication(
+			writer, request, requestID, sourceIP, timeGuard,
+		)
 		return
 	}
-	inspected, err := handler.dependencies.Agents.InspectAuthentication(
-		request.Context(), raw,
+	inspectNow, err := timeGuard.Next()
+	if err != nil {
+		writeClockUnavailable(writer, requestID)
+		return
+	}
+	inspected, err := handler.dependencies.Agents.InspectAuthenticationAt(
+		request.Context(), raw, inspectNow,
 	)
 	if err != nil || inspected.AgentID == "" || inspected.TokenID == "" {
-		handler.rejectAuthentication(writer, request, requestID, sourceIP)
+		handler.rejectAuthentication(
+			writer, request, requestID, sourceIP, timeGuard,
+		)
 		return
 	}
 	strictSubject := "mcp-preauth-agent:" + bearerFingerprint(
 		inspected.AgentID+"\x00"+inspected.TokenID+"\x00"+raw,
 	)
-	strictNow := handler.dependencies.Clock.Now().UTC()
+	strictNow, err := timeGuard.Next()
+	if err != nil {
+		writeClockUnavailable(writer, requestID)
+		return
+	}
 	strictReservation, strictDecision := handler.dependencies.Limiter.Reserve(
 		[]agents.LimitRequest{{
 			Subject: strictSubject, Operation: operation,
@@ -260,14 +328,27 @@ func (handler *handler) ServeHTTP(
 		return
 	}
 	strictReservation.Commit()
-	principal, err := handler.dependencies.Agents.Authenticate(request.Context(), raw)
+	authenticateNow, err := timeGuard.Next()
+	if err != nil {
+		writeClockUnavailable(writer, requestID)
+		return
+	}
+	principal, err := handler.dependencies.Agents.AuthenticateAt(
+		request.Context(), raw, authenticateNow,
+	)
 	if err != nil || principal.AgentID != inspected.AgentID ||
 		principal.TokenID != inspected.TokenID {
-		handler.rejectAuthentication(writer, request, requestID, sourceIP)
+		handler.rejectAuthentication(
+			writer, request, requestID, sourceIP, timeGuard,
+		)
 		return
 	}
 	actor := principal.AuditActor()
-	auditNow := handler.dependencies.Clock.Now().UTC()
+	auditNow, err := timeGuard.Next()
+	if err != nil {
+		writeClockUnavailable(writer, requestID)
+		return
+	}
 	if err := handler.dependencies.AuthAudit.RecordReadBeforeReturn(
 		request.Context(),
 		audit.Event{
@@ -286,12 +367,65 @@ func (handler *handler) ServeHTTP(
 		principal: principal, actor: actor, requestID: requestID,
 		sourceIP: sourceIP, userAgent: safeUserAgent(request.UserAgent()),
 	})
-	handler.stream.ServeHTTP(writer, request.WithContext(ctx))
+	buffered := newBufferedResponse(writer.Header())
+	handler.stream.ServeHTTP(buffered, request.WithContext(ctx))
+	if timeGuard.Failed() {
+		clear(buffered.body.Bytes())
+		writeClockUnavailable(writer, requestID)
+		return
+	}
+	buffered.Commit(writer)
 }
 
 type prefixedReadCloser struct {
 	io.Reader
 	io.Closer
+}
+
+type bufferedResponse struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func newBufferedResponse(initial http.Header) *bufferedResponse {
+	return &bufferedResponse{header: initial.Clone()}
+}
+
+func (response *bufferedResponse) Header() http.Header {
+	return response.header
+}
+
+func (response *bufferedResponse) WriteHeader(status int) {
+	if response.status == 0 {
+		response.status = status
+	}
+}
+
+func (response *bufferedResponse) Write(encoded []byte) (int, error) {
+	if response.status == 0 {
+		response.status = http.StatusOK
+	}
+	return response.body.Write(encoded)
+}
+
+func (*bufferedResponse) Flush() {}
+
+func (response *bufferedResponse) Commit(writer http.ResponseWriter) {
+	destination := writer.Header()
+	for name := range destination {
+		destination.Del(name)
+	}
+	for name, values := range response.header {
+		destination[name] = slices.Clone(values)
+	}
+	status := response.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	writer.WriteHeader(status)
+	_, _ = writer.Write(response.body.Bytes())
+	clear(response.body.Bytes())
 }
 
 func inspectMCPBodyPrefix(body io.Reader) ([]byte, byte, bool) {
@@ -388,8 +522,13 @@ func (handler *handler) rejectAuthentication(
 	request *http.Request,
 	requestID string,
 	sourceIP string,
+	timeGuard *requestTimeGuard,
 ) {
-	now := handler.dependencies.Clock.Now().UTC()
+	now, err := timeGuard.Next()
+	if err != nil {
+		writeClockUnavailable(writer, requestID)
+		return
+	}
 	reservation, decision := handler.dependencies.Limiter.Reserve(
 		[]agents.LimitRequest{{
 			Subject:   "mcp-auth-failure:" + sourceIP,
@@ -419,6 +558,12 @@ func (handler *handler) rejectAuthentication(
 		return
 	}
 	writeTransportError(writer, http.StatusUnauthorized, "UNAUTHENTICATED", requestID)
+}
+
+func writeClockUnavailable(writer http.ResponseWriter, requestID string) {
+	writeTransportError(
+		writer, http.StatusServiceUnavailable, "CLOCK_UNAVAILABLE", requestID,
+	)
 }
 
 func writeRateLimitError(

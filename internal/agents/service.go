@@ -471,10 +471,18 @@ func (service *Service) Authenticate(
 	ctx context.Context,
 	raw string,
 ) (AuthenticatedPrincipal, error) {
+	return service.AuthenticateAt(ctx, raw, service.clock.Now().UTC())
+}
+
+func (service *Service) AuthenticateAt(
+	ctx context.Context,
+	raw string,
+	now time.Time,
+) (AuthenticatedPrincipal, error) {
 	if !validRawToken(raw) {
 		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidToken)
 	}
-	now := service.clock.Now().UTC()
+	now = now.UTC()
 	if now.IsZero() {
 		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidClock)
 	}
@@ -561,10 +569,18 @@ func (service *Service) InspectAuthentication(
 	ctx context.Context,
 	raw string,
 ) (AuthenticatedPrincipal, error) {
+	return service.InspectAuthenticationAt(ctx, raw, service.clock.Now().UTC())
+}
+
+func (service *Service) InspectAuthenticationAt(
+	ctx context.Context,
+	raw string,
+	now time.Time,
+) (AuthenticatedPrincipal, error) {
 	if !validRawToken(raw) {
 		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidToken)
 	}
-	now := service.clock.Now().UTC()
+	now = now.UTC()
 	if now.IsZero() {
 		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidClock)
 	}

@@ -182,6 +182,15 @@ func (s *Service) Get(
 	principal Principal,
 	credentialID string,
 ) (Decrypted, error) {
+	return s.GetAt(ctx, principal, credentialID, s.clock.Now().UTC())
+}
+
+func (s *Service) GetAt(
+	ctx context.Context,
+	principal Principal,
+	credentialID string,
+	now time.Time,
+) (Decrypted, error) {
 	if credentialID == "" {
 		return Decrypted{}, ErrNotFound
 	}
@@ -210,9 +219,9 @@ func (s *Service) Get(
 	}
 	defer clearBytes(plaintext)
 
-	event, err := s.auditEvent(
+	event, err := s.auditEventAt(
 		principal, audit.Actor{}, "credential.read", record.metadata,
-		nil, "",
+		nil, "", now,
 	)
 	if err != nil {
 		return Decrypted{}, ErrAuditUnavailable
@@ -234,6 +243,18 @@ func (s *Service) Create(
 	principal Principal,
 	input CreateInput,
 	writeContext WriteContext,
+) (MutationResult, error) {
+	return s.CreateAt(
+		ctx, principal, input, writeContext, s.clock.Now().UTC(),
+	)
+}
+
+func (s *Service) CreateAt(
+	ctx context.Context,
+	principal Principal,
+	input CreateInput,
+	writeContext WriteContext,
+	now time.Time,
 ) (MutationResult, error) {
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 	if err := validateCreateInput(input); err != nil {
@@ -284,7 +305,7 @@ func (s *Service) Create(
 	if err != nil {
 		return MutationResult{}, err
 	}
-	now := s.clock.Now().UTC()
+	now = now.UTC()
 	var replayed *idempotencyResult
 	err = s.repository.withTx(ctx, func(tx *sql.Tx) error {
 		replay, err := s.checkIdempotency(
@@ -333,13 +354,13 @@ func (s *Service) Create(
 		); err != nil {
 			return err
 		}
-		event, err := s.auditEvent(
+		event, err := s.auditEventAt(
 			principal, writeContext.Actor, "credential.create", metadata,
 			audit.ChangeFields{
 				audit.FieldDisplayName, audit.FieldCredentialType, audit.FieldTags,
 				audit.FieldAssetLinks, audit.FieldVersion,
 			},
-			writeContext.Reason,
+			writeContext.Reason, now,
 		)
 		if err != nil {
 			return ErrAuditUnavailable
@@ -369,6 +390,18 @@ func (s *Service) Update(
 	input UpdateInput,
 	writeContext WriteContext,
 ) (MutationResult, error) {
+	return s.UpdateAt(
+		ctx, principal, input, writeContext, s.clock.Now().UTC(),
+	)
+}
+
+func (s *Service) UpdateAt(
+	ctx context.Context,
+	principal Principal,
+	input UpdateInput,
+	writeContext WriteContext,
+	now time.Time,
+) (MutationResult, error) {
 	if input.ExpectedVersion == 0 {
 		return MutationResult{}, ErrVersionConflict
 	}
@@ -387,7 +420,7 @@ func (s *Service) Update(
 	if err != nil {
 		return MutationResult{}, err
 	}
-	now := s.clock.Now().UTC()
+	now = now.UTC()
 	current, err := s.repository.recordByID(
 		ctx, s.repository.db.Reader, input.CredentialID, true,
 	)
@@ -544,9 +577,9 @@ func (s *Service) Update(
 				return err
 			}
 		}
-		event, err := s.auditEvent(
+		event, err := s.auditEventAt(
 			principal, writeContext.Actor, "credential.update", updated,
-			changeFields, writeContext.Reason,
+			changeFields, writeContext.Reason, now,
 		)
 		if err != nil {
 			return ErrAuditUnavailable
@@ -577,6 +610,20 @@ func (s *Service) Delete(
 	expectedVersion uint64,
 	writeContext WriteContext,
 ) error {
+	return s.DeleteAt(
+		ctx, principal, credentialID, expectedVersion, writeContext,
+		s.clock.Now().UTC(),
+	)
+}
+
+func (s *Service) DeleteAt(
+	ctx context.Context,
+	principal Principal,
+	credentialID string,
+	expectedVersion uint64,
+	writeContext WriteContext,
+	now time.Time,
+) error {
 	if expectedVersion == 0 {
 		return ErrVersionConflict
 	}
@@ -594,7 +641,7 @@ func (s *Service) Delete(
 	if err != nil {
 		return err
 	}
-	now := s.clock.Now().UTC()
+	now = now.UTC()
 	return s.repository.withTx(ctx, func(tx *sql.Tx) error {
 		endpoint := "credential.delete/" + credentialID
 		metadata, err := s.repository.metadataByID(ctx, tx, credentialID, true)
@@ -635,9 +682,9 @@ func (s *Service) Delete(
 		}
 		deletedAt := now
 		metadata.DeletedAt = &deletedAt
-		event, err := s.auditEvent(
+		event, err := s.auditEventAt(
 			principal, writeContext.Actor, "credential.delete", metadata,
-			audit.ChangeFields{audit.FieldDeletedAt}, writeContext.Reason,
+			audit.ChangeFields{audit.FieldDeletedAt}, writeContext.Reason, now,
 		)
 		if err != nil {
 			return ErrAuditUnavailable
@@ -933,6 +980,21 @@ func (s *Service) auditEvent(
 	changeFields audit.ChangeFields,
 	reason string,
 ) (audit.Event, error) {
+	return s.auditEventAt(
+		principal, actor, action, metadata, changeFields, reason,
+		s.clock.Now().UTC(),
+	)
+}
+
+func (s *Service) auditEventAt(
+	principal Principal,
+	actor audit.Actor,
+	action string,
+	metadata Metadata,
+	changeFields audit.ChangeFields,
+	reason string,
+	now time.Time,
+) (audit.Event, error) {
 	if actor == (audit.Actor{}) {
 		actor = principal.Actor
 	}
@@ -941,7 +1003,7 @@ func (s *Service) auditEvent(
 		return audit.Event{}, err
 	}
 	return audit.Event{
-		ID: id, RequestID: principal.RequestID, CreatedAt: s.clock.Now().UTC(),
+		ID: id, RequestID: principal.RequestID, CreatedAt: now.UTC(),
 		Actor: actor, Action: action, SpaceID: metadata.SpaceID,
 		ResourceType: "credential", ResourceID: metadata.ID,
 		SourceIP: principal.SourceIP, UserAgent: principal.UserAgent,

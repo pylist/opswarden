@@ -331,8 +331,13 @@ func handleCredentialGet(
 		blank(input.SpaceID) || blank(input.CredentialID) {
 		return nil, ErrInvalidToolInput
 	}
-	decrypted, err := dependencies.Credentials.Get(
-		ctx, credentialPrincipal(authenticated, input.SpaceID), input.CredentialID,
+	readNow, err := nextRequestTime(ctx)
+	if err != nil {
+		return nil, err
+	}
+	decrypted, err := dependencies.Credentials.GetAt(
+		ctx, credentialPrincipal(authenticated, input.SpaceID),
+		input.CredentialID, readNow,
 	)
 	if err != nil {
 		clear(decrypted.Payload)
@@ -368,7 +373,11 @@ func handleCredentialCreate(
 	}
 	defer clear(input.Payload)
 	principal := credentialPrincipal(authenticated, input.SpaceID)
-	result, err := dependencies.Credentials.Create(
+	mutationNow, err := nextRequestTime(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result, err := dependencies.Credentials.CreateAt(
 		ctx, principal, credentials.CreateInput{
 			SpaceID: input.SpaceID, DisplayName: input.DisplayName,
 			Type: input.Type, Tags: input.Tags, AssetIDs: input.AssetIDs,
@@ -378,6 +387,7 @@ func handleCredentialCreate(
 			Actor: authenticated.actor, Reason: input.Reason,
 			IdempotencyKey: input.IdempotencyKey,
 		},
+		mutationNow,
 	)
 	if err != nil {
 		return nil, err
@@ -402,7 +412,11 @@ func handleCredentialUpdate(
 		return nil, ErrInvalidToolInput
 	}
 	defer clear(input.Payload)
-	result, err := dependencies.Credentials.Update(
+	mutationNow, err := nextRequestTime(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result, err := dependencies.Credentials.UpdateAt(
 		ctx, credentialPrincipal(authenticated, input.SpaceID),
 		credentials.UpdateInput{
 			CredentialID: input.CredentialID, ExpectedVersion: input.Expected,
@@ -413,6 +427,7 @@ func handleCredentialUpdate(
 			Actor: authenticated.actor, Reason: input.Reason,
 			IdempotencyKey: input.IdempotencyKey,
 		},
+		mutationNow,
 	)
 	if err != nil {
 		return nil, err
@@ -435,13 +450,18 @@ func handleCredentialDelete(
 		blank(input.Reason) || blank(input.IdempotencyKey) {
 		return nil, ErrInvalidToolInput
 	}
-	err := dependencies.Credentials.Delete(
+	mutationNow, err := nextRequestTime(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = dependencies.Credentials.DeleteAt(
 		ctx, credentialPrincipal(authenticated, input.SpaceID),
 		input.CredentialID, input.Expected,
 		credentials.WriteContext{
 			Actor: authenticated.actor, Reason: input.Reason,
 			IdempotencyKey: input.IdempotencyKey,
 		},
+		mutationNow,
 	)
 	if err != nil {
 		return nil, err
@@ -529,8 +549,13 @@ func handleTOTPGenerate(
 		blank(input.SpaceID) || blank(input.CredentialID) {
 		return nil, ErrInvalidToolInput
 	}
-	decrypted, err := dependencies.Credentials.Get(
-		ctx, credentialPrincipal(authenticated, input.SpaceID), input.CredentialID,
+	readNow, err := nextRequestTime(ctx)
+	if err != nil {
+		return nil, err
+	}
+	decrypted, err := dependencies.Credentials.GetAt(
+		ctx, credentialPrincipal(authenticated, input.SpaceID),
+		input.CredentialID, readNow,
 	)
 	if err != nil {
 		clear(decrypted.Payload)
@@ -553,17 +578,25 @@ func handleTOTPGenerate(
 		payload.Seed = ""
 		return nil, credentials.ErrNotFound
 	}
-	now := dependencies.Clock.Now().UTC()
-	code, expiry, err := generateTOTP(payload, now)
+	generationNow, err := nextRequestTime(ctx)
+	if err != nil {
+		payload.Seed = ""
+		return nil, err
+	}
+	code, expiry, err := generateTOTP(payload, generationNow)
 	payload.Seed = ""
 	if err != nil {
 		return nil, credentials.ErrNotFound
 	}
 	defer clear(code)
+	auditNow, err := nextRequestTime(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := dependencies.AuthAudit.RecordReadBeforeReturn(
 		ctx, audit.Event{
 			ID: newID("aud_"), RequestID: authenticated.requestID,
-			CreatedAt: now,
+			CreatedAt: auditNow,
 			Actor:     authenticated.actor, Action: "credential.totp.generate",
 			SpaceID: input.SpaceID, ResourceType: "credential",
 			ResourceID: input.CredentialID, SourceIP: authenticated.sourceIP,
@@ -576,6 +609,14 @@ func handleTOTPGenerate(
 		Code   string    `json:"code"`
 		Expiry time.Time `json:"expiry"`
 	}{Code: string(code), Expiry: expiry}, nil
+}
+
+func nextRequestTime(ctx context.Context) (time.Time, error) {
+	guard, ok := ctx.Value(requestTimeGuardKey{}).(*requestTimeGuard)
+	if !ok || guard == nil {
+		return time.Time{}, ErrClockUnavailable
+	}
+	return guard.Next()
 }
 
 func credentialPrincipal(

@@ -61,6 +61,15 @@ func (service *fakeCredentialService) Get(
 	return result, service.err
 }
 
+func (service *fakeCredentialService) GetAt(
+	ctx context.Context,
+	principal credentials.Principal,
+	credentialID string,
+	_ time.Time,
+) (credentials.Decrypted, error) {
+	return service.Get(ctx, principal, credentialID)
+}
+
 func (service *fakeCredentialService) Create(
 	_ context.Context,
 	principal credentials.Principal,
@@ -77,6 +86,16 @@ func (service *fakeCredentialService) Create(
 	return service.createResult, service.err
 }
 
+func (service *fakeCredentialService) CreateAt(
+	ctx context.Context,
+	principal credentials.Principal,
+	input credentials.CreateInput,
+	writeContext credentials.WriteContext,
+	_ time.Time,
+) (credentials.MutationResult, error) {
+	return service.Create(ctx, principal, input, writeContext)
+}
+
 func (service *fakeCredentialService) Update(
 	context.Context,
 	credentials.Principal,
@@ -84,6 +103,16 @@ func (service *fakeCredentialService) Update(
 	credentials.WriteContext,
 ) (credentials.MutationResult, error) {
 	return credentials.MutationResult{}, service.err
+}
+
+func (service *fakeCredentialService) UpdateAt(
+	ctx context.Context,
+	principal credentials.Principal,
+	input credentials.UpdateInput,
+	writeContext credentials.WriteContext,
+	_ time.Time,
+) (credentials.MutationResult, error) {
+	return service.Update(ctx, principal, input, writeContext)
 }
 
 func (service *fakeCredentialService) Delete(
@@ -94,6 +123,19 @@ func (service *fakeCredentialService) Delete(
 	credentials.WriteContext,
 ) error {
 	return service.err
+}
+
+func (service *fakeCredentialService) DeleteAt(
+	ctx context.Context,
+	principal credentials.Principal,
+	credentialID string,
+	expectedVersion uint64,
+	writeContext credentials.WriteContext,
+	_ time.Time,
+) error {
+	return service.Delete(
+		ctx, principal, credentialID, expectedVersion, writeContext,
+	)
 }
 
 type fakeAssetService struct {
@@ -459,6 +501,7 @@ func TestGenerateTOTPMatchesRFC6238SHA1Vector(t *testing.T) {
 }
 
 func TestInvalidTOTPDoesNotWriteGenerationSuccessAudit(t *testing.T) {
+	clock := fixedClock{now: time.Unix(59, 0).UTC()}
 	recorder := &generationAuditRecorder{}
 	service := &fakeCredentialService{get: credentials.Decrypted{
 		Metadata: credentials.Metadata{
@@ -470,10 +513,10 @@ func TestInvalidTOTPDoesNotWriteGenerationSuccessAudit(t *testing.T) {
 		),
 	}}
 	result, err := handleTOTPGenerate(
-		context.Background(),
+		toolContextWithClock(clock),
 		Dependencies{
 			Credentials: service, AuthAudit: recorder,
-			Clock: fixedClock{now: time.Unix(59, 0).UTC()},
+			Clock: clock,
 		},
 		requestContext{
 			principal: agents.AuthenticatedPrincipal{
@@ -501,6 +544,7 @@ func TestInvalidTOTPDoesNotWriteGenerationSuccessAudit(t *testing.T) {
 }
 
 func TestNegativeTOTPClockFailsWithoutSuccessAudit(t *testing.T) {
+	clock := fixedClock{now: time.Unix(-1, 0).UTC()}
 	recorder := &generationAuditRecorder{}
 	service := &fakeCredentialService{get: credentials.Decrypted{
 		Metadata: credentials.Metadata{
@@ -512,10 +556,10 @@ func TestNegativeTOTPClockFailsWithoutSuccessAudit(t *testing.T) {
 		),
 	}}
 	result, err := handleTOTPGenerate(
-		context.Background(),
+		toolContextWithClock(clock),
 		Dependencies{
 			Credentials: service, AuthAudit: recorder,
-			Clock: fixedClock{now: time.Unix(-1, 0).UTC()},
+			Clock: clock,
 		},
 		requestContext{
 			principal: agents.AuthenticatedPrincipal{
@@ -540,6 +584,7 @@ func TestNegativeTOTPClockFailsWithoutSuccessAudit(t *testing.T) {
 }
 
 func TestTOTPGenerationAuditFailureReturnsNoCode(t *testing.T) {
+	clock := fixedClock{now: time.Unix(59, 0).UTC()}
 	recorder := &generationAuditRecorder{
 		failAction: "credential.totp.generate",
 	}
@@ -553,10 +598,10 @@ func TestTOTPGenerationAuditFailureReturnsNoCode(t *testing.T) {
 		),
 	}}
 	result, err := handleTOTPGenerate(
-		context.Background(),
+		toolContextWithClock(clock),
 		Dependencies{
 			Credentials: service, AuthAudit: recorder,
-			Clock: fixedClock{now: time.Unix(59, 0).UTC()},
+			Clock: clock,
 		},
 		requestContext{
 			principal: agents.AuthenticatedPrincipal{
@@ -579,6 +624,13 @@ func TestTOTPGenerationAuditFailureReturnsNoCode(t *testing.T) {
 			t.Fatalf("TOTP material reached audit: %+v", event)
 		}
 	}
+}
+
+func toolContextWithClock(clock fixedClock) context.Context {
+	return context.WithValue(
+		context.Background(), requestTimeGuardKey{},
+		&requestTimeGuard{clock: clock},
+	)
 }
 
 func TestToolSuccessRejectsOutputSchemaMismatchWithoutLeakingPayload(t *testing.T) {

@@ -62,6 +62,24 @@ type mutableClock struct {
 	now time.Time
 }
 
+type sequenceClock struct {
+	mu      sync.Mutex
+	samples []time.Time
+	last    time.Time
+}
+
+func (clock *sequenceClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	if len(clock.samples) == 0 {
+		return clock.last
+	}
+	next := clock.samples[0]
+	clock.samples = clock.samples[1:]
+	clock.last = next
+	return next
+}
+
 func (clock *mutableClock) Now() time.Time {
 	clock.mu.Lock()
 	defer clock.mu.Unlock()
@@ -93,6 +111,14 @@ func (authenticator *fakeAuthenticator) InspectAuthentication(
 	return authenticator.principal, authenticator.inspectErr
 }
 
+func (authenticator *fakeAuthenticator) InspectAuthenticationAt(
+	ctx context.Context,
+	raw string,
+	_ time.Time,
+) (agents.AuthenticatedPrincipal, error) {
+	return authenticator.InspectAuthentication(ctx, raw)
+}
+
 func (authenticator *fakeAuthenticator) Authenticate(
 	context.Context,
 	string,
@@ -101,6 +127,14 @@ func (authenticator *fakeAuthenticator) Authenticate(
 	defer authenticator.mu.Unlock()
 	authenticator.auths++
 	return authenticator.principal, authenticator.authErr
+}
+
+func (authenticator *fakeAuthenticator) AuthenticateAt(
+	ctx context.Context,
+	raw string,
+	_ time.Time,
+) (agents.AuthenticatedPrincipal, error) {
+	return authenticator.Authenticate(ctx, raw)
 }
 
 func (authenticator *fakeAuthenticator) revoke() {
@@ -202,6 +236,22 @@ func (authenticator *inspectBlockedAuthenticator) Authenticate(
 	defer authenticator.mu.Unlock()
 	authenticator.auths++
 	return authenticator.principal, nil
+}
+
+func (authenticator *inspectBlockedAuthenticator) InspectAuthenticationAt(
+	ctx context.Context,
+	raw string,
+	_ time.Time,
+) (agents.AuthenticatedPrincipal, error) {
+	return authenticator.InspectAuthentication(ctx, raw)
+}
+
+func (authenticator *inspectBlockedAuthenticator) AuthenticateAt(
+	ctx context.Context,
+	raw string,
+	_ time.Time,
+) (agents.AuthenticatedPrincipal, error) {
+	return authenticator.Authenticate(ctx, raw)
 }
 
 func (transport bearerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -822,6 +872,123 @@ func TestDelayedInspectUsesFreshStrictClock(t *testing.T) {
 	}
 }
 
+func TestRequestClockRollbackFailsClosedAtEveryAuthenticationStage(t *testing.T) {
+	base := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name         string
+		rollbackCall int
+		wantInspect  int
+		wantAuth     int
+	}{
+		{name: "prefix to operation source", rollbackCall: 2},
+		{name: "operation source to inspect", rollbackCall: 3},
+		{
+			name: "inspect to strict", rollbackCall: 4,
+			wantInspect: 1,
+		},
+		{
+			name: "strict to authenticate", rollbackCall: 5,
+			wantInspect: 1,
+		},
+		{
+			name: "authenticate to audit", rollbackCall: 6,
+			wantInspect: 1, wantAuth: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			samples := make([]time.Time, test.rollbackCall)
+			for index := range samples {
+				samples[index] = base.Add(time.Duration(index) * time.Second)
+			}
+			samples[test.rollbackCall-1] = base.Add(-time.Second)
+			clock := &sequenceClock{samples: samples}
+			authenticator := &fakeAuthenticator{
+				principal: agents.AuthenticatedPrincipal{
+					AgentID: "agt_test", TokenID: "tok_test",
+					TokenPrefix: "owat_fixture",
+				},
+			}
+			auditRecorder := &recordingAudit{}
+			credentialService := &fakeCredentialService{}
+			handler, err := New(Dependencies{
+				Agents: authenticator, AuthAudit: auditRecorder,
+				Credentials: credentialService, Assets: &fakeAssetService{},
+				Clock: clock, Limiter: agents.NewLimiter(agents.LimiterConfig{}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(
+				response,
+				mcpListRequest(io.NopCloser(strings.NewReader(
+					credentialListRequestJSON(),
+				))),
+			)
+			assertClockUnavailableResponse(t, response)
+			inspects, auths := authenticator.counts()
+			if inspects != test.wantInspect || auths != test.wantAuth ||
+				credentialService.listCalls != 0 ||
+				len(auditRecorder.events) != 0 {
+				t.Fatalf(
+					"rollback continued work: inspect=%d/%d auth=%d/%d list=%d audit=%d",
+					inspects, test.wantInspect, auths, test.wantAuth,
+					credentialService.listCalls, len(auditRecorder.events),
+				)
+			}
+		})
+	}
+}
+
+func TestRequestClockRollbackAfterCredentialReadReturnsNoTOTP(t *testing.T) {
+	base := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+	samples := make([]time.Time, 8)
+	for index := range samples {
+		samples[index] = base.Add(time.Duration(index) * time.Second)
+	}
+	samples[7] = base.Add(-time.Second)
+	clock := &sequenceClock{samples: samples}
+	authenticator := &fakeAuthenticator{principal: agents.AuthenticatedPrincipal{
+		AgentID: "agt_test", TokenID: "tok_test", TokenPrefix: "owat_fixture",
+	}}
+	auditRecorder := &recordingAudit{}
+	credentialService := &fakeCredentialService{get: credentials.Decrypted{
+		Metadata: credentials.Metadata{
+			ID: "crd_totp", SpaceID: "spc_test",
+			DisplayName: "TOTP", Type: credentials.TypeTOTP, Version: 1,
+		},
+		Payload: json.RawMessage(
+			`{"issuer":"Example","account":"alice","seed":"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ","algorithm":"SHA1","digits":8,"period":30}`,
+		),
+	}}
+	handler, err := New(Dependencies{
+		Agents: authenticator, AuthAudit: auditRecorder,
+		Credentials: credentialService, Assets: &fakeAssetService{},
+		Clock: clock, Limiter: agents.NewLimiter(agents.LimiterConfig{}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(
+		response,
+		mcpToolRequest(
+			"totp_generate",
+			`{"space_id":"spc_test","credential_id":"crd_totp"}`,
+		),
+	)
+	assertClockUnavailableResponse(t, response)
+	if strings.Contains(response.Body.String(), "94287082") {
+		t.Fatalf("clock failure returned TOTP code: %s", response.Body.String())
+	}
+	for _, event := range auditRecorder.events {
+		if event.Action == "credential.totp.generate" && event.Success {
+			t.Fatalf("clock failure wrote TOTP success audit: %+v", event)
+		}
+	}
+}
+
 func credentialListRequestJSON() string {
 	return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"credential_list","arguments":{"space_id":"spc_test"}}}`
 }
@@ -835,6 +1002,26 @@ func mcpListRequest(body io.ReadCloser) *http.Request {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json, text/event-stream")
 	return request
+}
+
+func mcpToolRequest(name string, arguments string) *http.Request {
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":` +
+		strconv.Quote(name) + `,"arguments":` + arguments + `}}`
+	return mcpListRequest(io.NopCloser(strings.NewReader(body)))
+}
+
+func assertClockUnavailableResponse(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"CLOCK_UNAVAILABLE"`) {
+		t.Fatalf(
+			"status=%d body=%s, want 503 CLOCK_UNAVAILABLE",
+			response.Code, response.Body.String(),
+		)
+	}
 }
 
 func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
