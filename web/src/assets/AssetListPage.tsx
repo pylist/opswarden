@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { apiPath, formatApiError } from "../api/client";
 import type { Space } from "../api/types";
 import {
-  isAsset,
+  parseAsset,
   parseList,
   type Asset,
   type WorkflowAPI,
@@ -38,20 +38,34 @@ export function AssetListPage({
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [nextCursor, setNextCursor] = useState("");
+  const [loadingMore, setLoadingMore] = useState(false);
   const generation = useRef(0);
   const requestController = useRef<AbortController | null>(null);
+  const requestedCursors = useRef(new Set<string>());
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (after = "") => {
+    if (after && requestedCursors.current.has(after)) {
+      setError("请求失败，请检查网络连接后重试。");
+      return;
+    }
+    if (!after) {
+      requestedCursors.current.clear();
+      setNextCursor("");
+    }
+    else requestedCursors.current.add(after);
     const current = ++generation.current;
     requestController.current?.abort();
     const controller = new AbortController();
     requestController.current = controller;
-    setLoading(true);
+    if (after) setLoadingMore(true);
+    else setLoading(true);
     setError("");
     try {
       const value = await api.request<unknown>(
         apiPath(["spaces", space.id, "assets"], {
           limit: 100,
+          ...(after ? { after } : {}),
           ...(type ? { type } : {}),
           ...(environment ? { environment } : {}),
           ...(status ? { status } : {}),
@@ -59,15 +73,26 @@ export function AssetListPage({
         { signal: controller.signal },
       );
       if (current !== generation.current) return;
-      const parsed = parseList(value, isAsset);
+      const parsed = parseList(value, parseAsset);
       if (!parsed || parsed.items.some((item) => item.spaceId !== space.id || item.deletedAt)) {
         throw new Error("invalid response");
       }
-      setItems(parsed.items);
+      if (
+        parsed.nextCursor &&
+        (parsed.nextCursor === after ||
+          requestedCursors.current.has(parsed.nextCursor))
+      ) {
+        throw new Error("invalid response");
+      }
+      setItems((existing) =>
+        after ? mergeByID(existing, parsed.items) : parsed.items
+      );
+      setNextCursor(parsed.nextCursor ?? "");
     } catch (caught) {
       if (current === generation.current) setError(formatApiError(caught));
     } finally {
       if (current === generation.current) setLoading(false);
+      if (current === generation.current) setLoadingMore(false);
       if (requestController.current === controller) {
         requestController.current = null;
       }
@@ -79,6 +104,7 @@ export function AssetListPage({
     return () => {
       generation.current += 1;
       requestController.current?.abort();
+      requestedCursors.current.clear();
       setSelectedID("");
     };
   }, [load]);
@@ -130,6 +156,7 @@ export function AssetListPage({
       </section>
       {error && <p className="form-error" role="alert">{error}</p>}
       <section className="table-card" aria-label="资产列表">
+        <p className="muted">搜索仅筛选当前已加载的资产。</p>
         {loading ? <p className="table-status" role="status">正在加载资产…</p> : visible.length === 0 ? (
           <p className="table-status empty-state">没有符合条件的资产。</p>
         ) : (
@@ -148,6 +175,16 @@ export function AssetListPage({
           </div>
         )}
       </section>
+      {nextCursor && !loading && (
+        <button
+          className="secondary-button"
+          type="button"
+          disabled={loadingMore}
+          onClick={() => void load(nextCursor)}
+        >
+          {loadingMore ? "正在加载…" : "加载更多资产"}
+        </button>
+      )}
       {creating && (
         <Modal labelledBy="new-asset-title" onClose={() => setCreating(false)}>
             <h2 id="new-asset-title">新建资产</h2>
@@ -159,4 +196,9 @@ export function AssetListPage({
       )}
     </>
   );
+}
+
+function mergeByID<T extends { id: string }>(existing: T[], incoming: T[]) {
+  const ids = new Set(existing.map((item) => item.id));
+  return [...existing, ...incoming.filter((item) => !ids.has(item.id))];
 }

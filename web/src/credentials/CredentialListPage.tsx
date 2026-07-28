@@ -5,7 +5,7 @@ import type { Space } from "../api/types";
 import {
   credentialTypeLabels,
   credentialTypes,
-  isCredentialMetadata,
+  parseCredentialMetadata,
   parseList,
   type CredentialMetadata,
   type CredentialType,
@@ -47,40 +47,65 @@ export function CredentialListPage({
   const [recycle, setRecycle] = useState(false);
   const [search, setSearch] = useState("");
   const [type, setType] = useState<CredentialType | "">("");
+  const [nextCursor, setNextCursor] = useState("");
+  const [loadingMore, setLoadingMore] = useState(false);
   const generation = useRef(0);
   const requestController = useRef<AbortController | null>(null);
+  const requestedCursors = useRef(new Set<string>());
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (after = "") => {
+    if (after && requestedCursors.current.has(after)) {
+      setError("请求失败，请检查网络连接后重试。");
+      return;
+    }
+    if (!after) {
+      requestedCursors.current.clear();
+      setNextCursor("");
+    }
+    else requestedCursors.current.add(after);
     const current = ++generation.current;
     requestController.current?.abort();
     const controller = new AbortController();
     requestController.current = controller;
-    setState("loading");
+    if (after) setLoadingMore(true);
+    else setState("loading");
     setError("");
     setSelected(null);
     try {
       const value = await api.request<unknown>(
         apiPath(["spaces", space.id, "credentials"], {
           limit: 100,
+          ...(after ? { after } : {}),
           ...(type ? { type } : {}),
         }),
         { signal: controller.signal },
       );
       if (current !== generation.current || !sessionActive) return;
-      const parsed = parseList(value, isCredentialMetadata);
+      const parsed = parseList(value, parseCredentialMetadata);
       if (!parsed || parsed.items.some((item) => item.spaceId !== space.id || item.deletedAt)) {
         throw new Error("invalid response");
       }
-      setItems(parsed.items);
+      if (
+        parsed.nextCursor &&
+        (parsed.nextCursor === after ||
+          requestedCursors.current.has(parsed.nextCursor))
+      ) {
+        throw new Error("invalid response");
+      }
+      setItems((existing) =>
+        after ? mergeByID(existing, parsed.items) : parsed.items
+      );
+      setNextCursor(parsed.nextCursor ?? "");
       setState("ready");
     } catch (caught) {
       if (current !== generation.current) return;
       setError(formatApiError(caught));
-      setState("error");
+      if (!after) setState("error");
     } finally {
       if (requestController.current === controller) {
         requestController.current = null;
       }
+      if (current === generation.current) setLoadingMore(false);
     }
   }, [api, sessionActive, space.id, type]);
 
@@ -89,6 +114,7 @@ export function CredentialListPage({
     return () => {
       generation.current += 1;
       requestController.current?.abort();
+      requestedCursors.current.clear();
       setSelected(null);
     };
   }, [load]);
@@ -97,6 +123,8 @@ export function CredentialListPage({
     if (!sessionActive) {
       generation.current += 1;
       requestController.current?.abort();
+      requestedCursors.current.clear();
+      setNextCursor("");
       setSelected(null);
       setCreating(false);
     }
@@ -132,6 +160,7 @@ export function CredentialListPage({
         api={api}
         space={space}
         systemRole={systemRole}
+        sessionActive={sessionActive}
         onBack={() => setRecycle(false)}
       />
     );
@@ -177,6 +206,8 @@ export function CredentialListPage({
         </div>
       </section>
       <section className="table-card" aria-label="凭据列表">
+        <p className="muted">搜索仅筛选当前已加载的凭据。</p>
+        {state === "ready" && error && <p className="form-error" role="alert">{error}</p>}
         {state === "loading" && <p className="table-status" role="status">正在加载凭据元数据…</p>}
         {state === "error" && (
           <div className="table-status">
@@ -210,6 +241,16 @@ export function CredentialListPage({
           </div>
         )}
       </section>
+      {nextCursor && state === "ready" && (
+        <button
+          className="secondary-button"
+          type="button"
+          disabled={loadingMore}
+          onClick={() => void load(nextCursor)}
+        >
+          {loadingMore ? "正在加载…" : "加载更多凭据"}
+        </button>
+      )}
       {selected && (
         <CredentialDrawer
           api={api}
@@ -245,4 +286,9 @@ export function CredentialListPage({
       )}
     </>
   );
+}
+
+function mergeByID<T extends { id: string }>(existing: T[], incoming: T[]) {
+  const ids = new Set(existing.map((item) => item.id));
+  return [...existing, ...incoming.filter((item) => !ids.has(item.id))];
 }

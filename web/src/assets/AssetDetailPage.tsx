@@ -4,8 +4,8 @@ import { apiPath, formatApiError } from "../api/client";
 import type { Space } from "../api/types";
 import {
   credentialTypeLabels,
-  isAsset,
-  isCredentialMetadata,
+  parseAsset,
+  parseCredentialMetadata,
   parseList,
   safeID,
   type Asset,
@@ -41,12 +41,21 @@ export function AssetDetailPage({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmation, setConfirmation] = useState("");
   const [deleting, setDeleting] = useState(false);
+  const [credentialCursor, setCredentialCursor] = useState("");
+  const [loadingMoreCredentials, setLoadingMoreCredentials] = useState(false);
   const generation = useRef(0);
   const requestController = useRef<AbortController | null>(null);
+  const credentialGeneration = useRef(0);
+  const credentialController = useRef<AbortController | null>(null);
+  const requestedCredentialCursors = useRef(new Set<string>());
 
   const load = useCallback(async () => {
     if (!safeID.test(assetId) || !safeID.test(space.id)) return;
     const current = ++generation.current;
+    credentialGeneration.current += 1;
+    credentialController.current?.abort();
+    requestedCredentialCursors.current.clear();
+    setCredentialCursor("");
     requestController.current?.abort();
     const controller = new AbortController();
     requestController.current = controller;
@@ -65,18 +74,23 @@ export function AssetDetailPage({
         ),
       ]);
       if (current !== generation.current) return;
-      const linked = parseList(credentialValue, isCredentialMetadata);
+      const linked = parseList(credentialValue, parseCredentialMetadata);
+      const parsedAsset = parseAsset(assetValue);
       if (
-        !isAsset(assetValue) ||
-        assetValue.id !== assetId ||
-        assetValue.spaceId !== space.id ||
+        !parsedAsset ||
+        parsedAsset.id !== assetId ||
+        parsedAsset.spaceId !== space.id ||
         !linked ||
         linked.items.some((item) => item.spaceId !== space.id)
       ) {
         throw new Error("invalid response");
       }
-      setAsset(assetValue);
+      if (linked.nextCursor && requestedCredentialCursors.current.has(linked.nextCursor)) {
+        throw new Error("invalid response");
+      }
+      setAsset(parsedAsset);
       setCredentials(linked.items);
+      setCredentialCursor(linked.nextCursor ?? "");
     } catch (caught) {
       if (current === generation.current) setError(formatApiError(caught));
     } finally {
@@ -90,11 +104,62 @@ export function AssetDetailPage({
     void load();
     return () => {
       generation.current += 1;
+      credentialGeneration.current += 1;
       requestController.current?.abort();
+      credentialController.current?.abort();
+      requestedCredentialCursors.current.clear();
       setAsset(null);
       setCredentials([]);
     };
   }, [load]);
+
+  async function loadMoreCredentials() {
+    const after = credentialCursor;
+    if (!after || requestedCredentialCursors.current.has(after)) {
+      setError("请求失败，请检查网络连接后重试。");
+      return;
+    }
+    requestedCredentialCursors.current.add(after);
+    const current = ++credentialGeneration.current;
+    credentialController.current?.abort();
+    const controller = new AbortController();
+    credentialController.current = controller;
+    setLoadingMoreCredentials(true);
+    setError("");
+    try {
+      const value = await api.request<unknown>(
+        apiPath(["spaces", space.id, "assets", assetId, "credentials"], {
+          limit: 100,
+          after,
+        }),
+        { signal: controller.signal },
+      );
+      if (current !== credentialGeneration.current) return;
+      const parsed = parseList(value, parseCredentialMetadata);
+      if (
+        !parsed ||
+        parsed.items.some((item) => item.spaceId !== space.id) ||
+        (parsed.nextCursor &&
+          (parsed.nextCursor === after ||
+            requestedCredentialCursors.current.has(parsed.nextCursor)))
+      ) {
+        throw new Error("invalid response");
+      }
+      setCredentials((existing) => mergeByID(existing, parsed.items));
+      setCredentialCursor(parsed.nextCursor ?? "");
+    } catch (caught) {
+      if (current === credentialGeneration.current) {
+        setError(formatApiError(caught));
+      }
+    } finally {
+      if (credentialController.current === controller) {
+        credentialController.current = null;
+      }
+      if (current === credentialGeneration.current) {
+        setLoadingMoreCredentials(false);
+      }
+    }
+  }
 
   async function remove() {
     if (!asset || deleting || confirmation !== asset.name) return;
@@ -177,6 +242,16 @@ export function AssetDetailPage({
               ))}
             </ul>
           )}
+          {credentialCursor && (
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={loadingMoreCredentials}
+              onClick={() => void loadMoreCredentials()}
+            >
+              {loadingMoreCredentials ? "正在加载…" : "加载更多关联凭据"}
+            </button>
+          )}
         </article>
       </section>
       {editing && (
@@ -208,15 +283,20 @@ export function AssetDetailPage({
             <h2 id="delete-asset-title">确认删除资产</h2>
             <p className="muted">输入资产名称“{asset.name}”以确认。</p>
             <label htmlFor="asset-delete-confirmation">输入资产名称以确认</label>
-            <input id="asset-delete-confirmation" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} autoFocus />
+            <input id="asset-delete-confirmation" value={confirmation} onChange={(event) => setConfirmation(event.target.value)} />
             <div className="button-row">
               <button className="danger-button" type="button" disabled={deleting || confirmation !== asset.name} onClick={() => void remove()}>
                 {deleting ? "正在删除…" : "确认删除"}
               </button>
-              <button className="secondary-button" type="button" onClick={() => setConfirmDelete(false)}>取消</button>
+              <button className="secondary-button" type="button" data-modal-initial-focus onClick={() => setConfirmDelete(false)}>取消</button>
             </div>
         </Modal>
       )}
     </>
   );
+}
+
+function mergeByID<T extends { id: string }>(existing: T[], incoming: T[]) {
+  const ids = new Set(existing.map((item) => item.id));
+  return [...existing, ...incoming.filter((item) => !ids.has(item.id))];
 }

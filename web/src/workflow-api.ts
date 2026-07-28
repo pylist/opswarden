@@ -110,43 +110,95 @@ export const credentialTypeLabels: Record<CredentialType, string> = {
   totp: "TOTP",
 };
 
+export function parseCredentialMetadata(value: unknown): CredentialMetadata | null {
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, [
+      "id", "spaceId", "displayName", "type", "version", "tags", "assetIds",
+      "deletedAt",
+    ]) ||
+    typeof value.id !== "string" ||
+    !safeID.test(value.id) ||
+    typeof value.spaceId !== "string" ||
+    !safeID.test(value.spaceId) ||
+    typeof value.displayName !== "string" ||
+    !credentialTypes.includes(value.type as CredentialType) ||
+    !isPositiveInteger(value.version) ||
+    !Array.isArray(value.assetIds) ||
+    !value.assetIds.every((id) => typeof id === "string" && safeID.test(id)) ||
+    !optionalDate(value.deletedAt)
+  ) {
+    return null;
+  }
+  const tags = cloneStringRecord(value.tags);
+  if (!tags) return null;
+  return {
+    id: value.id,
+    spaceId: value.spaceId,
+    displayName: value.displayName,
+    type: value.type as CredentialType,
+    version: value.version as number,
+    tags,
+    assetIds: [...value.assetIds],
+    ...(typeof value.deletedAt === "string" ? { deletedAt: value.deletedAt } : {}),
+  };
+}
+
 export function isCredentialMetadata(value: unknown): value is CredentialMetadata {
-  if (!isRecord(value)) return false;
-  return (
-    typeof value.id === "string" &&
-    safeID.test(value.id) &&
-    typeof value.spaceId === "string" &&
-    safeID.test(value.spaceId) &&
-    typeof value.displayName === "string" &&
-    credentialTypes.includes(value.type as CredentialType) &&
-    isPositiveInteger(value.version) &&
-    isStringRecord(value.tags) &&
-    Array.isArray(value.assetIds) &&
-    value.assetIds.every((id) => typeof id === "string" && safeID.test(id)) &&
-    (value.deletedAt === undefined ||
-      (typeof value.deletedAt === "string" &&
-        Number.isFinite(Date.parse(value.deletedAt))))
-  );
+  return parseCredentialMetadata(value) !== null;
+}
+
+export function parseAsset(value: unknown): Asset | null {
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, [
+      "id", "spaceId", "name", "type", "hostname", "os", "environment",
+      "status", "ips", "ports", "tags", "notes", "version", "createdAt",
+      "updatedAt", "deletedAt",
+    ]) ||
+    typeof value.id !== "string" ||
+    !safeID.test(value.id) ||
+    typeof value.spaceId !== "string" ||
+    !safeID.test(value.spaceId) ||
+    !["name", "type", "hostname", "os", "environment", "status", "notes"]
+      .every((key) => typeof value[key] === "string") ||
+    !Array.isArray(value.ips) ||
+    !value.ips.every((ip) => typeof ip === "string") ||
+    !Array.isArray(value.ports) ||
+    !value.ports.every(
+      (port) => Number.isInteger(port) && Number(port) >= 0 && Number(port) <= 65535,
+    ) ||
+    !isPositiveInteger(value.version) ||
+    !validDate(value.createdAt) ||
+    !validDate(value.updatedAt) ||
+    !optionalDate(value.deletedAt)
+  ) {
+    return null;
+  }
+  const tags = cloneStringRecord(value.tags);
+  if (!tags) return null;
+  return {
+    id: value.id,
+    spaceId: value.spaceId,
+    name: value.name as string,
+    type: value.type as string,
+    hostname: value.hostname as string,
+    os: value.os as string,
+    environment: value.environment as string,
+    status: value.status as string,
+    ips: [...value.ips],
+    ports: [...value.ports],
+    tags,
+    notes: value.notes as string,
+    version: value.version as number,
+    createdAt: value.createdAt as string,
+    updatedAt: value.updatedAt as string,
+    ...(typeof value.deletedAt === "string" ? { deletedAt: value.deletedAt } : {}),
+  };
 }
 
 export function isAsset(value: unknown): value is Asset {
-  if (!isRecord(value)) return false;
-  return (
-    typeof value.id === "string" &&
-    safeID.test(value.id) &&
-    typeof value.spaceId === "string" &&
-    safeID.test(value.spaceId) &&
-    ["name", "type", "hostname", "os", "environment", "status", "notes",
-      "createdAt", "updatedAt"].every((key) => typeof value[key] === "string") &&
-    Array.isArray(value.ips) &&
-    value.ips.every((ip) => typeof ip === "string") &&
-    Array.isArray(value.ports) &&
-    value.ports.every(
-      (port) => Number.isInteger(port) && Number(port) >= 0 && Number(port) <= 65535,
-    ) &&
-    isStringRecord(value.tags) &&
-    isPositiveInteger(value.version)
-  );
+  return parseAsset(value) !== null;
 }
 
 export function isCredentialDraft(
@@ -222,22 +274,135 @@ export function isCredentialDraft(
   }
 }
 
+export function parseCredentialDraft(
+  credentialType: CredentialType,
+  payload: unknown,
+): CredentialDraft | null {
+  if (!isCredentialDraft(credentialType, payload)) return null;
+  switch (credentialType) {
+    case "login": {
+      const source = payload as Extract<
+        CredentialDraft,
+        { credentialType: "login" }
+      >["payload"];
+      return {
+        credentialType,
+        payload: {
+          url: source.url,
+          username: source.username,
+          password: source.password,
+          ...(source.totp_credential_id !== undefined
+            ? { totp_credential_id: source.totp_credential_id }
+            : {}),
+        },
+      };
+    }
+    case "api_token": {
+      const source = payload as Extract<
+        CredentialDraft,
+        { credentialType: "api_token" }
+      >["payload"];
+      return {
+        credentialType,
+        payload: {
+          service: source.service,
+          token: source.token,
+          ...(source.header_name !== undefined ? { header_name: source.header_name } : {}),
+          ...(source.expires_at !== undefined ? { expires_at: source.expires_at } : {}),
+        },
+      };
+    }
+    case "ssh_key": {
+      const source = payload as Extract<
+        CredentialDraft,
+        { credentialType: "ssh_key" }
+      >["payload"];
+      return {
+        credentialType,
+        payload: {
+          username: source.username,
+          private_key: source.private_key,
+          ...(source.public_key !== undefined ? { public_key: source.public_key } : {}),
+          ...(source.fingerprint !== undefined ? { fingerprint: source.fingerprint } : {}),
+          ...(source.passphrase !== undefined ? { passphrase: source.passphrase } : {}),
+        },
+      };
+    }
+    case "database": {
+      const source = payload as Extract<
+        CredentialDraft,
+        { credentialType: "database" }
+      >["payload"];
+      let parameters: Record<string, string> | undefined;
+      if (source.parameters !== undefined) {
+        const cloned = cloneStringRecord(source.parameters);
+        if (!cloned) return null;
+        parameters = cloned;
+      }
+      return {
+        credentialType,
+        payload: {
+          engine: source.engine,
+          ...(source.host !== undefined ? { host: source.host } : {}),
+          ...(source.port !== undefined ? { port: source.port } : {}),
+          ...(source.database !== undefined ? { database: source.database } : {}),
+          ...(source.username !== undefined ? { username: source.username } : {}),
+          ...(source.password !== undefined ? { password: source.password } : {}),
+          ...(parameters !== undefined ? { parameters } : {}),
+          ...(source.connection_string !== undefined
+            ? { connection_string: source.connection_string }
+            : {}),
+        },
+      };
+    }
+    case "totp": {
+      const source = payload as Extract<
+        CredentialDraft,
+        { credentialType: "totp" }
+      >["payload"];
+      return {
+        credentialType,
+        payload: {
+          issuer: source.issuer,
+          account: source.account,
+          seed: source.seed,
+          algorithm: source.algorithm,
+          digits: source.digits,
+          period: source.period,
+        },
+      };
+    }
+  }
+}
+
 export function parseList<T>(
   value: unknown,
-  guard: (item: unknown) => item is T,
+  parser: (item: unknown) => T | null,
 ): { items: T[]; nextCursor?: string } | null {
-  if (!isRecord(value) || !Array.isArray(value.items) || !value.items.every(guard)) {
+  if (
+    !isRecord(value) ||
+    !exactKeys(value, ["items", "nextCursor"]) ||
+    !Array.isArray(value.items)
+  ) {
     return null;
+  }
+  const items: T[] = [];
+  for (const item of value.items) {
+    const parsed = parser(item);
+    if (parsed === null) return null;
+    items.push(parsed);
   }
   if (
     value.nextCursor !== undefined &&
     (typeof value.nextCursor !== "string" ||
-      (value.nextCursor !== "" && !safeID.test(value.nextCursor)))
+      value.nextCursor === "" ||
+      value.nextCursor.length > 1024 ||
+      !safeID.test(value.nextCursor))
   ) {
     return null;
   }
   return {
-    items: value.items,
+    items,
     ...(typeof value.nextCursor === "string"
       ? { nextCursor: value.nextCursor }
       : {}),
@@ -258,12 +423,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
-  return (
-    isRecord(value) &&
-    Object.entries(value).every(
-      ([key, item]) => key.trim() !== "" && typeof item === "string",
-    )
-  );
+  return cloneStringRecord(value) !== null;
+}
+
+function cloneStringRecord(value: unknown): Record<string, string> | null {
+  if (!isRecord(value)) return null;
+  const clone: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (
+      key.trim() === "" ||
+      key === "__proto__" ||
+      key === "prototype" ||
+      key === "constructor" ||
+      typeof item !== "string"
+    ) {
+      return null;
+    }
+    clone[key] = item;
+  }
+  return clone;
 }
 
 function isPositiveInteger(value: unknown) {
@@ -281,6 +459,14 @@ function requiredStrings(
 
 function optionalString(value: unknown): value is string | undefined {
   return value === undefined || typeof value === "string";
+}
+
+function validDate(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function optionalDate(value: unknown): value is string | undefined {
+  return value === undefined || validDate(value);
 }
 
 function exactKeys(value: Record<string, unknown>, allowed: string[]) {

@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -9,8 +10,8 @@ import { apiPath, formatApiError } from "../api/client";
 import type { Space } from "../api/types";
 import {
   credentialTypeLabels,
-  isCredentialDraft,
-  isCredentialMetadata,
+  parseCredentialDraft,
+  parseCredentialMetadata,
   type CredentialDraft,
   type CredentialMetadata,
   type WorkflowAPI,
@@ -50,9 +51,17 @@ export function CredentialDrawer({
   const lastButton = useRef<HTMLButtonElement>(null);
   const generation = useRef(0);
   const requestController = useRef<AbortController | null>(null);
+  const returnFocus = useRef<HTMLElement | null>(
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null,
+  );
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     closeButton.current?.focus();
+    return () => {
+      if (returnFocus.current?.isConnected) returnFocus.current.focus();
+    };
   }, []);
 
   useEffect(() => {
@@ -71,17 +80,12 @@ export function CredentialDrawer({
   }, [onClose, sessionActive]);
 
   useEffect(() => {
-    const close = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", close);
     return () => {
       generation.current += 1;
       requestController.current?.abort();
       setRevealed(null);
-      document.removeEventListener("keydown", close);
     };
-  }, [onClose]);
+  }, []);
 
   async function reveal() {
     if (state === "loading") return;
@@ -148,6 +152,12 @@ export function CredentialDrawer({
   }
 
   function trapFocus(event: ReactKeyboardEvent<HTMLElement>) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+      return;
+    }
     if (event.key !== "Tab") return;
     if (event.shiftKey && document.activeElement === closeButton.current) {
       event.preventDefault();
@@ -292,7 +302,6 @@ export function CredentialDrawer({
               id="delete-confirmation"
               value={confirmation}
               onChange={(event) => setConfirmation(event.target.value)}
-              autoFocus
             />
             <div className="button-row">
               <button
@@ -303,7 +312,12 @@ export function CredentialDrawer({
               >
                 {deleting ? "正在删除…" : "确认删除"}
               </button>
-              <button className="secondary-button" type="button" onClick={() => setConfirmDelete(false)}>
+              <button
+                className="secondary-button"
+                type="button"
+                data-modal-initial-focus
+                onClick={() => setConfirmDelete(false)}
+              >
                 取消
               </button>
             </div>
@@ -319,21 +333,24 @@ function parseDecrypted(
   spaceID: string,
 ): Revealed | null {
   if (!value || typeof value !== "object") return null;
-  const candidate = value as { metadata?: unknown; payload?: unknown };
+  const candidate = value as Record<string, unknown>;
   if (
-    !isCredentialMetadata(candidate.metadata) ||
-    candidate.metadata.id !== credentialID ||
-    candidate.metadata.spaceId !== spaceID ||
-    !isCredentialDraft(candidate.metadata.type, candidate.payload)
+    Array.isArray(value) ||
+    Object.keys(candidate).some((key) => key !== "metadata" && key !== "payload")
+  ) return null;
+  const metadata = parseCredentialMetadata(candidate.metadata);
+  if (
+    !metadata ||
+    metadata.id !== credentialID ||
+    metadata.spaceId !== spaceID
   ) {
     return null;
   }
+  const draft = parseCredentialDraft(metadata.type, candidate.payload);
+  if (!draft) return null;
   return {
-    metadata: candidate.metadata,
-    draft: {
-      credentialType: candidate.metadata.type,
-      payload: candidate.payload,
-    } as CredentialDraft,
+    metadata,
+    draft,
   };
 }
 

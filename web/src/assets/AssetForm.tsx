@@ -1,9 +1,9 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { apiPath, formatApiError } from "../api/client";
 import type { Space } from "../api/types";
 import {
-  isAsset,
+  parseAsset,
   type Asset,
   type WorkflowAPI,
 } from "../workflow-api";
@@ -30,6 +30,20 @@ export function AssetForm({ api, space, initial, onSaved, onCancel }: Props) {
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const submitting = useRef(false);
+  const operationGeneration = useRef(0);
+  const operation = useRef<{
+    generation: number;
+    controller: AbortController;
+  } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      operationGeneration.current += 1;
+      operation.current?.controller.abort();
+      operation.current = null;
+      submitting.current = false;
+    };
+  }, [initial?.id, space.id]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -41,6 +55,12 @@ export function AssetForm({ api, space, initial, onSaved, onCancel }: Props) {
       setError("请填写必填项，并检查 IP、端口与标签格式。");
       return;
     }
+    const current = {
+      generation: ++operationGeneration.current,
+      controller: new AbortController(),
+    };
+    operation.current?.controller.abort();
+    operation.current = current;
     submitting.current = true;
     setSaving(true);
     setError("");
@@ -62,22 +82,40 @@ export function AssetForm({ api, space, initial, onSaved, onCancel }: Props) {
         initial
           ? apiPath(["spaces", space.id, "assets", initial.id])
           : apiPath(["spaces", space.id, "assets"]),
-        { method: initial ? "PUT" : "POST", body },
+        { method: initial ? "PUT" : "POST", body, signal: current.controller.signal },
       );
-      if (!isAsset(value) || value.spaceId !== space.id) {
+      if (!operationIsCurrent(operation.current, current)) return;
+      const saved = parseAsset(value);
+      if (
+        !saved ||
+        saved.spaceId !== space.id ||
+        (initial !== undefined && saved.id !== initial.id)
+      ) {
         throw new Error("invalid response");
       }
-      onSaved(value);
+      onSaved(saved);
     } catch (caught) {
+      if (!operationIsCurrent(operation.current, current)) return;
       if (errorCode(caught) === "VERSION_CONFLICT") {
         setError("版本冲突：资产已被更新。你的修改仍保留，请刷新后对比。");
       } else {
         setError(formatApiError(caught));
       }
     } finally {
-      submitting.current = false;
-      setSaving(false);
+      if (operationIsCurrent(operation.current, current)) {
+        operation.current = null;
+        submitting.current = false;
+        setSaving(false);
+      }
     }
+  }
+
+  function cancel() {
+    operationGeneration.current += 1;
+    operation.current?.controller.abort();
+    operation.current = null;
+    submitting.current = false;
+    onCancel();
   }
 
   return (
@@ -108,7 +146,7 @@ export function AssetForm({ api, space, initial, onSaved, onCancel }: Props) {
         <button className="primary-button" type="submit" disabled={saving}>
           {saving ? "正在保存…" : "保存"}
         </button>
-        <button className="secondary-button" type="button" onClick={onCancel}>取消</button>
+        <button className="secondary-button" type="button" onClick={cancel}>取消</button>
       </div>
     </form>
   );
@@ -150,4 +188,15 @@ function errorCode(error: unknown) {
     typeof (error as { code?: unknown }).code === "string"
     ? (error as { code: string }).code
     : "";
+}
+
+function operationIsCurrent(
+  stored: { generation: number; controller: AbortController } | null,
+  expected: { generation: number; controller: AbortController },
+) {
+  return (
+    stored === expected &&
+    stored.generation === expected.generation &&
+    !expected.controller.signal.aborted
+  );
 }

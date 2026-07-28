@@ -4,7 +4,7 @@ import { apiPath, formatApiError } from "../api/client";
 import type { Space } from "../api/types";
 import {
   credentialTypeLabels,
-  isCredentialMetadata,
+  parseCredentialMetadata,
   parseList,
   type CredentialMetadata,
   type WorkflowAPI,
@@ -15,36 +15,88 @@ type Props = {
   api: WorkflowAPI;
   space: Space;
   systemRole: string;
+  sessionActive?: boolean;
   onBack?: () => void;
 };
 
-export function RecycleBinPage({ api, space, systemRole, onBack }: Props) {
+type PurgeOperation = {
+  generation: number;
+  controller: AbortController;
+  phase: "reverify" | "purge";
+  credentialID: string;
+};
+
+export function RecycleBinPage({
+  api,
+  space,
+  systemRole,
+  sessionActive = true,
+  onBack,
+}: Props) {
   const [items, setItems] = useState<CredentialMetadata[]>([]);
   const [error, setError] = useState("");
   const [busyID, setBusyID] = useState("");
   const [purging, setPurging] = useState<CredentialMetadata | null>(null);
   const [totp, setTotp] = useState("");
   const [confirmation, setConfirmation] = useState("");
+  const [nextCursor, setNextCursor] = useState("");
+  const [loadingMore, setLoadingMore] = useState(false);
   const generation = useRef(0);
   const requestController = useRef<AbortController | null>(null);
+  const requestedCursors = useRef(new Set<string>());
   const submitting = useRef(false);
+  const operationGeneration = useRef(0);
+  const purgeOperation = useRef<PurgeOperation | null>(null);
+  const [purgePhase, setPurgePhase] = useState<
+    "idle" | "reverify" | "purge"
+  >("idle");
 
-  const load = useCallback(async () => {
+  const invalidatePurge = useCallback((force = false) => {
+    const current = purgeOperation.current;
+    if (current?.phase === "purge" && !force) return false;
+    operationGeneration.current += 1;
+    current?.controller.abort();
+    purgeOperation.current = null;
+    submitting.current = false;
+    setPurgePhase("idle");
+    setBusyID("");
+    return true;
+  }, []);
+
+  const closePurge = useCallback(() => {
+    if (!invalidatePurge()) return;
+    setPurging(null);
+    setTotp("");
+    setConfirmation("");
+  }, [invalidatePurge]);
+
+  const load = useCallback(async (after = "") => {
+    if (after && requestedCursors.current.has(after)) {
+      setError("请求失败，请检查网络连接后重试。");
+      return;
+    }
+    if (!after) {
+      requestedCursors.current.clear();
+      setNextCursor("");
+    }
+    else requestedCursors.current.add(after);
     const current = ++generation.current;
     requestController.current?.abort();
     const controller = new AbortController();
     requestController.current = controller;
+    if (after) setLoadingMore(true);
     setError("");
     try {
       const value = await api.request<unknown>(
         apiPath(["spaces", space.id, "credentials"], {
           deletedOnly: 1,
           limit: 100,
+          ...(after ? { after } : {}),
         }),
         { signal: controller.signal },
       );
       if (current !== generation.current) return;
-      const parsed = parseList(value, isCredentialMetadata);
+      const parsed = parseList(value, parseCredentialMetadata);
       if (
         !parsed ||
         parsed.items.some(
@@ -53,13 +105,24 @@ export function RecycleBinPage({ api, space, systemRole, onBack }: Props) {
       ) {
         throw new Error("invalid response");
       }
-      setItems(parsed.items);
+      if (
+        parsed.nextCursor &&
+        (parsed.nextCursor === after ||
+          requestedCursors.current.has(parsed.nextCursor))
+      ) {
+        throw new Error("invalid response");
+      }
+      setItems((existing) =>
+        after ? mergeByID(existing, parsed.items) : parsed.items
+      );
+      setNextCursor(parsed.nextCursor ?? "");
     } catch (caught) {
       if (current === generation.current) setError(formatApiError(caught));
     } finally {
       if (requestController.current === controller) {
         requestController.current = null;
       }
+      if (current === generation.current) setLoadingMore(false);
     }
   }, [api, space.id]);
 
@@ -68,11 +131,22 @@ export function RecycleBinPage({ api, space, systemRole, onBack }: Props) {
     return () => {
       generation.current += 1;
       requestController.current?.abort();
+      requestedCursors.current.clear();
+      invalidatePurge(true);
       setPurging(null);
       setTotp("");
       setConfirmation("");
     };
-  }, [load]);
+  }, [invalidatePurge, load]);
+
+  useEffect(() => {
+    invalidatePurge(true);
+    setPurging(null);
+    setTotp("");
+    setConfirmation("");
+    requestedCursors.current.clear();
+    setNextCursor("");
+  }, [invalidatePurge, sessionActive, space.id]);
 
   async function restore(item: CredentialMetadata) {
     if (busyID) return;
@@ -83,7 +157,8 @@ export function RecycleBinPage({ api, space, systemRole, onBack }: Props) {
         apiPath(["spaces", space.id, "credentials", item.id, "restore"]),
         { method: "POST", body: { expectedVersion: item.version } },
       );
-      if (!isCredentialMetadata(value) || value.id !== item.id || value.spaceId !== space.id) {
+      const restored = parseCredentialMetadata(value);
+      if (!restored || restored.id !== item.id || restored.spaceId !== space.id) {
         throw new Error("invalid response");
       }
       await load();
@@ -103,27 +178,54 @@ export function RecycleBinPage({ api, space, systemRole, onBack }: Props) {
     ) {
       return;
     }
+    const target = purging;
+    const operation: PurgeOperation = {
+      generation: ++operationGeneration.current,
+      controller: new AbortController(),
+      phase: "reverify",
+      credentialID: target.id,
+    };
+    purgeOperation.current?.controller.abort();
+    purgeOperation.current = operation;
     submitting.current = true;
-    setBusyID(purging.id);
+    setBusyID(target.id);
+    setPurgePhase("reverify");
     setError("");
     try {
-      await api.reverifyTOTP(totp);
+      await api.reverifyTOTP(totp, operation.controller.signal);
+      if (!purgeOperationIsCurrent(purgeOperation.current, operation)) return;
+      operation.phase = "purge";
+      setPurgePhase("purge");
       await api.request(
-        apiPath(["spaces", space.id, "credentials", purging.id, "purge"]),
+        apiPath(["spaces", space.id, "credentials", target.id, "purge"]),
         {
           method: "POST",
-          body: { expectedVersion: purging.version },
+          body: { expectedVersion: target.version },
+          signal: operation.controller.signal,
         },
       );
+      if (!purgeOperationIsCurrent(purgeOperation.current, operation)) return;
+      purgeOperation.current = null;
+      operationGeneration.current += 1;
+      submitting.current = false;
+      setPurgePhase("idle");
+      setBusyID("");
       setPurging(null);
       setTotp("");
       setConfirmation("");
       await load();
     } catch (caught) {
-      setError(formatApiError(caught));
+      if (purgeOperationIsCurrent(purgeOperation.current, operation)) {
+        setError(formatApiError(caught));
+      }
     } finally {
-      submitting.current = false;
-      setBusyID("");
+      if (purgeOperationIsCurrent(purgeOperation.current, operation)) {
+        purgeOperation.current = null;
+        operationGeneration.current += 1;
+        submitting.current = false;
+        setPurgePhase("idle");
+        setBusyID("");
+      }
     }
   }
 
@@ -174,12 +276,18 @@ export function RecycleBinPage({ api, space, systemRole, onBack }: Props) {
           </div>
         )}
       </section>
+      {nextCursor && (
+        <button
+          className="secondary-button"
+          type="button"
+          disabled={loadingMore || Boolean(busyID)}
+          onClick={() => void load(nextCursor)}
+        >
+          {loadingMore ? "正在加载…" : "加载更多已删除凭据"}
+        </button>
+      )}
       {purging && (
-        <Modal labelledBy="purge-title" compact onClose={() => {
-          setPurging(null);
-          setTotp("");
-          setConfirmation("");
-        }}>
+        <Modal labelledBy="purge-title" compact onClose={closePurge}>
             <h2 id="purge-title">重新验证 TOTP</h2>
             <p className="warning-copy">永久删除不可恢复。验证后将仅删除当前这项凭据。</p>
             <label htmlFor="purge-totp">TOTP 验证码</label>
@@ -189,7 +297,6 @@ export function RecycleBinPage({ api, space, systemRole, onBack }: Props) {
               autoComplete="one-time-code"
               value={totp}
               onChange={(event) => setTotp(event.target.value.replace(/\D/g, "").slice(0, 8))}
-              autoFocus
             />
             <label htmlFor="purge-confirmation">输入凭据名称以确认</label>
             <input
@@ -202,19 +309,21 @@ export function RecycleBinPage({ api, space, systemRole, onBack }: Props) {
                 className="danger-button"
                 type="button"
                 disabled={
-                  busyID === purging.id ||
+                  purgePhase !== "idle" ||
                   confirmation !== purging.displayName ||
                   !/^\d{6,8}$/.test(totp)
                 }
                 onClick={() => void purge()}
               >
-                确认永久删除
+                {purgePhase === "purge" ? "正在永久删除…" : "确认永久删除"}
               </button>
-              <button className="secondary-button" type="button" onClick={() => {
-                setPurging(null);
-                setTotp("");
-                setConfirmation("");
-              }}>
+              <button
+                className="secondary-button"
+                type="button"
+                data-modal-initial-focus
+                disabled={purgePhase === "purge"}
+                onClick={closePurge}
+              >
                 取消
               </button>
             </div>
@@ -224,9 +333,25 @@ export function RecycleBinPage({ api, space, systemRole, onBack }: Props) {
   );
 }
 
+function purgeOperationIsCurrent(
+  current: PurgeOperation | null,
+  candidate: PurgeOperation,
+) {
+  return (
+    current === candidate &&
+    current.generation === candidate.generation &&
+    !candidate.controller.signal.aborted
+  );
+}
+
 function formatDate(value: string) {
   return new Intl.DateTimeFormat("zh-CN", {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+}
+
+function mergeByID<T extends { id: string }>(existing: T[], incoming: T[]) {
+  const ids = new Set(existing.map((item) => item.id));
+  return [...existing, ...incoming.filter((item) => !ids.has(item.id))];
 }

@@ -796,11 +796,7 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 		); err != nil {
 			t.Fatal(err)
 		}
-		owner := humanCredentialPrincipal(
-			"usr_editor", h.spaceID, authorization.RoleOwner,
-		)
-		owner.Human.SystemRole = identity.SystemRoleOwner
-		owner.Human.Session.RecentTOTPAt = h.clock.now
+		owner := recentSystemOwner(h)
 		if err := h.service.Purge(
 			h.ctx, owner, h.spaceID, created.ID, created.Version,
 			h.writeContext("purge-one", owner.Actor),
@@ -863,7 +859,13 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 			name: "missing recent TOTP",
 			principal: func(h *credentialHarness) Principal {
 				principal := recentSystemOwner(h)
-				principal.Human.Session.RecentTOTPAt = time.Time{}
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE sessions SET recent_totp_at = NULL WHERE id = ?`,
+					principal.Human.Session.SessionID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
 				return principal
 			},
 			delete: true,
@@ -873,8 +875,16 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 			name: "stale recent TOTP",
 			principal: func(h *credentialHarness) Principal {
 				principal := recentSystemOwner(h)
-				principal.Human.Session.RecentTOTPAt =
-					h.clock.now.Add(-identity.RecentTOTPLifetime)
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE sessions SET recent_totp_at = ? WHERE id = ?`,
+					formatCredentialTime(
+						h.clock.now.Add(-identity.RecentTOTPLifetime),
+					),
+					principal.Human.Session.SessionID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
 				return principal
 			},
 			delete: true,
@@ -883,10 +893,14 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 		{
 			name: "non-system-owner",
 			principal: func(h *credentialHarness) Principal {
-				principal := humanCredentialPrincipal(
-					"usr_editor", h.spaceID, authorization.RoleOwner,
-				)
-				principal.Human.Session.RecentTOTPAt = h.clock.now
+				principal := recentSystemOwner(h)
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE users SET system_role = 'member' WHERE id = ?`,
+					principal.Human.Session.UserID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
 				return principal
 			},
 			delete: true,
@@ -897,6 +911,117 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 			principal: func(h *credentialHarness) Principal { return h.agent },
 			delete:    true,
 			want:      ErrNotFound,
+		},
+		{
+			name: "revoked authoritative session",
+			principal: func(h *credentialHarness) Principal {
+				principal := recentSystemOwner(h)
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE sessions SET revoked_at = ? WHERE id = ?`,
+					formatCredentialTime(h.clock.now),
+					principal.Human.Session.SessionID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
+				return principal
+			},
+			delete: true,
+			want:   identity.ErrSessionRevoked,
+		},
+		{
+			name: "expired authoritative session",
+			principal: func(h *credentialHarness) Principal {
+				principal := recentSystemOwner(h)
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE sessions SET expires_at = ? WHERE id = ?`,
+					formatCredentialTime(h.clock.now),
+					principal.Human.Session.SessionID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
+				return principal
+			},
+			delete: true,
+			want:   identity.ErrSessionExpired,
+		},
+		{
+			name: "idle-expired authoritative session",
+			principal: func(h *credentialHarness) Principal {
+				principal := recentSystemOwner(h)
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE sessions SET idle_expires_at = ? WHERE id = ?`,
+					formatCredentialTime(h.clock.now),
+					principal.Human.Session.SessionID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
+				return principal
+			},
+			delete: true,
+			want:   identity.ErrSessionExpired,
+		},
+		{
+			name: "session user binding corruption",
+			principal: func(h *credentialHarness) Principal {
+				principal := recentSystemOwner(h)
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE sessions SET user_id = 'usr_reader' WHERE id = ?`,
+					principal.Human.Session.SessionID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
+				return principal
+			},
+			delete: true,
+			want:   identity.ErrInvalidSession,
+		},
+		{
+			name: "session token hash corruption",
+			principal: func(h *credentialHarness) Principal {
+				principal := recentSystemOwner(h)
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE sessions SET token_hash = X'01' WHERE id = ?`,
+					principal.Human.Session.SessionID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
+				return principal
+			},
+			delete: true,
+			want:   identity.ErrInvalidSession,
+		},
+		{
+			name: "session issued-at binding corruption",
+			principal: func(h *credentialHarness) Principal {
+				principal := recentSystemOwner(h)
+				principal.Human.Session.IssuedAt =
+					principal.Human.Session.IssuedAt.Add(time.Second)
+				return principal
+			},
+			delete: true,
+			want:   identity.ErrInvalidSession,
+		},
+		{
+			name: "deleted authoritative user",
+			principal: func(h *credentialHarness) Principal {
+				principal := recentSystemOwner(h)
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE users SET deleted_at = ? WHERE id = ?`,
+					formatCredentialTime(h.clock.now),
+					principal.Human.Session.UserID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
+				return principal
+			},
+			delete: true,
+			want:   identity.ErrForbidden,
 		},
 	}
 	for _, test := range tests {
@@ -961,13 +1086,127 @@ func TestPurgeOneCredentialRollsBackWhenAuditFails(t *testing.T) {
 	}
 }
 
+func TestPurgeSerializesAuthoritativeDemotionAndRevocation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*credentialHarness, Principal) error
+	}{
+		{
+			name: "role demotion follows committed purge",
+			mutate: func(h *credentialHarness, principal Principal) error {
+				_, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE users SET system_role = 'member' WHERE id = ?`,
+					principal.Human.Session.UserID,
+				)
+				return err
+			},
+		},
+		{
+			name: "session revocation follows committed purge",
+			mutate: func(h *credentialHarness, principal Principal) error {
+				_, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE sessions SET revoked_at = ? WHERE id = ?`,
+					formatCredentialTime(h.clock.now),
+					principal.Human.Session.SessionID,
+				)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newCredentialHarness(t)
+			created := h.create(h.editor)
+			if err := h.service.Delete(
+				h.ctx, h.editor, created.ID, created.Version,
+				h.writeContext("purge-race-delete", h.editor.Actor),
+			); err != nil {
+				t.Fatal(err)
+			}
+			owner := recentSystemOwner(h)
+			authorized := make(chan struct{})
+			release := make(chan struct{})
+			h.service.purgeAuthorizedHook = func() {
+				close(authorized)
+				<-release
+			}
+			purgeDone := make(chan error, 1)
+			go func() {
+				purgeDone <- h.service.Purge(
+					h.ctx, owner, h.spaceID, created.ID, created.Version,
+					h.writeContext("purge-race", owner.Actor),
+				)
+			}()
+			<-authorized
+
+			mutationStarted := make(chan struct{})
+			mutationDone := make(chan error, 1)
+			go func() {
+				close(mutationStarted)
+				mutationDone <- test.mutate(h, owner)
+			}()
+			<-mutationStarted
+			select {
+			case err := <-mutationDone:
+				t.Fatalf("authority mutation bypassed writer serialization: %v", err)
+			default:
+			}
+
+			close(release)
+			if err := <-purgeDone; err != nil {
+				t.Fatal(err)
+			}
+			if err := <-mutationDone; err != nil {
+				t.Fatal(err)
+			}
+			if h.countCredentials() != 0 {
+				t.Fatal("serialized purge did not commit")
+			}
+		})
+	}
+}
+
 func recentSystemOwner(h *credentialHarness) Principal {
 	principal := humanCredentialPrincipal(
 		"usr_editor", h.spaceID, authorization.RoleOwner,
 	)
 	principal.Human.SystemRole = identity.SystemRoleOwner
 	principal.Human.Session.RecentTOTPAt = h.clock.now
+	principal.Human.Session.IssuedAt = h.clock.now.Add(-time.Hour)
 	principal.BoundSpaceID = h.spaceID
+	if _, err := h.db.Writer.ExecContext(
+		h.ctx,
+		`UPDATE users SET system_role = ?, deleted_at = NULL WHERE id = ?`,
+		identity.SystemRoleOwner, principal.Human.Session.UserID,
+	); err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := h.db.Writer.ExecContext(
+		h.ctx,
+		`INSERT INTO sessions (
+			id, user_id, token_hash, created_at, expires_at,
+			idle_expires_at, recent_totp_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			user_id = excluded.user_id,
+			token_hash = excluded.token_hash,
+			created_at = excluded.created_at,
+			expires_at = excluded.expires_at,
+			idle_expires_at = excluded.idle_expires_at,
+			recent_totp_at = excluded.recent_totp_at,
+			revoked_at = NULL`,
+		principal.Human.Session.SessionID,
+		principal.Human.Session.UserID,
+		bytes.Repeat([]byte{0x5a}, 32),
+		formatCredentialTime(principal.Human.Session.IssuedAt),
+		formatCredentialTime(h.clock.now.Add(identity.SessionAbsoluteLifetime)),
+		formatCredentialTime(h.clock.now.Add(identity.SessionIdleLifetime)),
+		formatCredentialTime(h.clock.now),
+	); err != nil {
+		h.t.Fatal(err)
+	}
 	return principal
 }
 

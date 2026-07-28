@@ -52,6 +52,8 @@ type Service struct {
 	box        *cryptobox.Box
 	audit      AuditAppender
 	clock      platform.Clock
+	// purgeAuthorizedHook is test-only synchronization injected by package tests.
+	purgeAuthorizedHook func()
 }
 
 func NewService(
@@ -802,9 +804,13 @@ func (s *Service) Purge(
 		); err != nil {
 			return err
 		}
-		if principal.Human == nil ||
-			!principal.Human.Session.HasRecentTOTP(now) {
-			return identity.ErrRecentTOTPRequired
+		if err := verifyAuthoritativePurgeSession(
+			ctx, tx, principal, now,
+		); err != nil {
+			return err
+		}
+		if s.purgeAuthorizedHook != nil {
+			s.purgeAuthorizedHook()
 		}
 		if metadata.DeletedAt == nil {
 			return ErrNotFound
@@ -839,6 +845,77 @@ func (s *Service) Purge(
 		}
 		return nil
 	})
+}
+
+func verifyAuthoritativePurgeSession(
+	ctx context.Context,
+	tx *sql.Tx,
+	principal Principal,
+	now time.Time,
+) error {
+	if principal.Human == nil || principal.Agent != nil {
+		return ErrNotFound
+	}
+	var (
+		userID, createdAt, expiresAt, idleExpiresAt, systemRole string
+		tokenHash                                               []byte
+		revokedAt, recentTOTPAt, deletedAt                      sql.NullString
+	)
+	err := tx.QueryRowContext(ctx, `
+		SELECT
+			s.user_id, s.token_hash, s.created_at, s.expires_at,
+			s.idle_expires_at, s.revoked_at, s.recent_totp_at,
+			u.system_role, u.deleted_at
+		FROM sessions s
+		JOIN users u ON u.id = s.user_id
+		WHERE s.id = ?
+	`, principal.Human.Session.SessionID).Scan(
+		&userID, &tokenHash, &createdAt, &expiresAt, &idleExpiresAt,
+		&revokedAt, &recentTOTPAt, &systemRole, &deletedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return identity.ErrInvalidSession
+	}
+	if err != nil {
+		return fmt.Errorf("read authoritative purge session: %w", err)
+	}
+	if userID != principal.Human.Session.UserID ||
+		len(tokenHash) != sha256.Size {
+		return identity.ErrInvalidSession
+	}
+	created, err := parseCredentialTime(createdAt)
+	if err != nil || !created.Equal(principal.Human.Session.IssuedAt.UTC()) {
+		return identity.ErrInvalidSession
+	}
+	expires, err := parseCredentialTime(expiresAt)
+	if err != nil {
+		return identity.ErrInvalidSession
+	}
+	idleExpires, err := parseCredentialTime(idleExpiresAt)
+	if err != nil {
+		return identity.ErrInvalidSession
+	}
+	if revokedAt.Valid {
+		return identity.ErrSessionRevoked
+	}
+	if !now.Before(expires) || !now.Before(idleExpires) {
+		return identity.ErrSessionExpired
+	}
+	if deletedAt.Valid {
+		return identity.ErrForbidden
+	}
+	if systemRole != identity.SystemRoleOwner {
+		return authorization.ErrDenied
+	}
+	if !recentTOTPAt.Valid {
+		return identity.ErrRecentTOTPRequired
+	}
+	recent, err := parseCredentialTime(recentTOTPAt.String)
+	if err != nil || recent.After(now) ||
+		now.Sub(recent) >= identity.RecentTOTPLifetime {
+		return identity.ErrRecentTOTPRequired
+	}
+	return nil
 }
 
 func (s *Service) PurgeExpired(

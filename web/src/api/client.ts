@@ -264,7 +264,7 @@ export class ApiClient {
     }
   }
 
-  async reverifyTOTP(code: string): Promise<void> {
+  async reverifyTOTP(code: string, signal?: AbortSignal): Promise<void> {
     if (!/^\d{6,8}$/.test(code)) {
       throw new ApiError("INVALID_REQUEST", "", 400);
     }
@@ -281,7 +281,11 @@ export class ApiClient {
         expiresAt: string;
       }>(
         "/api/v1/auth/reverify",
-        { method: "POST", body: { code }, signal: snapshot.signal },
+        {
+          method: "POST",
+          body: { code },
+          signal: combineSignals(snapshot.signal, signal),
+        },
         snapshot.token,
       );
       if (
