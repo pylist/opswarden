@@ -47,7 +47,7 @@ v1 不包含：
 | 部署 | Docker Compose |
 | 入口 | Caddy，统一处理公网与内网 HTTPS |
 | 成员认证 | 本地密码 + TOTP |
-| 浏览器会话 | 服务端会话 + `HttpOnly` Cookie |
+| 浏览器会话 | 短期 JWT Bearer + 服务端可吊销会话 |
 | Agent 认证 | 独立 Bearer Token；预留短期 JWT 交换接口 |
 | AI 接口 | REST API + MCP Streamable HTTP |
 | 主密钥 | 宿主机受限文件，只读挂载到应用容器 |
@@ -174,24 +174,27 @@ SQLite 至少包含：
 - 开启 TOTP 时生成一次性恢复码；恢复码以哈希形式保存，使用后立即失效。
 - 首次 `System Owner` 只能从本机或明确配置的内网网段创建。
 
-### 7.2 服务端会话
+### 7.2 JWT 与服务端会话
 
 - 登录完成后生成至少 256 bit 的随机会话 ID。
-- 浏览器只获得 `__Host-opswarden_session` Cookie。
-- Cookie 属性为 `Secure; HttpOnly; SameSite=Strict; Path=/`，且不设置 `Domain`。
+- 登录完成后返回短期签名 JWT，浏览器通过 `Authorization: Bearer <jwt>` 发送。
+- 不设置认证 Cookie。JWT 仅保存在 React 运行时内存，不写入 `localStorage`、`sessionStorage`、IndexedDB 或 Service Worker。
+- JWT 签名密钥使用 HKDF-SHA256 从主密钥按独立用途派生，不复用数据加密密钥；JWT 必须校验算法、issuer、audience、签发/到期时间和规范 claims。
 - SQLite 只保存会话 ID 的 SHA-256 哈希。
 - 会话空闲 8 小时失效，绝对期限为 24 小时。
+- JWT 有效期不超过 15 分钟；每次请求除验证 JWT 外仍解析服务端会话，因此退出登录、禁用用户、密码重置和角色变更会立即生效。
 - 修改权限、永久删除、导出审计和重置他人认证要求最近 5 分钟内重新验证 TOTP。
 - 退出登录、禁用用户、密码重置和角色变更立即吊销相关会话。
 
-### 7.3 CSRF 与前端安全
+### 7.3 Bearer 与前端安全
 
-- 所有状态变更请求必须提供与会话绑定的 CSRF Token。
+- 浏览器 API 不接受认证 Cookie，只接受显式 `Authorization` 头；因此不使用 CSRF Token。
+- CORS 默认不开放跨源；登录与刷新响应也必须设置 `Cache-Control: no-store`。
 - React 不在 `localStorage`、`sessionStorage` 或 IndexedDB 保存认证 Token。
 - Caddy 设置严格 CSP；前端禁止 `dangerouslySetInnerHTML`，除非经过单独安全评审。
 - API 响应包含 `Cache-Control: no-store`，凭据明文不得进入 Service Worker、浏览器缓存或前端持久化状态。
 
-浏览器应用不直接保存 Bearer Token，依据是浏览器持久化存储无法防止同源恶意 JavaScript 读取 Token；服务端会话能避免 Token 被直接复制到其他设备继续使用。参考 [RFC 10017](https://www.rfc-editor.org/rfc/rfc10017.html) 与 [OWASP Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)。
+浏览器按已确认需求直接使用 JWT Bearer。为降低 XSS 后的可复制风险，JWT 只存在于内存、短期有效，并由服务端会话提供即时吊销能力；页面刷新或浏览器重启后需要重新登录。
 
 ## 8. Agent 认证与授权
 
@@ -544,7 +547,7 @@ v1 面向小团队和单机部署。如果持续写并发、数据库体积或�
 
 - 验证数据库、备份、日志、审计和错误中不存在测试凭据明文。
 - 登录、TOTP、Token 和读取限速。
-- CSRF、CORS、CSP 和安全 Cookie 属性。
+- JWT 算法/issuer/audience/时效校验、无认证 Cookie、CORS 与 CSP。
 - Go race detector、静态分析和依赖漏洞扫描。
 - 前端依赖审计和生产构建。
 - 容器非 root 运行、只读根文件系统可行性和最小权限。

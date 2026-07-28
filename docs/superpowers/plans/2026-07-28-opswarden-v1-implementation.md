@@ -4,7 +4,7 @@
 
 **Goal:** Build a production-ready single-host OpsWarden v1 that manages assets and encrypted credentials for team members and scoped AI agents through React, REST, and MCP.
 
-**Architecture:** A modular Go monolith owns all domain rules, SQLite access, envelope encryption, REST, and MCP. A React SPA is compiled into the Go image, while Caddy is the only public container and terminates HTTPS. Browser users authenticate with password, TOTP, and a server-side session cookie; agents use individually revocable bearer tokens.
+**Architecture:** A modular Go monolith owns all domain rules, SQLite access, envelope encryption, REST, and MCP. A React SPA is compiled into the Go image, while Caddy is the only public container and terminates HTTPS. Browser users authenticate with password, TOTP, a short-lived JWT Bearer, and a server-side revocable session; agents use individually revocable opaque bearer tokens.
 
 **Tech Stack:** Go 1.26, React 19, TypeScript 5, Vite, SQLite through `modernc.org/sqlite`, `golang.org/x/crypto`, official MCP Go SDK, Caddy 2, Docker Compose 2, Vitest, React Testing Library, Playwright.
 
@@ -13,7 +13,7 @@
 - The approved design is `docs/superpowers/specs/2026-07-28-opswarden-design.md`; implementation must not silently weaken it.
 - Product copy uses “凭据库 / 凭据”; code and APIs use `credential`, never `secret` for the domain object.
 - The application is a Go modular monolith with one SQLite writer and no network filesystem support.
-- React browser authentication uses `__Host-opswarden_session` with `Secure; HttpOnly; SameSite=Strict; Path=/`; authentication tokens never enter browser storage.
+- React browser authentication uses a short-lived JWT in the `Authorization` header, backed by a server-side revocable session. No authentication Cookie is set, and JWTs never enter browser persistent storage.
 - Agents authenticate independently and receive only per-Space scopes; service-side authorization never relies on Hermes tool filtering.
 - Credential values, member TOTP seeds, session IDs, full Agent Tokens, and the master key must never appear in logs, errors, audit payloads, URLs, browser storage, or idempotency records.
 - Every credential version uses XChaCha20-Poly1305 envelope encryption and authenticated context binding.
@@ -724,14 +724,14 @@ func TestAgentWriteRequiresIdempotencyHeader(t *testing.T) {
     res := h.postAsAgent("/api/v1/spaces/"+h.spaceID+"/credentials", h.validCreateBody(), nil)
     assertAPIError(t, res, http.StatusBadRequest, "INVALID_REQUEST")
 }
-func TestSessionCookieHasRequiredAttributes(t *testing.T) {
-    cookie := newHTTPHarness(t).loginCookie()
-    if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode || cookie.Path != "/" { t.Fatalf("cookie=%+v", cookie) }
+func TestLoginReturnsJWTWithoutCookie(t *testing.T) {
+    res, token := newHTTPHarness(t).loginJWT()
+    if token == "" || len(res.Cookies()) != 0 { t.Fatalf("token=%q cookies=%v", token, res.Cookies()) }
 }
-func TestStateChangeRequiresCSRF(t *testing.T) {
+func TestStateChangeRequiresJWTAuthorizationHeader(t *testing.T) {
     h := newHTTPHarness(t)
-    res := h.postAsUserWithoutCSRF("/api/v1/spaces", []byte(`{"name":"x"}`))
-    assertAPIError(t, res, http.StatusForbidden, "PERMISSION_DENIED")
+    res := h.postAsUserWithoutAuthorization("/api/v1/spaces", []byte(`{"name":"x"}`))
+    assertAPIError(t, res, http.StatusUnauthorized, "UNAUTHENTICATED")
 }
 func TestErrorsAndLogsRedactFixtureValues(t *testing.T) {
     h := newHTTPHarness(t)
@@ -748,7 +748,7 @@ Expected: compile failure because the router does not exist.
 
 - [ ] **Step 3: Implement routes, middleware, DTOs, and exact errors**
 
-Middleware order: request ID, recovery, security headers, structured redacted logging, rate limit, authentication, CSRF for browser writes, then handler. Map domain errors to the approved codes and never place request bodies in logs. Set `Cache-Control: no-store` on authentication and credential responses.
+Middleware order: request ID, recovery, security headers, structured redacted logging, rate limit, authentication, then handler. Browser authentication accepts only an explicit JWT Bearer header and never sets an authentication Cookie. Validate JWT algorithm, issuer, audience, time claims, and server-side session on every request. Derive the JWT signing key from the master key with a dedicated HKDF-SHA256 context. Map domain errors to the approved codes and never place request bodies in logs. Set `Cache-Control: no-store` on authentication and credential responses.
 
 - [ ] **Step 4: Run the complete Go API suite**
 
@@ -844,7 +844,7 @@ git commit -m "feat: add Hermes-compatible MCP server"
 
 **Interfaces:**
 - Consumes: `/api/v1/auth/*`, `/api/v1/me`, and `/api/v1/spaces`.
-- Produces: `api.request<T>()` with credentials included, in-memory CSRF token, stable error decoding, and `AuthProvider`.
+- Produces: `api.request<T>()` with an in-memory JWT Authorization header, stable error decoding, and `AuthProvider`.
 - Produces: protected routes for 概览、凭据库、资产、Agent、审计日志、成员与权限、设置.
 
 - [ ] **Step 1: Write failing login and shell tests**
@@ -870,7 +870,7 @@ Expected: failures because the provider, login flow, and shell do not exist.
 
 - [ ] **Step 3: Implement the two-step login and responsive shell**
 
-The API client must use `credentials: "include"`, attach the in-memory CSRF header on writes, redirect on session expiry, and render request IDs for support without rendering raw server details. `SetupPage` is reachable only while the server reports no owner and guides password, TOTP enrollment, recovery-code confirmation, and initial Space creation. The sidebar uses approved Chinese labels and the current Space switcher.
+The API client must keep the JWT only in `AuthProvider` memory, attach it as `Authorization: Bearer` on every protected request, redirect on expiry, and render request IDs for support without rendering raw server details. It must not use credentialed Cookie requests or CSRF headers. `SetupPage` is reachable only while the server reports no owner and guides password, TOTP enrollment, recovery-code confirmation, and initial Space creation. The sidebar uses approved Chinese labels and the current Space switcher.
 
 - [ ] **Step 4: Run frontend tests and production build**
 
