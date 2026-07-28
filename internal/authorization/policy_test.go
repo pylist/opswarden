@@ -37,27 +37,27 @@ func TestHumanRolePermissionMatrixIsExhaustive(t *testing.T) {
 		authorization.AddMember:         {spaces.Owner: true},
 		authorization.ChangeMemberRole:  {spaces.Owner: true},
 		authorization.RemoveMember:      {spaces.Owner: true},
-		authorization.ListAgents:        {spaces.Owner: true},
-		authorization.ReadAgent:         {spaces.Owner: true},
-		authorization.CreateAgent:       {spaces.Owner: true},
-		authorization.UpdateAgent:       {spaces.Owner: true},
-		authorization.DeleteAgent:       {spaces.Owner: true},
-		authorization.IssueAgentToken:   {spaces.Owner: true},
-		authorization.RevokeAgentToken:  {spaces.Owner: true},
-		authorization.ManageAgentGrants: {spaces.Owner: true},
+		authorization.ManageAgentGrant:  {spaces.Owner: true},
 		authorization.ListAuditEvents:   {spaces.Owner: true},
 		authorization.PurgeAuditEvents:  {},
 	}
 	globalActions := map[authorization.Action]struct{}{
-		authorization.CreateSpace:    {},
-		authorization.ListSpaces:     {},
-		authorization.ListBackups:    {},
-		authorization.CreateBackup:   {},
-		authorization.RestoreBackup:  {},
-		authorization.ReadSettings:   {},
-		authorization.UpdateSettings: {},
-		authorization.ManageUsers:    {},
-		authorization.ReadHealth:     {},
+		authorization.CreateSpace:      {},
+		authorization.ListSpaces:       {},
+		authorization.ListAgents:       {},
+		authorization.ReadAgent:        {},
+		authorization.CreateAgent:      {},
+		authorization.UpdateAgent:      {},
+		authorization.DeleteAgent:      {},
+		authorization.IssueAgentToken:  {},
+		authorization.RevokeAgentToken: {},
+		authorization.ListBackups:      {},
+		authorization.CreateBackup:     {},
+		authorization.RestoreBackup:    {},
+		authorization.ReadSettings:     {},
+		authorization.UpdateSettings:   {},
+		authorization.ManageUsers:      {},
+		authorization.ReadHealth:       {},
 	}
 	if got, want := len(spaceActions)+len(globalActions), len(authorization.AllActions()); got != want {
 		t.Fatalf("classified actions = %d, AllActions = %d", got, want)
@@ -117,10 +117,20 @@ func TestHumanGlobalAndSystemRolePermissions(t *testing.T) {
 		authorization.UpdateSettings:    true,
 		authorization.ManageUsers:       true,
 		authorization.ReadHealth:        true,
+		authorization.ListAgents:        true,
+		authorization.ReadAgent:         true,
+		authorization.CreateAgent:       true,
+		authorization.UpdateAgent:       true,
+		authorization.DeleteAgent:       true,
+		authorization.IssueAgentToken:   true,
+		authorization.RevokeAgentToken:  true,
+		authorization.ManageAgentGrant:  true,
 	}
 	for _, action := range authorization.AllActions() {
 		resource := authorization.Resource{}
-		if action == authorization.RestoreCredential || action == authorization.ListAuditEvents {
+		if action == authorization.RestoreCredential ||
+			action == authorization.ListAuditEvents ||
+			action == authorization.ManageAgentGrant {
 			resource.SpaceID = "space-1"
 		}
 		decision := authorization.DecisionForHuman(
@@ -147,6 +157,92 @@ func TestHumanGlobalAndSystemRolePermissions(t *testing.T) {
 		if !ownerDecision.Allowed {
 			t.Fatalf("System Owner %s decision = %+v", action, ownerDecision)
 		}
+	}
+}
+
+func TestSpaceOwnerCanManageOnlyOwnSpaceGrantNotAgentLifecycle(t *testing.T) {
+	principal := authorization.HumanPrincipal{
+		Session: identity.SessionPrincipal{
+			UserID: "space-owner", SessionID: "session-1",
+		},
+		SystemRole: identity.SystemRoleMember,
+		SpaceRoles: map[string]authorization.Role{
+			"space-a": spaces.Owner,
+		},
+	}
+	ownGrant := authorization.DecisionForHuman(
+		principal,
+		authorization.Resource{SpaceID: "space-a", ResourceID: "agent-1"},
+		authorization.ManageAgentGrant,
+	)
+	if !ownGrant.Allowed {
+		t.Fatalf("own-Space grant decision = %+v", ownGrant)
+	}
+	otherGrant := authorization.DecisionForHuman(
+		principal,
+		authorization.Resource{SpaceID: "space-b", ResourceID: "agent-1"},
+		authorization.ManageAgentGrant,
+	)
+	if otherGrant.Allowed || !otherGrant.Conceal {
+		t.Fatalf("other-Space grant decision = %+v", otherGrant)
+	}
+
+	for _, action := range []authorization.Action{
+		authorization.ListAgents,
+		authorization.ReadAgent,
+		authorization.CreateAgent,
+		authorization.UpdateAgent,
+		authorization.DeleteAgent,
+		authorization.IssueAgentToken,
+		authorization.RevokeAgentToken,
+	} {
+		decision := authorization.DecisionForHuman(
+			principal,
+			authorization.Resource{ResourceID: "agent-1"},
+			action,
+		)
+		if decision.Allowed || decision.Conceal {
+			t.Fatalf("%s decision = %+v", action, decision)
+		}
+	}
+}
+
+func TestManageAgentGrantRequiresResourceSpace(t *testing.T) {
+	for _, systemRole := range []string{
+		identity.SystemRoleOwner,
+		identity.SystemRoleAdmin,
+	} {
+		decision := authorization.DecisionForHuman(
+			authorization.HumanPrincipal{
+				Session: identity.SessionPrincipal{
+					UserID: "system-user", SessionID: "session-1",
+				},
+				SystemRole: systemRole,
+			},
+			authorization.Resource{ResourceID: "agent-1"},
+			authorization.ManageAgentGrant,
+		)
+		if decision.Allowed || !decision.Conceal {
+			t.Fatalf("%s decision = %+v", systemRole, decision)
+		}
+	}
+}
+
+func TestEditorCannotManageAgentGrantInOwnSpace(t *testing.T) {
+	decision := authorization.DecisionForHuman(
+		authorization.HumanPrincipal{
+			Session: identity.SessionPrincipal{
+				UserID: "editor", SessionID: "session-1",
+			},
+			SpaceRoles: map[string]authorization.Role{
+				"space-a": spaces.Editor,
+			},
+		},
+		authorization.Resource{SpaceID: "space-a", ResourceID: "agent-1"},
+		authorization.ManageAgentGrant,
+	)
+	if decision.Allowed || decision.Conceal {
+		t.Fatalf("decision = %+v", decision)
 	}
 }
 
@@ -312,6 +408,77 @@ func TestAgentSpaceAndLabelsCanOnlyNarrowAccess(t *testing.T) {
 				t.Fatalf("denial did not conceal resource: %+v", decision)
 			}
 		})
+	}
+}
+
+func TestAgentRequiredEmptyLabelValueRequiresExplicitKeyPresence(t *testing.T) {
+	principal := authorization.AgentPrincipal{
+		AgentID: "agent-1",
+		Grants: []authorization.Grant{{
+			SpaceID: "space-1",
+			Scopes: map[authorization.Scope]struct{}{
+				authorization.ScopeCredentialRead: {},
+			},
+			Labels: map[string]string{"environment": ""},
+		}},
+	}
+	tests := []struct {
+		name    string
+		labels  map[string]string
+		allowed bool
+	}{
+		{name: "missing key", labels: map[string]string{}},
+		{
+			name: "explicit empty value",
+			labels: map[string]string{
+				"environment": "",
+			},
+			allowed: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decision := authorization.DecisionForAgent(
+				principal,
+				authorization.Resource{
+					SpaceID: "space-1", ResourceID: "credential-1",
+					Labels: test.labels,
+				},
+				authorization.ReadCredential,
+			)
+			if decision.Allowed != test.allowed {
+				t.Fatalf("decision = %+v, want allowed=%v", decision, test.allowed)
+			}
+		})
+	}
+}
+
+func TestAgentGrantRejectsEmptyLabelKey(t *testing.T) {
+	grant := authorization.Grant{
+		SpaceID: "space-1",
+		Scopes: map[authorization.Scope]struct{}{
+			authorization.ScopeCredentialRead: {},
+		},
+		Labels: map[string]string{"": "dev"},
+	}
+	if err := authorization.ValidateGrant(grant); !errors.Is(
+		err, authorization.ErrInvalidGrant,
+	) {
+		t.Fatalf("ValidateGrant error = %v", err)
+	}
+
+	decision := authorization.DecisionForAgent(
+		authorization.AgentPrincipal{
+			AgentID: "agent-1", Grants: []authorization.Grant{grant},
+		},
+		authorization.Resource{
+			SpaceID: "space-1", ResourceID: "credential-1",
+			Labels: map[string]string{"": "dev"},
+		},
+		authorization.ReadCredential,
+	)
+	if decision.Allowed || !decision.Conceal {
+		t.Fatalf("invalid grant decision = %+v", decision)
 	}
 }
 

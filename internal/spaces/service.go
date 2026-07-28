@@ -88,6 +88,9 @@ func (s *Service) AddMember(
 		return ErrUserNotFound
 	}
 	return s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if err := s.repository.requireActiveSpaceTx(ctx, tx, spaceID); err != nil {
+			return err
+		}
 		if err := s.authorizeMemberManagement(
 			ctx, tx, principal, spaceID, authorization.AddMember,
 		); err != nil {
@@ -122,6 +125,9 @@ func (s *Service) ChangeRole(
 		return ErrMembershipNotFound
 	}
 	return s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if err := s.repository.requireActiveSpaceTx(ctx, tx, spaceID); err != nil {
+			return err
+		}
 		if err := s.authorizeMemberManagement(
 			ctx, tx, principal, spaceID, authorization.ChangeMemberRole,
 		); err != nil {
@@ -160,6 +166,9 @@ func (s *Service) RemoveMember(
 		return ErrMembershipNotFound
 	}
 	return s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if err := s.repository.requireActiveSpaceTx(ctx, tx, spaceID); err != nil {
+			return err
+		}
 		if err := s.authorizeMemberManagement(
 			ctx, tx, principal, spaceID, authorization.RemoveMember,
 		); err != nil {

@@ -182,6 +182,24 @@ func (r repository) activeUserExistsTx(
 	return count == 1, nil
 }
 
+func (r repository) requireActiveSpaceTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	spaceID string,
+) error {
+	var active int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1 FROM spaces WHERE id = ? AND deleted_at IS NULL
+	`, spaceID).Scan(&active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("find active Space: %w", err)
+	}
+	return nil
+}
+
 func (r repository) membershipRoleTx(
 	ctx context.Context,
 	tx *sql.Tx,

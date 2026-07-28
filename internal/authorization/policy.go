@@ -34,14 +34,14 @@ const (
 	ChangeMemberRole Action = "membership.role.change"
 	RemoveMember     Action = "membership.remove"
 
-	ListAgents        Action = "agent.list"
-	ReadAgent         Action = "agent.read"
-	CreateAgent       Action = "agent.create"
-	UpdateAgent       Action = "agent.update"
-	DeleteAgent       Action = "agent.delete"
-	IssueAgentToken   Action = "agent.token.issue"
-	RevokeAgentToken  Action = "agent.token.revoke"
-	ManageAgentGrants Action = "agent.grant.manage"
+	ListAgents       Action = "agent.list"
+	ReadAgent        Action = "agent.read"
+	CreateAgent      Action = "agent.create"
+	UpdateAgent      Action = "agent.update"
+	DeleteAgent      Action = "agent.delete"
+	IssueAgentToken  Action = "agent.token.issue"
+	RevokeAgentToken Action = "agent.token.revoke"
+	ManageAgentGrant Action = "agent.grant.manage"
 
 	ListAuditEvents  Action = "audit.list"
 	PurgeAuditEvents Action = "audit.purge"
@@ -85,7 +85,7 @@ var allActions = []Action{
 	DeleteAgent,
 	IssueAgentToken,
 	RevokeAgentToken,
-	ManageAgentGrants,
+	ManageAgentGrant,
 	ListAuditEvents,
 	PurgeAuditEvents,
 	ListBackups,
@@ -156,6 +156,7 @@ var (
 	ErrDenied          = errors.New("authorization denied")
 	ErrNotFound        = errors.New("resource not found")
 	ErrUnauthenticated = errors.New("principal is not authenticated")
+	ErrInvalidGrant    = errors.New("invalid authorization grant")
 )
 
 type Decision struct {
@@ -194,6 +195,15 @@ type Grant struct {
 	Labels  map[string]string
 }
 
+func ValidateGrant(grant Grant) error {
+	for key := range grant.Labels {
+		if key == "" {
+			return ErrInvalidGrant
+		}
+	}
+	return nil
+}
+
 func AllActions() []Action {
 	return append([]Action(nil), allActions...)
 }
@@ -212,6 +222,9 @@ func DecisionForHuman(
 	}
 	if principal.Session.UserID == "" || principal.Session.SessionID == "" {
 		return Decision{Reason: CodeUnauthenticated}
+	}
+	if action == ManageAgentGrant && resource.SpaceID == "" {
+		return concealed()
 	}
 	if principal.SystemRole == identity.SystemRoleOwner {
 		return allowed()
@@ -251,6 +264,9 @@ func DecisionForAgent(
 		return concealed()
 	}
 	for _, grant := range principal.Grants {
+		if ValidateGrant(grant) != nil {
+			continue
+		}
 		if grant.SpaceID != resource.SpaceID {
 			continue
 		}
@@ -279,8 +295,7 @@ func spaceScopedAction(action Action) bool {
 		DeleteCredential, RestoreCredential, PurgeCredential, GenerateTOTP,
 		ListAsset, ReadAsset, CreateAsset, UpdateAsset, DeleteAsset, LinkCredential,
 		ListMembers, ManageMembers, AddMember, ChangeMemberRole, RemoveMember,
-		ListAgents, ReadAgent, CreateAgent, UpdateAgent, DeleteAgent,
-		IssueAgentToken, RevokeAgentToken, ManageAgentGrants,
+		ManageAgentGrant,
 		ListAuditEvents, PurgeAuditEvents:
 		return true
 	default:
@@ -291,6 +306,8 @@ func spaceScopedAction(action Action) bool {
 func systemAdminAllows(action Action) bool {
 	switch action {
 	case RestoreCredential, ListAuditEvents, PurgeAuditEvents,
+		ListAgents, ReadAgent, CreateAgent, UpdateAgent, DeleteAgent,
+		IssueAgentToken, RevokeAgentToken, ManageAgentGrant,
 		ListBackups, CreateBackup, RestoreBackup,
 		ReadSettings, UpdateSettings, ManageUsers, ReadHealth:
 		return true
@@ -354,7 +371,8 @@ func scopeForAction(action Action) (Scope, bool) {
 
 func labelsMatch(required, actual map[string]string) bool {
 	for key, value := range required {
-		if actual[key] != value {
+		actualValue, exists := actual[key]
+		if !exists || actualValue != value {
 			return false
 		}
 	}

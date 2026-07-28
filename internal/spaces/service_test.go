@@ -312,6 +312,114 @@ func TestSystemOwnerCanManageAnySpaceAndListAllSpaces(t *testing.T) {
 	}
 }
 
+func TestSystemOwnerMutationsConcealMissingOrDeletedSpace(t *testing.T) {
+	tests := []struct {
+		name     string
+		spaceID  func(*testing.T, *spacesHarness) string
+		mutation func(*spacesHarness, string) error
+	}{
+		{
+			name: "add member to missing Space",
+			spaceID: func(*testing.T, *spacesHarness) string {
+				return "missing-space"
+			},
+			mutation: func(h *spacesHarness, spaceID string) error {
+				return h.service.AddMember(
+					h.ctx, h.principal("owner"), spaceID, "editor", spaces.Reader,
+				)
+			},
+		},
+		{
+			name: "change role in missing Space",
+			spaceID: func(*testing.T, *spacesHarness) string {
+				return "missing-space"
+			},
+			mutation: func(h *spacesHarness, spaceID string) error {
+				return h.service.ChangeRole(
+					h.ctx, h.principal("owner"), spaceID, "member", spaces.Editor,
+				)
+			},
+		},
+		{
+			name: "remove member from missing Space",
+			spaceID: func(*testing.T, *spacesHarness) string {
+				return "missing-space"
+			},
+			mutation: func(h *spacesHarness, spaceID string) error {
+				return h.service.RemoveMember(
+					h.ctx, h.principal("owner"), spaceID, "member",
+				)
+			},
+		},
+		{
+			name: "add member to deleted Space",
+			spaceID: func(t *testing.T, h *spacesHarness) string {
+				return h.softDeletedSpace(t)
+			},
+			mutation: func(h *spacesHarness, spaceID string) error {
+				return h.service.AddMember(
+					h.ctx, h.principal("owner"), spaceID, "editor", spaces.Reader,
+				)
+			},
+		},
+		{
+			name: "change role in deleted Space",
+			spaceID: func(t *testing.T, h *spacesHarness) string {
+				return h.softDeletedSpace(t)
+			},
+			mutation: func(h *spacesHarness, spaceID string) error {
+				return h.service.ChangeRole(
+					h.ctx, h.principal("owner"), spaceID, "member", spaces.Editor,
+				)
+			},
+		},
+		{
+			name: "remove member from deleted Space",
+			spaceID: func(t *testing.T, h *spacesHarness) string {
+				return h.softDeletedSpace(t)
+			},
+			mutation: func(h *spacesHarness, spaceID string) error {
+				return h.service.RemoveMember(
+					h.ctx, h.principal("owner"), spaceID, "member",
+				)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newSpacesHarness(t)
+			h.mustExec(
+				`UPDATE users SET system_role = ? WHERE id = ?`,
+				identity.SystemRoleOwner, "owner",
+			)
+			spaceID := test.spaceID(t, h)
+
+			if err := test.mutation(h, spaceID); err != spaces.ErrNotFound {
+				t.Fatalf("mutation error = %v, want stable ErrNotFound", err)
+			}
+			if len(h.revoker.calls) != 0 {
+				t.Fatalf("session revocations = %+v", h.revoker.calls)
+			}
+		})
+	}
+}
+
+func TestSpaceOwnerCannotMutateSoftDeletedSpace(t *testing.T) {
+	h := newSpacesHarness(t)
+	spaceID := h.createSpace(t, "owner")
+	h.mustExec(`UPDATE spaces SET deleted_at = ? WHERE id = ?`, h.nowString(), spaceID)
+
+	err := h.service.AddMember(
+		h.ctx, h.principal("owner"), spaceID, "member", spaces.Reader,
+	)
+	if err != spaces.ErrNotFound {
+		t.Fatalf("mutation error = %v, want stable ErrNotFound", err)
+	}
+	if h.membershipExists(t, spaceID, "member") {
+		t.Fatal("member was added to deleted Space")
+	}
+}
+
 type spacesHarness struct {
 	ctx     context.Context
 	db      *storage.DB
@@ -368,6 +476,13 @@ func (h *spacesHarness) createSpace(t *testing.T, userID string) string {
 		t.Fatal(err)
 	}
 	return created.ID
+}
+
+func (h *spacesHarness) softDeletedSpace(t *testing.T) string {
+	t.Helper()
+	spaceID := h.createSpace(t, "member")
+	h.mustExec(`UPDATE spaces SET deleted_at = ? WHERE id = ?`, h.nowString(), spaceID)
+	return spaceID
 }
 
 func (h *spacesHarness) membershipRole(
