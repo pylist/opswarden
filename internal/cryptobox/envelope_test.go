@@ -24,7 +24,47 @@ func TestLoadMasterKeyAcceptsRestrictedRegularFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got[:], want) {
-		t.Fatalf("got %x, want %x", got, want)
+		t.Fatal("loaded master key mismatch")
+	}
+}
+
+func TestLoadMasterKeyRejectsSymlinkSwapAfterLstat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "master.key")
+	renamedPath := filepath.Join(dir, "original.key")
+	raw := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	afterLstat := func() error {
+		if err := os.Rename(path, renamedPath); err != nil {
+			return err
+		}
+		return os.Symlink(renamedPath, path)
+	}
+	_, err := loadMasterKey(path, afterLstat)
+	if !errors.Is(err, ErrKeyFileType) {
+		t.Fatalf("expected key file type error, got %v", err)
+	}
+}
+
+func TestLoadMasterKeyRejectsPermissionChangeAfterLstat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "master.key")
+	raw := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	if err := os.WriteFile(path, []byte(raw), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	afterLstat := func() error {
+		return os.Chmod(path, 0o600)
+	}
+	_, err := loadMasterKey(path, afterLstat)
+	if !errors.Is(err, ErrKeyPermissions) {
+		t.Fatalf("expected key permissions error, got %v", err)
 	}
 }
 
@@ -112,6 +152,22 @@ func TestLoadMasterKeyRejectsContentBeyondReadLimit(t *testing.T) {
 	}
 }
 
+func TestDecodeMasterKeyClearsEncodedInput(t *testing.T) {
+	tests := map[string][]byte{
+		"success": []byte(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))),
+		"failure": []byte("not-base64"),
+	}
+
+	for name, encoded := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, _ = decodeMasterKey(encoded)
+			if !bytes.Equal(encoded, make([]byte, len(encoded))) {
+				t.Fatal("encoded master key buffer was not cleared")
+			}
+		})
+	}
+}
+
 func TestCredentialAADUsesDomainSeparatedCanonicalEncoding(t *testing.T) {
 	ctx := CredentialContext{
 		CredentialID: "c1",
@@ -138,10 +194,10 @@ func TestCredentialAADUsesDomainSeparatedCanonicalEncoding(t *testing.T) {
 	wantPayload := append([]byte("opswarden/credential-payload/v1"), fields.Bytes()...)
 	wantWrap := append([]byte("opswarden/data-key-wrap/v1"), fields.Bytes()...)
 	if got := credentialAAD(payloadDomain, ctx); !bytes.Equal(got, wantPayload) {
-		t.Fatalf("payload AAD got %x, want %x", got, wantPayload)
+		t.Fatal("payload AAD mismatch")
 	}
 	if got := credentialAAD(wrapDomain, ctx); !bytes.Equal(got, wantWrap) {
-		t.Fatalf("wrap AAD got %x, want %x", got, wantWrap)
+		t.Fatal("wrap AAD mismatch")
 	}
 }
 
@@ -169,7 +225,7 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, plaintext) {
-		t.Fatalf("got %q, want %q", got, plaintext)
+		t.Fatal("decrypted credential plaintext mismatch")
 	}
 }
 
@@ -286,7 +342,7 @@ func TestRewrapDataKeyRotatesOnlyWrappedKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, plaintext) {
-		t.Fatalf("got %q, want %q", got, plaintext)
+		t.Fatal("decrypted credential plaintext mismatch after rewrap")
 	}
 }
 

@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -51,6 +51,10 @@ func New(masterKey [chacha20poly1305.KeySize]byte) *Box {
 }
 
 func LoadMasterKey(path string) ([chacha20poly1305.KeySize]byte, error) {
+	return loadMasterKey(path, nil)
+}
+
+func loadMasterKey(path string, afterLstat func() error) ([chacha20poly1305.KeySize]byte, error) {
 	var key [chacha20poly1305.KeySize]byte
 
 	pathInfo, err := os.Lstat(path)
@@ -60,10 +64,15 @@ func LoadMasterKey(path string) ([chacha20poly1305.KeySize]byte, error) {
 	if err := validateMasterKeyFileInfo(pathInfo); err != nil {
 		return key, err
 	}
+	if afterLstat != nil {
+		if err := afterLstat(); err != nil {
+			return key, fmt.Errorf("run master key test hook: %w", err)
+		}
+	}
 
-	file, err := os.Open(path)
+	file, err := openMasterKeyFile(path)
 	if err != nil {
-		return key, fmt.Errorf("open master key file: %w", err)
+		return key, err
 	}
 	defer file.Close()
 
@@ -71,29 +80,68 @@ func LoadMasterKey(path string) ([chacha20poly1305.KeySize]byte, error) {
 	if err != nil {
 		return key, fmt.Errorf("inspect open master key file: %w", err)
 	}
-	if err := validateMasterKeyFileInfo(openInfo); err != nil {
+	if err := validateStableMasterKeyFileInfo(pathInfo, openInfo); err != nil {
 		return key, err
-	}
-	if !os.SameFile(pathInfo, openInfo) {
-		return key, ErrKeyFileType
 	}
 
 	encoded, err := io.ReadAll(io.LimitReader(file, maxEncodedKeyFileSize+1))
 	if err != nil {
 		return key, fmt.Errorf("read master key file: %w", err)
 	}
+	defer clear(encoded)
 	if len(encoded) > maxEncodedKeyFileSize {
 		return key, ErrKeyFormat
 	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encoded)))
-	if err != nil || len(decoded) != len(key) {
-		clear(decoded)
+
+	afterReadInfo, err := file.Stat()
+	if err != nil {
+		return key, fmt.Errorf("reinspect open master key file: %w", err)
+	}
+	if err := validateStableMasterKeyFileInfo(openInfo, afterReadInfo); err != nil {
+		return key, err
+	}
+
+	afterReadPathInfo, err := os.Lstat(path)
+	if err != nil {
+		return key, fmt.Errorf("reinspect master key path: %w", err)
+	}
+	if err := validateStableMasterKeyFileInfo(afterReadInfo, afterReadPathInfo); err != nil {
+		return key, err
+	}
+
+	return decodeMasterKey(encoded)
+}
+
+func decodeMasterKey(encoded []byte) ([chacha20poly1305.KeySize]byte, error) {
+	var key [chacha20poly1305.KeySize]byte
+	defer clear(encoded)
+
+	trimmed := bytes.TrimSpace(encoded)
+	decoded := make([]byte, base64.StdEncoding.DecodedLen(len(trimmed)))
+	defer clear(decoded)
+	decodedLen, err := base64.StdEncoding.Decode(decoded, trimmed)
+	if err != nil || decodedLen != len(key) {
 		return key, ErrKeyFormat
 	}
-	copy(key[:], decoded)
-	clear(decoded)
+	copy(key[:], decoded[:decodedLen])
 
 	return key, nil
+}
+
+func openMasterKeyFile(path string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ELOOP) {
+			return nil, ErrKeyFileType
+		}
+		return nil, fmt.Errorf("open master key file without following symlinks: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, errors.New("wrap master key file descriptor")
+	}
+	return file, nil
 }
 
 func validateMasterKeyFileInfo(info os.FileInfo) error {
@@ -101,6 +149,19 @@ func validateMasterKeyFileInfo(info os.FileInfo) error {
 		return ErrKeyFileType
 	}
 	if info.Mode().Perm()&^os.FileMode(0o600) != 0 {
+		return ErrKeyPermissions
+	}
+	return nil
+}
+
+func validateStableMasterKeyFileInfo(before, after os.FileInfo) error {
+	if err := validateMasterKeyFileInfo(after); err != nil {
+		return err
+	}
+	if !os.SameFile(before, after) {
+		return ErrKeyFileType
+	}
+	if before.Mode().Perm() != after.Mode().Perm() {
 		return ErrKeyPermissions
 	}
 	return nil
