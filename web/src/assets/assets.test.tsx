@@ -93,6 +93,65 @@ describe("asset workflows", () => {
     expect(screen.getAllByText("orders-01")).toHaveLength(1);
   });
 
+  it("retries failed asset cursors, rejects cycles, dedupes every page, and ignores stale retries", async () => {
+    const second = { ...asset, id: "ast_cache", name: "cache-01" };
+    const stalePage = deferred<unknown>();
+    let firstContinuation = 0;
+    let secondContinuation = 0;
+    const api = apiFor(async (path) => {
+      if (path.endsWith("/assets?limit=100")) {
+        return { items: [asset, asset], nextCursor: "asset_1" };
+      }
+      if (path.endsWith("/assets?limit=100&after=asset_1")) {
+        firstContinuation += 1;
+        if (firstContinuation === 1) throw new Error("transient");
+        return { items: [asset, second, second], nextCursor: "asset_2" };
+      }
+      if (path.endsWith("/assets?limit=100&after=asset_2")) {
+        secondContinuation += 1;
+        if (secondContinuation === 1) {
+          return {
+            items: [{ ...asset, id: "ast_cycle", name: "cycle asset" }],
+            nextCursor: "asset_1",
+          };
+        }
+        return stalePage.promise;
+      }
+      if (path.endsWith("/assets?limit=100&type=database")) {
+        const filtered = { ...asset, id: "ast_filtered", name: "filtered asset", type: "database" };
+        return { items: [filtered, filtered] };
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    render(
+      <AssetListPage
+        api={api}
+        space={{ id: "spc_prod", name: "生产", role: "reader" }}
+      />,
+    );
+    expect(await screen.findAllByText("orders-01")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "加载更多资产" }));
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "加载更多资产" }));
+    expect(await screen.findAllByText("cache-01")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "加载更多资产" }));
+    await waitFor(() => expect(secondContinuation).toBe(1));
+    expect(screen.queryByText("cycle asset")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "加载更多资产" }));
+    await waitFor(() => expect(secondContinuation).toBe(2));
+    fireEvent.change(screen.getByLabelText("资产类型"), {
+      target: { value: "database" },
+    });
+    expect(await screen.findAllByText("filtered asset")).toHaveLength(1);
+    await act(async () => {
+      stalePage.resolve({
+        items: [{ ...asset, id: "ast_stale", name: "stale asset" }],
+      });
+      await stalePage.promise;
+    });
+    expect(screen.queryByText("stale asset")).toBeNull();
+  });
+
   it("paginates linked credential metadata", async () => {
     const linked = {
       id: "crd_orders",
@@ -124,6 +183,87 @@ describe("asset workflows", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "加载更多关联凭据" }));
     expect(await screen.findByText("cache credential")).toBeVisible();
+  });
+
+  it("retries failed linked cursors, rejects cycles, dedupes every page, and ignores stale retries", async () => {
+    const linked = {
+      id: "crd_orders",
+      spaceId: "spc_prod",
+      displayName: "orders database",
+      type: "database" as const,
+      version: 3,
+      tags: {},
+      assetIds: ["ast_orders"],
+    };
+    const second = { ...linked, id: "crd_cache", displayName: "cache credential" };
+    const otherAsset = { ...asset, id: "ast_other", name: "other asset" };
+    const otherLinked = {
+      ...linked,
+      id: "crd_other",
+      displayName: "other credential",
+      assetIds: ["ast_other"],
+    };
+    const stalePage = deferred<unknown>();
+    let firstContinuation = 0;
+    let secondContinuation = 0;
+    const api = apiFor(async (path) => {
+      if (path.endsWith("/assets/ast_orders")) return asset;
+      if (path.endsWith("/assets/ast_other")) return otherAsset;
+      if (path.endsWith("/assets/ast_other/credentials?limit=100")) {
+        return { items: [otherLinked, otherLinked] };
+      }
+      if (path.endsWith("/assets/ast_orders/credentials?limit=100")) {
+        return { items: [linked, linked], nextCursor: "linked_1" };
+      }
+      if (path.endsWith("/assets/ast_orders/credentials?limit=100&after=linked_1")) {
+        firstContinuation += 1;
+        if (firstContinuation === 1) throw new Error("transient");
+        return { items: [linked, second, second], nextCursor: "linked_2" };
+      }
+      if (path.endsWith("/assets/ast_orders/credentials?limit=100&after=linked_2")) {
+        secondContinuation += 1;
+        if (secondContinuation === 1) {
+          return {
+            items: [{ ...linked, id: "crd_cycle", displayName: "cycle linked" }],
+            nextCursor: "linked_1",
+          };
+        }
+        return stalePage.promise;
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    const view = render(
+      <AssetDetailPage
+        api={api}
+        assetId="ast_orders"
+        space={{ id: "spc_prod", name: "生产", role: "reader" }}
+      />,
+    );
+    expect(await screen.findAllByText("orders database")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "加载更多关联凭据" }));
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "加载更多关联凭据" }));
+    expect(await screen.findAllByText("cache credential")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "加载更多关联凭据" }));
+    await waitFor(() => expect(secondContinuation).toBe(1));
+    expect(screen.queryByText("cycle linked")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "加载更多关联凭据" }));
+    await waitFor(() => expect(secondContinuation).toBe(2));
+    view.rerender(
+      <AssetDetailPage
+        api={api}
+        assetId="ast_other"
+        space={{ id: "spc_prod", name: "生产", role: "reader" }}
+      />,
+    );
+    expect(await screen.findAllByText("other credential")).toHaveLength(1);
+    await act(async () => {
+      stalePage.resolve({
+        items: [{ ...linked, id: "crd_stale_linked", displayName: "stale linked" }],
+      });
+      await stalePage.promise;
+    });
+    expect(screen.queryByText("stale linked")).toBeNull();
   });
 
   it("rejects hostile linked credential metadata containing payload", async () => {

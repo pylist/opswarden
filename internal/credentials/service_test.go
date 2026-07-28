@@ -20,9 +20,22 @@ import (
 	"opswarden/internal/storage"
 )
 
-type credentialTestClock struct{ now time.Time }
+type credentialTestClock struct {
+	mu  sync.RWMutex
+	now time.Time
+}
 
-func (c *credentialTestClock) Now() time.Time { return c.now }
+func (c *credentialTestClock) Now() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.now
+}
+
+func (c *credentialTestClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(duration)
+}
 
 type credentialAuditAppender struct {
 	mu       sync.Mutex
@@ -769,7 +782,7 @@ func TestRestoreAndPurgeExpiredRecycleBin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.clock.now = h.clock.now.Add(30 * 24 * time.Hour)
+	h.clock.Advance(30 * 24 * time.Hour)
 	systemOwner := humanCredentialPrincipal(
 		"usr_editor", "spc_main", authorization.RoleOwner,
 	)
@@ -879,7 +892,7 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 					h.ctx,
 					`UPDATE sessions SET recent_totp_at = ? WHERE id = ?`,
 					formatCredentialTime(
-						h.clock.now.Add(-identity.RecentTOTPLifetime),
+						h.clock.Now().Add(-identity.RecentTOTPLifetime),
 					),
 					principal.Human.Session.SessionID,
 				); err != nil {
@@ -919,7 +932,7 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 				if _, err := h.db.Writer.ExecContext(
 					h.ctx,
 					`UPDATE sessions SET revoked_at = ? WHERE id = ?`,
-					formatCredentialTime(h.clock.now),
+					formatCredentialTime(h.clock.Now()),
 					principal.Human.Session.SessionID,
 				); err != nil {
 					h.t.Fatal(err)
@@ -936,7 +949,7 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 				if _, err := h.db.Writer.ExecContext(
 					h.ctx,
 					`UPDATE sessions SET expires_at = ? WHERE id = ?`,
-					formatCredentialTime(h.clock.now),
+					formatCredentialTime(h.clock.Now()),
 					principal.Human.Session.SessionID,
 				); err != nil {
 					h.t.Fatal(err)
@@ -953,7 +966,7 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 				if _, err := h.db.Writer.ExecContext(
 					h.ctx,
 					`UPDATE sessions SET idle_expires_at = ? WHERE id = ?`,
-					formatCredentialTime(h.clock.now),
+					formatCredentialTime(h.clock.Now()),
 					principal.Human.Session.SessionID,
 				); err != nil {
 					h.t.Fatal(err)
@@ -1013,7 +1026,7 @@ func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T
 				if _, err := h.db.Writer.ExecContext(
 					h.ctx,
 					`UPDATE users SET deleted_at = ? WHERE id = ?`,
-					formatCredentialTime(h.clock.now),
+					formatCredentialTime(h.clock.Now()),
 					principal.Human.Session.UserID,
 				); err != nil {
 					h.t.Fatal(err)
@@ -1086,6 +1099,149 @@ func TestPurgeOneCredentialRollsBackWhenAuditFails(t *testing.T) {
 	}
 }
 
+func TestPurgeSamplesOperationTimeAfterWriterAcquisition(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*credentialHarness, Principal)
+		advance time.Duration
+		want    error
+	}{
+		{
+			name:    "recent TOTP expires while waiting",
+			advance: identity.RecentTOTPLifetime,
+			want:    identity.ErrRecentTOTPRequired,
+		},
+		{
+			name: "session expires while waiting",
+			prepare: func(h *credentialHarness, principal Principal) {
+				if _, err := h.db.Writer.ExecContext(
+					h.ctx,
+					`UPDATE sessions SET expires_at = ? WHERE id = ?`,
+					formatCredentialTime(h.clock.Now().Add(time.Minute)),
+					principal.Human.Session.SessionID,
+				); err != nil {
+					h.t.Fatal(err)
+				}
+			},
+			advance: time.Minute,
+			want:    identity.ErrSessionExpired,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newCredentialHarness(t)
+			created := h.create(h.editor)
+			if err := h.service.Delete(
+				h.ctx, h.editor, created.ID, created.Version,
+				h.writeContext("purge-clock-delete", h.editor.Actor),
+			); err != nil {
+				t.Fatal(err)
+			}
+			owner := recentSystemOwner(h)
+			if test.prepare != nil {
+				test.prepare(h, owner)
+			}
+
+			held, err := h.db.Writer.BeginTx(h.ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitCount := h.db.Writer.Stats().WaitCount
+			done := make(chan error, 1)
+			go func() {
+				done <- h.service.Purge(
+					h.ctx, owner, h.spaceID, created.ID, created.Version,
+					h.writeContext("purge-clock", owner.Actor),
+				)
+			}()
+			waitForWriterWait(t, h.db.Writer, waitCount)
+			h.clock.Advance(test.advance)
+			if err := held.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := <-done; !errors.Is(err, test.want) {
+				t.Fatalf("purge err=%v want=%v", err, test.want)
+			}
+			if h.countCredentials() != 1 {
+				t.Fatal("expired authority deleted credential")
+			}
+			var purgeEvents int
+			if err := h.db.Reader.QueryRowContext(
+				h.ctx,
+				`SELECT count(*) FROM audit_events
+				 WHERE action = 'credential.purge' AND entity_id = ?`,
+				created.ID,
+			).Scan(&purgeEvents); err != nil {
+				t.Fatal(err)
+			}
+			if purgeEvents != 0 {
+				t.Fatalf("failed purge audit events=%d", purgeEvents)
+			}
+		})
+	}
+
+	t.Run("audit uses post-acquisition time", func(t *testing.T) {
+		h := newCredentialHarness(t)
+		created := h.create(h.editor)
+		if err := h.service.Delete(
+			h.ctx, h.editor, created.ID, created.Version,
+			h.writeContext("purge-audit-clock-delete", h.editor.Actor),
+		); err != nil {
+			t.Fatal(err)
+		}
+		owner := recentSystemOwner(h)
+		held, err := h.db.Writer.BeginTx(h.ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitCount := h.db.Writer.Stats().WaitCount
+		done := make(chan error, 1)
+		go func() {
+			done <- h.service.Purge(
+				h.ctx, owner, h.spaceID, created.ID, created.Version,
+				h.writeContext("purge-audit-clock", owner.Actor),
+			)
+		}()
+		waitForWriterWait(t, h.db.Writer, waitCount)
+		h.clock.Advance(time.Minute)
+		wantTime := h.clock.Now()
+		if err := held.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		var stored string
+		if err := h.db.Reader.QueryRowContext(
+			h.ctx,
+			`SELECT created_at FROM audit_events
+			 WHERE action = 'credential.purge' AND entity_id = ?`,
+			created.ID,
+		).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		gotTime, err := time.Parse("2006-01-02T15:04:05.000000000Z", stored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !gotTime.Equal(wantTime) {
+			t.Fatalf("audit time=%s want post-acquisition %s", gotTime, wantTime)
+		}
+	})
+}
+
+func waitForWriterWait(t *testing.T, db *sql.DB, before int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for db.Stats().WaitCount <= before {
+		if time.Now().After(deadline) {
+			t.Fatal("purge did not block acquiring writer")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestPurgeSerializesAuthoritativeDemotionAndRevocation(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1108,7 +1264,7 @@ func TestPurgeSerializesAuthoritativeDemotionAndRevocation(t *testing.T) {
 				_, err := h.db.Writer.ExecContext(
 					h.ctx,
 					`UPDATE sessions SET revoked_at = ? WHERE id = ?`,
-					formatCredentialTime(h.clock.now),
+					formatCredentialTime(h.clock.Now()),
 					principal.Human.Session.SessionID,
 				)
 				return err
@@ -1173,8 +1329,8 @@ func recentSystemOwner(h *credentialHarness) Principal {
 		"usr_editor", h.spaceID, authorization.RoleOwner,
 	)
 	principal.Human.SystemRole = identity.SystemRoleOwner
-	principal.Human.Session.RecentTOTPAt = h.clock.now
-	principal.Human.Session.IssuedAt = h.clock.now.Add(-time.Hour)
+	principal.Human.Session.RecentTOTPAt = h.clock.Now()
+	principal.Human.Session.IssuedAt = h.clock.Now().Add(-time.Hour)
 	principal.BoundSpaceID = h.spaceID
 	if _, err := h.db.Writer.ExecContext(
 		h.ctx,
@@ -1201,9 +1357,9 @@ func recentSystemOwner(h *credentialHarness) Principal {
 		principal.Human.Session.UserID,
 		bytes.Repeat([]byte{0x5a}, 32),
 		formatCredentialTime(principal.Human.Session.IssuedAt),
-		formatCredentialTime(h.clock.now.Add(identity.SessionAbsoluteLifetime)),
-		formatCredentialTime(h.clock.now.Add(identity.SessionIdleLifetime)),
-		formatCredentialTime(h.clock.now),
+		formatCredentialTime(h.clock.Now().Add(identity.SessionAbsoluteLifetime)),
+		formatCredentialTime(h.clock.Now().Add(identity.SessionIdleLifetime)),
+		formatCredentialTime(h.clock.Now()),
 	); err != nil {
 		h.t.Fatal(err)
 	}

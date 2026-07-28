@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiPath, formatApiError } from "../api/client";
 import type { Space } from "../api/types";
+import { CursorFlow, mergeUniqueByID } from "../pagination";
 import {
   credentialTypeLabels,
   parseAsset,
@@ -47,14 +48,16 @@ export function AssetDetailPage({
   const requestController = useRef<AbortController | null>(null);
   const credentialGeneration = useRef(0);
   const credentialController = useRef<AbortController | null>(null);
-  const requestedCredentialCursors = useRef(new Set<string>());
+  const credentialCursorFlow = useRef(new CursorFlow());
 
   const load = useCallback(async () => {
     if (!safeID.test(assetId) || !safeID.test(space.id)) return;
     const current = ++generation.current;
     credentialGeneration.current += 1;
     credentialController.current?.abort();
-    requestedCredentialCursors.current.clear();
+    credentialCursorFlow.current.reset();
+    const credentialAttempt = credentialCursorFlow.current.begin("");
+    if (!credentialAttempt) return;
     setCredentialCursor("");
     requestController.current?.abort();
     const controller = new AbortController();
@@ -85,15 +88,21 @@ export function AssetDetailPage({
       ) {
         throw new Error("invalid response");
       }
-      if (linked.nextCursor && requestedCredentialCursors.current.has(linked.nextCursor)) {
+      if (
+        !credentialCursorFlow.current.complete(
+          credentialAttempt,
+          linked.nextCursor,
+        )
+      ) {
         throw new Error("invalid response");
       }
       setAsset(parsedAsset);
-      setCredentials(linked.items);
+      setCredentials(mergeUniqueByID([], linked.items));
       setCredentialCursor(linked.nextCursor ?? "");
     } catch (caught) {
       if (current === generation.current) setError(formatApiError(caught));
     } finally {
+      credentialCursorFlow.current.fail(credentialAttempt);
       if (requestController.current === controller) {
         requestController.current = null;
       }
@@ -107,7 +116,7 @@ export function AssetDetailPage({
       credentialGeneration.current += 1;
       requestController.current?.abort();
       credentialController.current?.abort();
-      requestedCredentialCursors.current.clear();
+      credentialCursorFlow.current.reset();
       setAsset(null);
       setCredentials([]);
     };
@@ -115,11 +124,15 @@ export function AssetDetailPage({
 
   async function loadMoreCredentials() {
     const after = credentialCursor;
-    if (!after || requestedCredentialCursors.current.has(after)) {
+    if (!after) {
       setError("请求失败，请检查网络连接后重试。");
       return;
     }
-    requestedCredentialCursors.current.add(after);
+    const attempt = credentialCursorFlow.current.begin(after);
+    if (!attempt) {
+      setError("请求失败，请检查网络连接后重试。");
+      return;
+    }
     const current = ++credentialGeneration.current;
     credentialController.current?.abort();
     const controller = new AbortController();
@@ -139,19 +152,18 @@ export function AssetDetailPage({
       if (
         !parsed ||
         parsed.items.some((item) => item.spaceId !== space.id) ||
-        (parsed.nextCursor &&
-          (parsed.nextCursor === after ||
-            requestedCredentialCursors.current.has(parsed.nextCursor)))
+        !credentialCursorFlow.current.complete(attempt, parsed.nextCursor)
       ) {
         throw new Error("invalid response");
       }
-      setCredentials((existing) => mergeByID(existing, parsed.items));
+      setCredentials((existing) => mergeUniqueByID(existing, parsed.items));
       setCredentialCursor(parsed.nextCursor ?? "");
     } catch (caught) {
       if (current === credentialGeneration.current) {
         setError(formatApiError(caught));
       }
     } finally {
+      credentialCursorFlow.current.fail(attempt);
       if (credentialController.current === controller) {
         credentialController.current = null;
       }
@@ -294,9 +306,4 @@ export function AssetDetailPage({
       )}
     </>
   );
-}
-
-function mergeByID<T extends { id: string }>(existing: T[], incoming: T[]) {
-  const ids = new Set(existing.map((item) => item.id));
-  return [...existing, ...incoming.filter((item) => !ids.has(item.id))];
 }

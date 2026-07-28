@@ -790,7 +790,6 @@ func (s *Service) Purge(
 	if err := validateMutationContext(principal, writeContext); err != nil {
 		return err
 	}
-	now := s.clock.Now().UTC()
 	return s.repository.withTx(ctx, func(tx *sql.Tx) error {
 		metadata, err := s.repository.metadataByID(ctx, tx, credentialID, true)
 		if err != nil {
@@ -804,8 +803,9 @@ func (s *Service) Purge(
 		); err != nil {
 			return err
 		}
+		operationTime := s.clock.Now().UTC()
 		if err := verifyAuthoritativePurgeSession(
-			ctx, tx, principal, now,
+			ctx, tx, principal, operationTime,
 		); err != nil {
 			return err
 		}
@@ -820,7 +820,8 @@ func (s *Service) Purge(
 		}
 		event, err := s.auditEventAt(
 			principal, writeContext.Actor, "credential.purge", metadata,
-			audit.ChangeFields{audit.FieldDeletedAt}, writeContext.Reason, now,
+			audit.ChangeFields{audit.FieldDeletedAt}, writeContext.Reason,
+			operationTime,
 		)
 		if err != nil {
 			return ErrAuditUnavailable

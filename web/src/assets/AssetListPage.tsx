@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiPath, formatApiError } from "../api/client";
 import type { Space } from "../api/types";
+import { CursorFlow, mergeUniqueByID } from "../pagination";
 import {
   parseAsset,
   parseList,
@@ -42,18 +43,18 @@ export function AssetListPage({
   const [loadingMore, setLoadingMore] = useState(false);
   const generation = useRef(0);
   const requestController = useRef<AbortController | null>(null);
-  const requestedCursors = useRef(new Set<string>());
+  const cursorFlow = useRef(new CursorFlow());
 
   const load = useCallback(async (after = "") => {
-    if (after && requestedCursors.current.has(after)) {
+    if (!after) {
+      cursorFlow.current.reset();
+      setNextCursor("");
+    }
+    const attempt = cursorFlow.current.begin(after);
+    if (!attempt) {
       setError("请求失败，请检查网络连接后重试。");
       return;
     }
-    if (!after) {
-      requestedCursors.current.clear();
-      setNextCursor("");
-    }
-    else requestedCursors.current.add(after);
     const current = ++generation.current;
     requestController.current?.abort();
     const controller = new AbortController();
@@ -77,20 +78,17 @@ export function AssetListPage({
       if (!parsed || parsed.items.some((item) => item.spaceId !== space.id || item.deletedAt)) {
         throw new Error("invalid response");
       }
-      if (
-        parsed.nextCursor &&
-        (parsed.nextCursor === after ||
-          requestedCursors.current.has(parsed.nextCursor))
-      ) {
+      if (!cursorFlow.current.complete(attempt, parsed.nextCursor)) {
         throw new Error("invalid response");
       }
       setItems((existing) =>
-        after ? mergeByID(existing, parsed.items) : parsed.items
+        mergeUniqueByID(after ? existing : [], parsed.items)
       );
       setNextCursor(parsed.nextCursor ?? "");
     } catch (caught) {
       if (current === generation.current) setError(formatApiError(caught));
     } finally {
+      cursorFlow.current.fail(attempt);
       if (current === generation.current) setLoading(false);
       if (current === generation.current) setLoadingMore(false);
       if (requestController.current === controller) {
@@ -104,7 +102,7 @@ export function AssetListPage({
     return () => {
       generation.current += 1;
       requestController.current?.abort();
-      requestedCursors.current.clear();
+      cursorFlow.current.reset();
       setSelectedID("");
     };
   }, [load]);
@@ -196,9 +194,4 @@ export function AssetListPage({
       )}
     </>
   );
-}
-
-function mergeByID<T extends { id: string }>(existing: T[], incoming: T[]) {
-  const ids = new Set(existing.map((item) => item.id));
-  return [...existing, ...incoming.filter((item) => !ids.has(item.id))];
 }

@@ -119,6 +119,80 @@ describe("credential workflows", () => {
     expect(screen.queryByText("stale page")).toBeNull();
   });
 
+  it("retries failed credential cursors, rejects cycles, dedupes every page, and ignores stale retries", async () => {
+    const second = {
+      ...metadata,
+      id: "crd_cache",
+      displayName: "cache credential",
+      type: "api_token" as const,
+    };
+    const stalePage = deferred<unknown>();
+    let firstContinuation = 0;
+    let secondContinuation = 0;
+    const api = apiFor(async (path) => {
+      if (path.endsWith("/credentials?limit=100")) {
+        return { items: [metadata, metadata], nextCursor: "cursor_1" };
+      }
+      if (path.endsWith("/credentials?limit=100&after=cursor_1")) {
+        firstContinuation += 1;
+        if (firstContinuation === 1) throw new Error("transient");
+        return { items: [metadata, second, second], nextCursor: "cursor_2" };
+      }
+      if (path.endsWith("/credentials?limit=100&after=cursor_2")) {
+        secondContinuation += 1;
+        if (secondContinuation === 1) {
+          return {
+            items: [{ ...second, id: "crd_cycle", displayName: "cycle item" }],
+            nextCursor: "cursor_1",
+          };
+        }
+        return stalePage.promise;
+      }
+      if (path.endsWith("/credentials?limit=100&type=login")) {
+        const filtered = {
+          ...metadata,
+          id: "crd_filtered",
+          displayName: "filtered credential",
+          type: "login" as const,
+        };
+        return { items: [filtered, filtered] };
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    render(
+      <CredentialListPage
+        api={api}
+        space={{ id: "spc_prod", name: "生产", role: "reader" }}
+        sessionActive
+        systemRole="member"
+      />,
+    );
+    expect(await screen.findAllByText("orders database")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "加载更多凭据" }));
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "加载更多凭据" }));
+    expect(await screen.findByText("cache credential")).toBeVisible();
+    expect(screen.getAllByText("cache credential")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "加载更多凭据" }));
+    await waitFor(() => expect(secondContinuation).toBe(1));
+    expect(screen.queryByText("cycle item")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "加载更多凭据" }));
+    await waitFor(() => expect(secondContinuation).toBe(2));
+    fireEvent.change(screen.getByLabelText("按类型筛选"), {
+      target: { value: "login" },
+    });
+    expect(await screen.findAllByText("filtered credential")).toHaveLength(1);
+    await act(async () => {
+      stalePage.resolve({
+        items: [{ ...metadata, id: "crd_stale_retry", displayName: "stale retry" }],
+      });
+      await stalePage.promise;
+    });
+    expect(screen.queryByText("stale retry")).toBeNull();
+  });
+
   it("rejects hostile metadata list items instead of retaining extra payload fields", async () => {
     const api = apiFor(() =>
       response({
@@ -638,6 +712,76 @@ describe("credential workflows", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "加载更多已删除凭据" }));
     expect(await screen.findByText("deleted second")).toBeVisible();
+  });
+
+  it("retries failed recycle cursors, rejects cycles, dedupes every page, and ignores stale retries", async () => {
+    const deleted = { ...metadata, deletedAt: "2026-07-01T00:00:00Z" };
+    const stalePage = deferred<unknown>();
+    let firstContinuation = 0;
+    let secondContinuation = 0;
+    const api = apiFor(async (path) => {
+      if (path.includes("/spaces/spc_other/")) {
+        const other = {
+          ...deleted,
+          id: "crd_other",
+          spaceId: "spc_other",
+          displayName: "other deleted",
+        };
+        return { items: [other, other] };
+      }
+      if (path.endsWith("/credentials?deletedOnly=1&limit=100")) {
+        return { items: [deleted, deleted], nextCursor: "deleted_1" };
+      }
+      if (path.endsWith("/credentials?deletedOnly=1&limit=100&after=deleted_1")) {
+        firstContinuation += 1;
+        if (firstContinuation === 1) throw new Error("transient");
+        const second = { ...deleted, id: "crd_deleted_2", displayName: "deleted two" };
+        return { items: [deleted, second, second], nextCursor: "deleted_2" };
+      }
+      if (path.endsWith("/credentials?deletedOnly=1&limit=100&after=deleted_2")) {
+        secondContinuation += 1;
+        if (secondContinuation === 1) {
+          return {
+            items: [{ ...deleted, id: "crd_cycle", displayName: "cycle deleted" }],
+            nextCursor: "deleted_1",
+          };
+        }
+        return stalePage.promise;
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    const view = render(
+      <RecycleBinPage
+        api={api}
+        space={{ id: "spc_prod", name: "生产", role: "owner" }}
+        systemRole="member"
+      />,
+    );
+    expect(await screen.findAllByText("orders database")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "加载更多已删除凭据" }));
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "加载更多已删除凭据" }));
+    expect(await screen.findAllByText("deleted two")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "加载更多已删除凭据" }));
+    await waitFor(() => expect(secondContinuation).toBe(1));
+    expect(screen.queryByText("cycle deleted")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "加载更多已删除凭据" }));
+    await waitFor(() => expect(secondContinuation).toBe(2));
+    view.rerender(
+      <RecycleBinPage
+        api={api}
+        space={{ id: "spc_other", name: "开发", role: "owner" }}
+        systemRole="member"
+      />,
+    );
+    expect(await screen.findAllByText("other deleted")).toHaveLength(1);
+    await act(async () => {
+      stalePage.resolve({
+        items: [{ ...deleted, id: "crd_stale_deleted", displayName: "stale deleted" }],
+      });
+      await stalePage.promise;
+    });
+    expect(screen.queryByText("stale deleted")).toBeNull();
   });
 
   it("renews the JWT before a single exact permanent-purge request", async () => {
