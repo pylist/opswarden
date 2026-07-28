@@ -54,6 +54,8 @@ type Service struct {
 	clock      platform.Clock
 	// purgeAuthorizedHook is test-only synchronization injected by package tests.
 	purgeAuthorizedHook func()
+	// maintenancePurgeRowScannedHook injects row interruption in package tests.
+	maintenancePurgeRowScannedHook func() error
 }
 
 func NewService(
@@ -1025,9 +1027,18 @@ func (s *Service) PurgeExpiredMaintenance(
 				return err
 			}
 			expired = append(expired, metadata)
+			if s.maintenancePurgeRowScannedHook != nil {
+				if err := s.maintenancePurgeRowScannedHook(); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf("iterate expired credentials: %w", err)
+				}
+			}
 		}
 		if err := rows.Close(); err != nil {
-			return err
+			return fmt.Errorf("close expired credentials: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate expired credentials: %w", err)
 		}
 		for _, metadata := range expired {
 			eventID, err := randomCredentialID("aud_")

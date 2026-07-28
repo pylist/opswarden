@@ -288,6 +288,67 @@ func TestNewServiceRejectsRootSharedDirectoryAndDatabaseDirectoryWithoutChmod(t 
 	}
 }
 
+func TestNewServiceRejectsDirectorySwapBetweenStatAndOpenRoot(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "data", "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	dir := backupDir(t)
+	original := dir + "-original"
+	attacker := dir + "-attacker"
+	const sentinel = "attacker-owned-content"
+
+	originalOpenRoot := openBackupRoot
+	t.Cleanup(func() { openBackupRoot = originalOpenRoot })
+	openBackupRoot = func(path string) (*os.Root, error) {
+		if err := os.Rename(path, original); err != nil {
+			return nil, err
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(
+			filepath.Join(path, "sentinel"), []byte(sentinel), 0o600,
+		); err != nil {
+			return nil, err
+		}
+		root, err := os.OpenRoot(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Rename(path, attacker); err != nil {
+			_ = root.Close()
+			return nil, err
+		}
+		if err := os.Rename(original, path); err != nil {
+			_ = root.Close()
+			return nil, err
+		}
+		return root, nil
+	}
+
+	if _, err := NewService(
+		db, dir, fixedClock{now: time.Now().UTC()},
+	); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("directory swap err=%v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(attacker, "sentinel"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != sentinel {
+		t.Fatalf("attacker file changed: %q", content)
+	}
+	entries, err := os.ReadDir(attacker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "sentinel" {
+		t.Fatalf("attacker directory changed: %v", entries)
+	}
+}
+
 func TestServiceRejectsReplacedOrPermissionChangedBackupDirectory(t *testing.T) {
 	db, err := storage.Open(filepath.Join(t.TempDir(), "data", "source.db"))
 	if err != nil {
@@ -381,6 +442,62 @@ func TestOnlineCopyUsesReservedRootBoundFile(t *testing.T) {
 		context.Background(), name, "",
 	); err != nil {
 		t.Fatalf("root-bound integrity: %T %v", err, err)
+	}
+}
+
+func TestBackupFileOperationsRejectInjectedForeignOwner(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service, err := NewService(
+		db, backupDir(t), fixedClock{now: time.Now().UTC()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+	const name = "foreign-owner.partial"
+	if err := service.reserveTemp(name); err != nil {
+		t.Fatal(err)
+	}
+	originalOwnerCheck := backupFileOwnedByCurrentUser
+	backupFileOwnedByCurrentUser = func(os.FileInfo) bool { return false }
+	t.Cleanup(func() {
+		backupFileOwnedByCurrentUser = originalOwnerCheck
+		_ = service.root.Remove(name)
+	})
+
+	if err := service.onlineCopy(context.Background(), name); err == nil {
+		t.Fatal("online copy accepted foreign-owned file")
+	}
+	info, err := service.root.Lstat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("foreign-owned file received %d bytes", info.Size())
+	}
+	if err := service.chmodFile(name, 0o600); err == nil {
+		t.Fatal("chmod accepted foreign-owned file")
+	}
+	if err := service.syncFile(name); err == nil {
+		t.Fatal("sync accepted foreign-owned file")
+	}
+	if err := service.publishLink(name, "foreign-owner-linked.partial"); err == nil {
+		t.Fatal("link accepted foreign-owned file")
+	}
+	if _, err := service.verifyRelative(
+		context.Background(), name, "",
+	); !errors.Is(err, ErrInvalidBackup) {
+		t.Fatalf("verify foreign-owned file err=%v", err)
+	}
+	if err := service.removeOwnedBackupFile(name, 1); err == nil {
+		t.Fatal("remove accepted foreign-owned file")
+	}
+	if _, err := service.root.Lstat(name); err != nil {
+		t.Fatalf("foreign-owned file was removed: %v", err)
 	}
 }
 

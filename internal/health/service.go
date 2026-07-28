@@ -15,6 +15,8 @@ import (
 	"opswarden/internal/storage"
 )
 
+const writerProbeTimeout = 100 * time.Millisecond
+
 type Liveness struct {
 	Status string `json:"status"`
 }
@@ -182,19 +184,27 @@ func (s *Service) Detailed(ctx context.Context) (Detail, error) {
 }
 
 func (s *Service) probeWriter(ctx context.Context) (string, error) {
-	tx, err := s.db.Writer.BeginTx(ctx, nil)
+	probeCtx, cancel := context.WithTimeout(ctx, writerProbeTimeout)
+	defer cancel()
+	tx, err := s.db.Writer.BeginTx(probeCtx, nil)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
+		}
+		if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
+			return "busy", nil
 		}
 		return classifyWriteFailure(err), nil
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(
-		ctx, `UPDATE health_probe SET marker = marker WHERE id = 1`,
+		probeCtx, `UPDATE health_probe SET marker = marker WHERE id = 1`,
 	); err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
+		}
+		if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
+			return "busy", nil
 		}
 		return classifyWriteFailure(err), nil
 	}

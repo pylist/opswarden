@@ -41,6 +41,8 @@ var (
 	canonicalNamePattern = regexp.MustCompile(
 		`^opswarden-(\d{8}T\d{6}\.\d{9}Z)-(bkp_[0-9a-f]{32})\.sqlite3$`,
 	)
+	openBackupRoot               = os.OpenRoot
+	backupFileOwnedByCurrentUser = ownedByCurrentUser
 )
 
 type RunRecord struct {
@@ -87,7 +89,7 @@ func NewService(db *storage.DB, directory string, clock platform.Clock) (*Servic
 	if err != nil {
 		return nil, ErrUnavailable
 	}
-	root, err := os.OpenRoot(absolute)
+	root, err := openBackupRoot(absolute)
 	if err != nil {
 		return nil, ErrUnavailable
 	}
@@ -152,7 +154,7 @@ func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
 	}
 	defer func() {
 		if resultErr != nil {
-			_ = s.root.Remove(tempName)
+			_ = s.removeOwnedBackupFile(tempName, 1, 2)
 		}
 	}()
 	if err := s.recordStart(ctx, id, now); err != nil {
@@ -188,8 +190,8 @@ func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
 		fail("PUBLISH_ERROR")
 		return "", ErrUnavailable
 	}
-	if err := s.root.Remove(tempName); err != nil {
-		_ = s.root.Remove(filename)
+	if err := s.removeOwnedBackupFile(tempName, 2); err != nil {
+		_ = s.removeOwnedBackupFile(filename, 2)
 		fail("FILESYSTEM_ERROR")
 		return "", ErrUnavailable
 	}
@@ -197,7 +199,7 @@ func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
 		ctx, filename, verification.Checksum,
 	)
 	if err != nil || publishedVerification.Size != verification.Size {
-		_ = s.root.Remove(filename)
+		_ = s.removeOwnedBackupFile(filename, 1)
 		if err == nil {
 			err = ErrInvalidBackup
 		}
@@ -205,12 +207,12 @@ func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
 		return "", publicError(err)
 	}
 	if err := s.syncDirectory(); err != nil {
-		_ = s.root.Remove(filename)
+		_ = s.removeOwnedBackupFile(filename, 1)
 		fail("FILESYSTEM_ERROR")
 		return "", ErrUnavailable
 	}
 	if err := s.validateDirectory(); err != nil {
-		_ = s.root.Remove(filename)
+		_ = s.removeOwnedBackupFile(filename, 1)
 		fail("FILESYSTEM_ERROR")
 		return "", ErrUnavailable
 	}
@@ -229,14 +231,16 @@ func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
 }
 
 func (s *Service) onlineCopy(ctx context.Context, destinationName string) error {
+	if err := s.validateDirectory(); err != nil {
+		return err
+	}
 	file, err := s.root.OpenFile(destinationName, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() ||
-		info.Mode().Perm() != 0o600 || linkCount(info) != 1 {
+	if err != nil || !validOwnedBackupFile(info, false, 1) {
 		return ErrUnavailable
 	}
 	conn, err := s.db.Reader.Conn(ctx)
@@ -573,7 +577,7 @@ func (s *Service) ApplyRetention(ctx context.Context) ([]RunRecord, error) {
 			continue
 		}
 		info, err := s.root.Lstat(record.Filename)
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		if err != nil || !validOwnedBackupFile(info, true, 1) {
 			partial = true
 			retained = append(retained, record)
 			continue
@@ -596,7 +600,7 @@ func (s *Service) ApplyRetention(ctx context.Context) ([]RunRecord, error) {
 			retained = append(retained, record)
 			continue
 		}
-		if err := s.root.Remove(record.Filename); err != nil {
+		if err := s.removeOwnedBackupFile(record.Filename, 1); err != nil {
 			_, _ = s.db.Writer.ExecContext(context.Background(), `
 			UPDATE backup_runs
 			SET retained = 1, deleted_at = NULL,
@@ -878,7 +882,7 @@ func (s *Service) reconcileRunningRows(ctx context.Context) error {
 		temp := "." + name + ".partial"
 		if _, err := s.root.Lstat(name); err == nil {
 			if _, tempErr := s.root.Lstat(temp); tempErr == nil {
-				if err := s.root.Remove(temp); err != nil {
+				if err := s.removeOwnedBackupFile(temp, 1, 2); err != nil {
 					return err
 				}
 				if err := s.syncDirectory(); err != nil {
@@ -904,7 +908,7 @@ func (s *Service) reconcileRunningRows(ctx context.Context) error {
 			continue
 		}
 		if _, err := s.root.Lstat(temp); err == nil {
-			if err := s.root.Remove(temp); err != nil {
+			if err := s.removeOwnedBackupFile(temp, 1); err != nil {
 				return err
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -1024,8 +1028,7 @@ func (s *Service) verifyRelative(
 		return Verification{}, ErrInvalidBackup
 	}
 	info, err := s.root.Lstat(name)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
-		info.Mode().Perm() != 0o600 || info.Size() <= 0 || linkCount(info) != 1 {
+	if err != nil || !validOwnedBackupFile(info, true, 1) {
 		return Verification{}, ErrInvalidBackup
 	}
 	file, err := s.root.Open(name)
@@ -1034,9 +1037,8 @@ func (s *Service) verifyRelative(
 	}
 	defer file.Close()
 	openedInfo, err := file.Stat()
-	if err != nil || !openedInfo.Mode().IsRegular() ||
-		openedInfo.Mode().Perm() != 0o600 || openedInfo.Size() <= 0 ||
-		openedInfo.Size() > maxSnapshotBytes || linkCount(openedInfo) != 1 {
+	if err != nil || !validOwnedBackupFile(openedInfo, true, 1) ||
+		openedInfo.Size() > maxSnapshotBytes {
 		return Verification{}, ErrInvalidBackup
 	}
 	if !os.SameFile(info, openedInfo) {
@@ -1059,9 +1061,9 @@ func (s *Service) verifyRelative(
 		return Verification{}, ErrInvalidBackup
 	}
 	finalInfo, err := s.root.Lstat(name)
-	if err != nil || !finalInfo.Mode().IsRegular() ||
-		finalInfo.Mode().Perm() != 0o600 || finalInfo.Size() != openedInfo.Size() ||
-		linkCount(finalInfo) != 1 || !os.SameFile(openedInfo, finalInfo) {
+	if err != nil || !validOwnedBackupFile(finalInfo, true, 1) ||
+		finalInfo.Size() != openedInfo.Size() ||
+		!os.SameFile(openedInfo, finalInfo) {
 		return Verification{}, ErrInvalidBackup
 	}
 	if err := s.validateDirectory(); err != nil {
@@ -1129,10 +1131,9 @@ func (filesystem singleFileFS) Open(name string) (fs.File, error) {
 		return nil, err
 	}
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() ||
-		info.Mode().Perm() != 0o600 ||
+	if err != nil || !validOwnedBackupFile(info, true, 1) ||
 		info.Size() != filesystem.expectedInfo.Size() ||
-		linkCount(info) != 1 || !os.SameFile(filesystem.expectedInfo, info) {
+		!os.SameFile(filesystem.expectedInfo, info) {
 		_ = file.Close()
 		return nil, fs.ErrInvalid
 	}
@@ -1183,65 +1184,147 @@ func ensurePrivateDirectory(path, databasePath string) (os.FileInfo, error) {
 }
 
 func (s *Service) reserveTemp(name string) error {
+	if err := s.validateDirectory(); err != nil {
+		return err
+	}
 	file, err := s.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
+	openedInfo, statErr := file.Stat()
+	if statErr != nil || !validOwnedBackupFile(openedInfo, false, 1) {
+		_ = file.Close()
+		_ = s.removeOwnedBackupFile(name, 1)
+		return ErrUnavailable
+	}
 	if err := file.Close(); err != nil {
-		_ = s.root.Remove(name)
+		_ = s.removeOwnedBackupFile(name, 1)
 		return err
 	}
 	info, err := s.root.Lstat(name)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 ||
-		linkCount(info) != 1 {
-		_ = s.root.Remove(name)
+	if err != nil || !validOwnedBackupFile(info, false, 1) ||
+		!os.SameFile(openedInfo, info) {
+		_ = s.removeOwnedBackupFile(name, 1)
 		return ErrUnavailable
 	}
 	return nil
 }
 
 func (s *Service) syncFile(name string) error {
+	if err := s.validateDirectory(); err != nil {
+		return err
+	}
 	file, err := s.root.Open(name)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !validOwnedBackupFile(info, true, 1) {
+		return ErrUnavailable
+	}
 	return file.Sync()
 }
 
 func (s *Service) chmodFile(name string, mode os.FileMode) error {
+	if err := s.validateDirectory(); err != nil {
+		return err
+	}
 	file, err := s.root.OpenFile(name, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !validOwnedBackupFile(info, false, 1) {
+		return ErrUnavailable
+	}
 	return file.Chmod(mode)
 }
 
 func (s *Service) publishLink(oldName, newName string) error {
+	if err := s.validateDirectory(); err != nil {
+		return err
+	}
+	oldFile, err := s.root.Open(oldName)
+	if err != nil {
+		return err
+	}
+	defer oldFile.Close()
+	oldInfo, err := oldFile.Stat()
+	if err != nil || !validOwnedBackupFile(oldInfo, true, 1) {
+		return ErrUnavailable
+	}
 	dir, err := s.root.Open(".")
 	if err != nil {
 		return err
 	}
 	defer dir.Close()
-	return unix.Linkat(
+	if err := unix.Linkat(
 		int(dir.Fd()), oldName, int(dir.Fd()), newName, 0,
-	)
-}
-
-func (s *Service) validateDirectory() error {
-	info, err := os.Lstat(s.dir)
-	if err != nil || !os.SameFile(info, s.dirInfo) ||
-		!info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
-		info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+	); err != nil {
+		return err
+	}
+	oldLinkedInfo, oldErr := s.root.Lstat(oldName)
+	newInfo, newErr := s.root.Lstat(newName)
+	if oldErr != nil || newErr != nil ||
+		!validOwnedBackupFile(oldLinkedInfo, true, 2) ||
+		!validOwnedBackupFile(newInfo, true, 2) ||
+		!os.SameFile(oldInfo, oldLinkedInfo) ||
+		!os.SameFile(oldInfo, newInfo) {
+		_ = s.removeOwnedBackupFile(newName, 1, 2)
 		return ErrUnavailable
 	}
 	return nil
 }
 
+func (s *Service) validateDirectory() error {
+	info, err := os.Lstat(s.dir)
+	if err != nil || !validPrivateDirectory(info, s.dirInfo) {
+		return ErrUnavailable
+	}
+	dir, err := s.root.Open(".")
+	if err != nil {
+		return ErrUnavailable
+	}
+	rootInfo, statErr := dir.Stat()
+	closeErr := dir.Close()
+	if statErr != nil || closeErr != nil ||
+		!validPrivateDirectory(rootInfo, s.dirInfo) {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func validPrivateDirectory(info, expected os.FileInfo) bool {
+	return info != nil && expected != nil && os.SameFile(info, expected) &&
+		info.IsDir() && info.Mode()&os.ModeSymlink == 0 &&
+		info.Mode().Perm() == 0o700 && ownedByCurrentUser(info)
+}
+
 func ownedByCurrentUser(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && int(stat.Uid) == os.Geteuid()
+}
+
+func validOwnedBackupFile(
+	info os.FileInfo,
+	requireNonEmpty bool,
+	allowedLinkCounts ...uint64,
+) bool {
+	if info == nil || !info.Mode().IsRegular() ||
+		info.Mode().Perm() != 0o600 ||
+		!backupFileOwnedByCurrentUser(info) ||
+		(requireNonEmpty && info.Size() <= 0) {
+		return false
+	}
+	links := linkCount(info)
+	for _, allowed := range allowedLinkCounts {
+		if links == allowed {
+			return true
+		}
+	}
+	return false
 }
 
 func linkCount(info os.FileInfo) uint64 {
@@ -1252,7 +1335,27 @@ func linkCount(info os.FileInfo) uint64 {
 	return uint64(stat.Nlink)
 }
 
+func (s *Service) removeOwnedBackupFile(
+	name string,
+	allowedLinkCounts ...uint64,
+) error {
+	if err := s.validateDirectory(); err != nil {
+		return err
+	}
+	info, err := s.root.Lstat(name)
+	if err != nil {
+		return err
+	}
+	if !validOwnedBackupFile(info, false, allowedLinkCounts...) {
+		return ErrUnavailable
+	}
+	return s.root.Remove(name)
+}
+
 func (s *Service) syncDirectory() error {
+	if err := s.validateDirectory(); err != nil {
+		return err
+	}
 	dir, err := s.root.Open(".")
 	if err != nil {
 		return err

@@ -855,6 +855,46 @@ func TestMaintenancePurgeAuditFailureRollsBackBatch(t *testing.T) {
 	}
 }
 
+func TestMaintenancePurgeIterationFailureRollsBackBeforeAuditOrDelete(t *testing.T) {
+	h := newCredentialHarness(t)
+	for index := 0; index < 2; index++ {
+		created := h.create(h.editor)
+		if err := h.service.Delete(
+			h.ctx, h.editor, created.ID, created.Version,
+			h.writeContext(
+				fmt.Sprintf("maintenance-iteration-delete-%d", index),
+				h.editor.Actor,
+			),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.clock.Advance(30 * 24 * time.Hour)
+	h.service.maintenancePurgeRowScannedHook = func() error {
+		return context.Canceled
+	}
+	if _, err := h.service.PurgeExpiredMaintenance(
+		h.ctx, h.clock.Now().UTC(), "mnt_iteration_failure",
+	); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	if h.countCredentials() != 2 {
+		t.Fatal("iteration failure did not roll back maintenance purge")
+	}
+	var events int
+	if err := h.db.Reader.QueryRow(`
+		SELECT count(*) FROM audit_events
+		WHERE action = 'credential.purge'
+		  AND json_extract(metadata_json, '$.request_id') =
+		      'mnt_iteration_failure'
+	`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Fatalf("purge audit events=%d", events)
+	}
+}
+
 func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T) {
 	t.Run("success is audited and a second call is concealed", func(t *testing.T) {
 		h := newCredentialHarness(t)

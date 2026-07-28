@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -168,6 +169,100 @@ func TestDetailedClassifiesBusyAndUnavailableWriters(t *testing.T) {
 	})
 }
 
+func TestDetailedBoundsSingleConnectionWriterProbeAndRecovers(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "opswarden.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	lock, err := db.Writer.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(
+		db, t.TempDir(), "test", fixedClock{now: time.Now().UTC()}, nil,
+	)
+	if err != nil {
+		_ = lock.Rollback()
+		t.Fatal(err)
+	}
+	type result struct {
+		detail Detail
+		err    error
+	}
+	results := make(chan result, 1)
+	started := time.Now()
+	go func() {
+		detail, err := service.Detailed(context.Background())
+		results <- result{detail: detail, err: err}
+	}()
+	select {
+	case got := <-results:
+		if got.err != nil {
+			_ = lock.Rollback()
+			t.Fatal(got.err)
+		}
+		if got.detail.Status != "degraded" || got.detail.Database != "busy" {
+			_ = lock.Rollback()
+			t.Fatalf("detail=%+v", got.detail)
+		}
+		if elapsed := time.Since(started); elapsed > 2*time.Second {
+			_ = lock.Rollback()
+			t.Fatalf("writer probe elapsed=%v", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		_ = lock.Rollback()
+		<-results
+		t.Fatal("writer probe blocked on the single-connection pool")
+	}
+	if err := lock.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := service.Detailed(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Status != "ok" || recovered.Database != "ok" {
+		t.Fatalf("recovered detail=%+v", recovered)
+	}
+}
+
+func TestDetailedPreservesParentDeadlineBeforeBackupVerification(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "opswarden.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	lock, err := db.Writer.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lock.Rollback() })
+	backups := &countingBackups{}
+	service, err := NewService(
+		db, t.TempDir(), "test", fixedClock{now: time.Now().UTC()}, backups,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(
+		context.Background(), writerProbeTimeout/4,
+	)
+	defer cancel()
+	started := time.Now()
+	if _, err := service.Detailed(ctx); !errors.Is(
+		err, context.DeadlineExceeded,
+	) {
+		t.Fatalf("detail err=%v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("parent deadline elapsed=%v", elapsed)
+	}
+	if backups.calls != 0 {
+		t.Fatalf("backup verification calls=%d", backups.calls)
+	}
+}
+
 func TestDetailedWriterProbeRollsBackWithoutPersistentChurn(t *testing.T) {
 	db, err := storage.Open(filepath.Join(t.TempDir(), "opswarden.db"))
 	if err != nil {
@@ -269,6 +364,15 @@ type fakeBackups struct {
 
 func (provider fakeBackups) LatestSuccessful(context.Context) (*backup.RunRecord, error) {
 	return provider.record, provider.err
+}
+
+type countingBackups struct{ calls int }
+
+func (provider *countingBackups) LatestSuccessful(
+	context.Context,
+) (*backup.RunRecord, error) {
+	provider.calls++
+	return nil, nil
 }
 
 type fakeMaintenance struct{ status MaintenanceStatus }
