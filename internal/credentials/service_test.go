@@ -786,6 +786,191 @@ func TestRestoreAndPurgeExpiredRecycleBin(t *testing.T) {
 	}
 }
 
+func TestPurgeOneCredentialRequiresDeletedSystemOwnerWithRecentTOTP(t *testing.T) {
+	t.Run("success is audited and a second call is concealed", func(t *testing.T) {
+		h := newCredentialHarness(t)
+		created := h.create(h.editor)
+		if err := h.service.Delete(
+			h.ctx, h.editor, created.ID, created.Version,
+			h.writeContext("purge-delete", h.editor.Actor),
+		); err != nil {
+			t.Fatal(err)
+		}
+		owner := humanCredentialPrincipal(
+			"usr_editor", h.spaceID, authorization.RoleOwner,
+		)
+		owner.Human.SystemRole = identity.SystemRoleOwner
+		owner.Human.Session.RecentTOTPAt = h.clock.now
+		if err := h.service.Purge(
+			h.ctx, owner, h.spaceID, created.ID, created.Version,
+			h.writeContext("purge-one", owner.Actor),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if h.countCredentials() != 0 {
+			t.Fatal("purged credential remains")
+		}
+		var events int
+		if err := h.db.Reader.QueryRowContext(
+			h.ctx,
+			`SELECT count(*) FROM audit_events
+			 WHERE action = 'credential.purge' AND entity_id = ?`,
+			created.ID,
+		).Scan(&events); err != nil {
+			t.Fatal(err)
+		}
+		if events != 1 {
+			t.Fatalf("purge audit events=%d", events)
+		}
+		if err := h.service.Purge(
+			h.ctx, owner, h.spaceID, created.ID, created.Version,
+			h.writeContext("purge-one-again", owner.Actor),
+		); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("second purge err=%v", err)
+		}
+	})
+
+	tests := []struct {
+		name      string
+		mutate    func(*credentialHarness, *Principal, MutationResult)
+		principal func(*credentialHarness) Principal
+		delete    bool
+		version   func(MutationResult) uint64
+		want      error
+	}{
+		{
+			name:      "active credential",
+			principal: recentSystemOwner,
+			want:      ErrNotFound,
+		},
+		{
+			name:      "wrong space is concealed",
+			principal: recentSystemOwner,
+			delete:    true,
+			mutate: func(h *credentialHarness, principal *Principal, _ MutationResult) {
+				principal.BoundSpaceID = h.otherSpace
+			},
+			want: ErrNotFound,
+		},
+		{
+			name:      "stale version",
+			principal: recentSystemOwner,
+			delete:    true,
+			version:   func(result MutationResult) uint64 { return result.Version + 1 },
+			want:      ErrVersionConflict,
+		},
+		{
+			name: "missing recent TOTP",
+			principal: func(h *credentialHarness) Principal {
+				principal := recentSystemOwner(h)
+				principal.Human.Session.RecentTOTPAt = time.Time{}
+				return principal
+			},
+			delete: true,
+			want:   identity.ErrRecentTOTPRequired,
+		},
+		{
+			name: "stale recent TOTP",
+			principal: func(h *credentialHarness) Principal {
+				principal := recentSystemOwner(h)
+				principal.Human.Session.RecentTOTPAt =
+					h.clock.now.Add(-identity.RecentTOTPLifetime)
+				return principal
+			},
+			delete: true,
+			want:   identity.ErrRecentTOTPRequired,
+		},
+		{
+			name: "non-system-owner",
+			principal: func(h *credentialHarness) Principal {
+				principal := humanCredentialPrincipal(
+					"usr_editor", h.spaceID, authorization.RoleOwner,
+				)
+				principal.Human.Session.RecentTOTPAt = h.clock.now
+				return principal
+			},
+			delete: true,
+			want:   authorization.ErrDenied,
+		},
+		{
+			name:      "agent is concealed",
+			principal: func(h *credentialHarness) Principal { return h.agent },
+			delete:    true,
+			want:      ErrNotFound,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newCredentialHarness(t)
+			created := h.create(h.editor)
+			if test.delete {
+				if err := h.service.Delete(
+					h.ctx, h.editor, created.ID, created.Version,
+					h.writeContext("purge-case-delete", h.editor.Actor),
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			principal := test.principal(h)
+			if test.mutate != nil {
+				test.mutate(h, &principal, created)
+			}
+			version := created.Version
+			if test.version != nil {
+				version = test.version(created)
+			}
+			callSpace := h.spaceID
+			if principal.BoundSpaceID != "" {
+				callSpace = principal.BoundSpaceID
+			}
+			err := h.service.Purge(
+				h.ctx, principal, callSpace,
+				created.ID, version,
+				h.writeContext("purge-case", principal.Actor),
+			)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("err=%v want=%v", err, test.want)
+			}
+			if h.countCredentials() != 1 {
+				t.Fatal("failed purge changed credential")
+			}
+		})
+	}
+}
+
+func TestPurgeOneCredentialRollsBackWhenAuditFails(t *testing.T) {
+	h := newCredentialHarness(t)
+	created := h.create(h.editor)
+	if err := h.service.Delete(
+		h.ctx, h.editor, created.ID, created.Version,
+		h.writeContext("purge-audit-delete", h.editor.Actor),
+	); err != nil {
+		t.Fatal(err)
+	}
+	owner := recentSystemOwner(h)
+	h.audit.FailNextInsert(audit.ErrAuditUnavailable)
+	err := h.service.Purge(
+		h.ctx, owner, h.spaceID, created.ID, created.Version,
+		h.writeContext("purge-audit", owner.Actor),
+	)
+	if !errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("err=%v", err)
+	}
+	if h.countCredentials() != 1 {
+		t.Fatal("audit failure did not roll back purge")
+	}
+}
+
+func recentSystemOwner(h *credentialHarness) Principal {
+	principal := humanCredentialPrincipal(
+		"usr_editor", h.spaceID, authorization.RoleOwner,
+	)
+	principal.Human.SystemRole = identity.SystemRoleOwner
+	principal.Human.Session.RecentTOTPAt = h.clock.now
+	principal.BoundSpaceID = h.spaceID
+	return principal
+}
+
 func TestBoundSpaceConcealsCrossSpaceMutationFromSystemOwner(t *testing.T) {
 	h := newCredentialHarness(t)
 	created := h.create(h.editor)

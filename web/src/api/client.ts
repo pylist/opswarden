@@ -264,6 +264,53 @@ export class ApiClient {
     }
   }
 
+  async reverifyTOTP(code: string): Promise<void> {
+    if (!/^\d{6,8}$/.test(code)) {
+      throw new ApiError("INVALID_REQUEST", "", 400);
+    }
+    let snapshot = this.session?.readSession();
+    if (!snapshot) {
+      throw new ApiError("UNAUTHENTICATED", "", 401);
+    }
+    if (snapshot.expiresAt - Date.now() <= refreshWindowMs) {
+      snapshot = await this.refresh(snapshot);
+    }
+    try {
+      const response = await this.send<{
+        token: string;
+        expiresAt: string;
+      }>(
+        "/api/v1/auth/reverify",
+        { method: "POST", body: { code }, signal: snapshot.signal },
+        snapshot.token,
+      );
+      if (
+        typeof response.token !== "string" ||
+        response.token.length === 0 ||
+        typeof response.expiresAt !== "string" ||
+        !this.session?.isCurrent(snapshot)
+      ) {
+        throw new SessionSupersededError();
+      }
+      const replacement = this.session.replaceIfCurrent(
+        snapshot,
+        response.token,
+        parseTokenExpiry(response.expiresAt),
+      );
+      if (!replacement) {
+        throw new SessionSupersededError();
+      }
+    } catch (error) {
+      if (!this.session?.isCurrent(snapshot)) {
+        throw new SessionSupersededError();
+      }
+      if (error instanceof ApiError && error.status === 401) {
+        this.session.clearIfCurrent(snapshot);
+      }
+      throw error;
+    }
+  }
+
   private refresh(snapshot: SessionSnapshot): Promise<SessionSnapshot> {
     if (
       this.refreshFlight &&

@@ -1195,6 +1195,11 @@ type fakeCredentialService struct {
 	fixture       string
 	actualSpaceID string
 	createCalls   int
+	purgeCalls    int
+	purgeSpaceID  string
+	purgeID       string
+	purgeVersion  uint64
+	purgeError    error
 }
 
 func (service *fakeCredentialService) List(
@@ -1259,6 +1264,36 @@ func (*fakeCredentialService) Restore(
 	credentials.WriteContext,
 ) (credentials.Metadata, error) {
 	return credentials.Metadata{}, nil
+}
+
+func (service *fakeCredentialService) Purge(
+	_ context.Context,
+	_ credentials.Principal,
+	spaceID string,
+	credentialID string,
+	expectedVersion uint64,
+	_ credentials.WriteContext,
+) error {
+	service.purgeCalls++
+	service.purgeSpaceID = spaceID
+	service.purgeID = credentialID
+	service.purgeVersion = expectedVersion
+	return service.purgeError
+}
+
+type systemOwnerSpaceService struct{ fakeSpaceService }
+
+func (systemOwnerSpaceService) ResolveAuthorizationPrincipal(
+	_ context.Context,
+	session identity.SessionPrincipal,
+	spaceID string,
+) (authorization.HumanPrincipal, error) {
+	return authorization.HumanPrincipal{
+		Session: session, SystemRole: identity.SystemRoleOwner,
+		SpaceRoles: map[string]authorization.Role{
+			spaceID: authorization.RoleOwner,
+		},
+	}, nil
 }
 
 type fakeAgentService struct{}
@@ -1456,6 +1491,127 @@ func TestCredentialPathSpaceMismatchIsConcealed(t *testing.T) {
 	if strings.Contains(response.Body.String(), fixture) {
 		t.Fatalf("credential leaked: %s", response.Body.String())
 	}
+}
+
+func TestCredentialPurgeRESTUsesExactBoundTargetAndVersion(t *testing.T) {
+	service := &fakeCredentialService{}
+	handler, token, _ := authenticatedTestHandler(t, service, nil)
+	handler.(*Router).deps.Spaces = systemOwnerSpaceService{}
+	response := serveAuthorized(
+		handler, token, http.MethodPost,
+		"/api/v1/spaces/spc_test/credentials/cred_test/purge",
+		strings.NewReader(`{"expectedVersion":7}`),
+	)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if service.purgeCalls != 1 ||
+		service.purgeSpaceID != "spc_test" ||
+		service.purgeID != "cred_test" ||
+		service.purgeVersion != 7 {
+		t.Fatalf(
+			"calls=%d space=%q credential=%q version=%d",
+			service.purgeCalls, service.purgeSpaceID,
+			service.purgeID, service.purgeVersion,
+		)
+	}
+}
+
+func TestCredentialPurgeRESTIsStrictAndFailClosed(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		target string
+		body   string
+		status int
+	}{
+		{
+			name: "wrong method", method: http.MethodDelete,
+			target: "/api/v1/spaces/spc_test/credentials/cred_test/purge",
+			body:   `{"expectedVersion":7}`, status: http.StatusNotFound,
+		},
+		{
+			name: "query rejected", method: http.MethodPost,
+			target: "/api/v1/spaces/spc_test/credentials/cred_test/purge?force=1",
+			body:   `{"expectedVersion":7}`, status: http.StatusBadRequest,
+		},
+		{
+			name: "zero version", method: http.MethodPost,
+			target: "/api/v1/spaces/spc_test/credentials/cred_test/purge",
+			body:   `{"expectedVersion":0}`, status: http.StatusBadRequest,
+		},
+		{
+			name: "unknown field", method: http.MethodPost,
+			target: "/api/v1/spaces/spc_test/credentials/cred_test/purge",
+			body:   `{"expectedVersion":7,"credentialId":"other"}`,
+			status: http.StatusBadRequest,
+		},
+		{
+			name: "duplicate version", method: http.MethodPost,
+			target: "/api/v1/spaces/spc_test/credentials/cred_test/purge",
+			body:   `{"expectedVersion":7,"expectedVersion":8}`,
+			status: http.StatusBadRequest,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeCredentialService{}
+			handler, token, _ := authenticatedTestHandler(t, service, nil)
+			handler.(*Router).deps.Spaces = systemOwnerSpaceService{}
+			response := serveAuthorized(
+				handler, token, test.method, test.target,
+				strings.NewReader(test.body),
+			)
+			if response.Code != test.status || service.purgeCalls != 0 {
+				t.Fatalf(
+					"status=%d body=%s calls=%d",
+					response.Code, response.Body.String(), service.purgeCalls,
+				)
+			}
+		})
+	}
+}
+
+func TestCredentialPurgeRESTConcealsAgentAndMapsRecentTOTPFailure(t *testing.T) {
+	t.Run("agent", func(t *testing.T) {
+		service := &fakeCredentialService{}
+		handler := newTestHandler(Dependencies{
+			Identity: &fakeIdentityService{}, Spaces: systemOwnerSpaceService{},
+			Credentials: service, Agents: fakeAgentService{},
+			Clock: &fixedClock{now: time.Date(
+				2026, 7, 28, 12, 0, 0, 0, time.UTC,
+			)},
+			MasterKey: [32]byte{1},
+		})
+		response := serveAuthorized(
+			handler, "owat_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", http.MethodPost,
+			"/api/v1/spaces/spc_test/credentials/cred_test/purge",
+			strings.NewReader(`{"expectedVersion":7}`),
+		)
+		if response.Code != http.StatusNotFound || service.purgeCalls != 0 {
+			t.Fatalf(
+				"status=%d body=%s calls=%d",
+				response.Code, response.Body.String(), service.purgeCalls,
+			)
+		}
+	})
+
+	t.Run("recent TOTP required", func(t *testing.T) {
+		service := &fakeCredentialService{
+			purgeError: identity.ErrRecentTOTPRequired,
+		}
+		handler, token, _ := authenticatedTestHandler(t, service, nil)
+		handler.(*Router).deps.Spaces = systemOwnerSpaceService{}
+		response := serveAuthorized(
+			handler, token, http.MethodPost,
+			"/api/v1/spaces/spc_test/credentials/cred_test/purge",
+			strings.NewReader(`{"expectedVersion":7}`),
+		)
+		if response.Code != http.StatusForbidden ||
+			!strings.Contains(response.Body.String(), `"code":"PERMISSION_DENIED"`) {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
 }
 
 func TestAgentCredentialWriteRequiresIdempotencyHeader(t *testing.T) {

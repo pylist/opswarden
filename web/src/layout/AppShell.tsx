@@ -4,6 +4,8 @@ import { apiPath } from "../api/client";
 import type { ListResponse, Space } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
 import { SpaceSwitcher } from "../spaces/SpaceSwitcher";
+import { CredentialListPage } from "../credentials/CredentialListPage";
+import { AssetListPage } from "../assets/AssetListPage";
 import { Sidebar, type View } from "./Sidebar";
 
 const viewTitles: Record<View, string> = {
@@ -27,9 +29,16 @@ export function AppShell() {
   const [view, setView] = useState<View>(initialView);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [currentSpace, setCurrentSpace] = useState<Space | null>(null);
+  const [selectedAssetID, setSelectedAssetID] = useState("");
+  const [selectedCredentialID, setSelectedCredentialID] = useState("");
   const menuButton = useRef<HTMLButtonElement>(null);
   const restoreMenuFocus = useRef(false);
   const isMobile = useMobileLayout();
+  const consumeAssetSelection = useCallback(() => setSelectedAssetID(""), []);
+  const consumeCredentialSelection = useCallback(
+    () => setSelectedCredentialID(""),
+    [],
+  );
 
   const closeDrawer = useCallback(() => {
     restoreMenuFocus.current = isMobile;
@@ -57,6 +66,8 @@ export function AppShell() {
     const sync = () => {
       const next = initialView();
       setView(next);
+      setSelectedAssetID("");
+      setSelectedCredentialID("");
       const url = new URL(window.location.href);
       const raw = url.searchParams.get("view");
       if (raw && !views.has(raw as View)) {
@@ -75,10 +86,36 @@ export function AppShell() {
 
   function navigate(next: View) {
     setView(next);
+    setSelectedAssetID("");
+    setSelectedCredentialID("");
     const url = new URL(window.location.href);
     url.searchParams.set("view", next);
     window.history.pushState({}, "", `${url.pathname}${url.search}`);
   }
+
+  function openAsset(assetID: string) {
+    setSelectedCredentialID("");
+    setSelectedAssetID(assetID);
+    navigateWithoutClearing("assets");
+  }
+
+  function openCredential(credentialID: string) {
+    setSelectedAssetID("");
+    setSelectedCredentialID(credentialID);
+    navigateWithoutClearing("credentials");
+  }
+
+  function navigateWithoutClearing(next: View) {
+    setView(next);
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", next);
+    window.history.pushState({}, "", `${url.pathname}${url.search}`);
+  }
+
+  useEffect(() => {
+    setSelectedAssetID("");
+    setSelectedCredentialID("");
+  }, [currentSpace?.id]);
 
   return (
     <div className="app-frame">
@@ -123,6 +160,26 @@ export function AppShell() {
           </div>
           {view === "overview" ? (
             <Overview api={api} space={currentSpace} />
+          ) : view === "credentials" && currentSpace ? (
+            <CredentialListPage
+              key={currentSpace.id}
+              api={api}
+              space={currentSpace}
+              systemRole={principal?.systemRole ?? ""}
+              sessionActive={Boolean(principal)}
+              initialCredentialId={selectedCredentialID || undefined}
+              onSelectionConsumed={consumeCredentialSelection}
+              onOpenAsset={openAsset}
+            />
+          ) : view === "assets" && currentSpace ? (
+            <AssetListPage
+              key={currentSpace.id}
+              api={api}
+              space={currentSpace}
+              initialAssetId={selectedAssetID || undefined}
+              onSelectionConsumed={consumeAssetSelection}
+              onOpenCredential={openCredential}
+            />
           ) : (
             <EmptyView view={view} />
           )}

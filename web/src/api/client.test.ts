@@ -81,6 +81,31 @@ describe("canonical API paths", () => {
 });
 
 describe("session generations", () => {
+  it("adopts the renewed JWT after a recent-TOTP verification", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      json({
+        token: "recent-totp-token",
+        expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      }),
+    );
+    const sessions = new MemorySessionController();
+    sessions.allocate("old-token", Date.now() + 5 * 60_000);
+    const client = new ApiClient(sessions);
+
+    await client.reverifyTOTP("123456");
+
+    expect(sessions.readSession()?.token).toBe("recent-totp-token");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/auth/reverify",
+      expect.objectContaining({
+        body: JSON.stringify({ code: "123456" }),
+      }),
+    );
+    expect(
+      new Headers(fetchMock.mock.calls[0][1]?.headers).get("Authorization"),
+    ).toBe("Bearer old-token");
+  });
+
   it("does not let an old delayed 401 clear a newer login", async () => {
     const oldResponse = deferred<Response>();
     vi.spyOn(globalThis, "fetch").mockImplementation(async () => oldResponse.promise);

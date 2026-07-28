@@ -55,6 +55,7 @@ type CredentialService interface {
 	Update(context.Context, credentials.Principal, credentials.UpdateInput, credentials.WriteContext) (credentials.MutationResult, error)
 	Delete(context.Context, credentials.Principal, string, uint64, credentials.WriteContext) error
 	Restore(context.Context, credentials.Principal, string, uint64, credentials.WriteContext) (credentials.Metadata, error)
+	Purge(context.Context, credentials.Principal, string, string, uint64, credentials.WriteContext) error
 }
 
 type AssetService interface {

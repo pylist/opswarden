@@ -20,6 +20,7 @@ import (
 	"opswarden/internal/audit"
 	"opswarden/internal/authorization"
 	"opswarden/internal/cryptobox"
+	"opswarden/internal/identity"
 	"opswarden/internal/platform"
 	"opswarden/internal/storage"
 )
@@ -765,6 +766,79 @@ func (s *Service) Restore(
 		return Metadata{}, err
 	}
 	return cloneMetadata(restored), nil
+}
+
+// Purge permanently deletes one soft-deleted credential. Authorization,
+// recent-TOTP verification, audit, and deletion are evaluated in one
+// transaction so a failed audit can never leave an unaudited deletion.
+func (s *Service) Purge(
+	ctx context.Context,
+	principal Principal,
+	spaceID string,
+	credentialID string,
+	expectedVersion uint64,
+	writeContext WriteContext,
+) error {
+	if spaceID == "" || credentialID == "" {
+		return ErrNotFound
+	}
+	if expectedVersion == 0 {
+		return ErrVersionConflict
+	}
+	if err := validateMutationContext(principal, writeContext); err != nil {
+		return err
+	}
+	now := s.clock.Now().UTC()
+	return s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		metadata, err := s.repository.metadataByID(ctx, tx, credentialID, true)
+		if err != nil {
+			return err
+		}
+		if metadata.SpaceID != spaceID {
+			return ErrNotFound
+		}
+		if err := authorize(
+			principal, resourceForMetadata(metadata), authorization.PurgeCredential,
+		); err != nil {
+			return err
+		}
+		if principal.Human == nil ||
+			!principal.Human.Session.HasRecentTOTP(now) {
+			return identity.ErrRecentTOTPRequired
+		}
+		if metadata.DeletedAt == nil {
+			return ErrNotFound
+		}
+		if metadata.Version != expectedVersion {
+			return ErrVersionConflict
+		}
+		event, err := s.auditEventAt(
+			principal, writeContext.Actor, "credential.purge", metadata,
+			audit.ChangeFields{audit.FieldDeletedAt}, writeContext.Reason, now,
+		)
+		if err != nil {
+			return ErrAuditUnavailable
+		}
+		if err := s.audit.AppendTx(ctx, tx, event); err != nil {
+			return ErrAuditUnavailable
+		}
+		result, err := tx.ExecContext(ctx, `
+			DELETE FROM credentials
+			WHERE id = ? AND space_id = ? AND current_version = ?
+			  AND deleted_at IS NOT NULL
+		`, credentialID, spaceID, expectedVersion)
+		if err != nil {
+			return fmt.Errorf("purge credential: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count purged credential: %w", err)
+		}
+		if affected != 1 {
+			return ErrVersionConflict
+		}
+		return nil
+	})
 }
 
 func (s *Service) PurgeExpired(

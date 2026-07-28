@@ -454,6 +454,28 @@ func (router *Router) handleCredentials(
 			return
 		}
 		writeJSON(writer, http.StatusOK, credentialMetadataDTO(metadata))
+	case len(rest) == 2 && rest[0] != "" && rest[1] == "purge" &&
+		request.Method == http.MethodPost:
+		if principal.Agent != nil {
+			writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
+			return
+		}
+		var input credentialRestoreRequest
+		if err := decodeJSONBody(
+			writer, request, defaultBodyLimit, &input,
+		); err != nil || input.ExpectedVersion == 0 {
+			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			return
+		}
+		writeContext, _ := credentialWriteContext(request, principal)
+		if err := router.deps.Credentials.Purge(
+			request.Context(), principal, spaceID, rest[0],
+			input.ExpectedVersion, writeContext,
+		); err != nil {
+			writeDomainError(writer, request, err)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
 	default:
 		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
 	}
