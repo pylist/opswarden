@@ -115,6 +115,7 @@ CREATE TABLE credentials (
     space_id TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     type TEXT NOT NULL,
+    current_version INTEGER NOT NULL DEFAULT 0 CHECK (current_version >= 0),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TEXT,
@@ -128,7 +129,10 @@ CREATE TABLE credential_versions (
     id TEXT PRIMARY KEY,
     credential_id TEXT NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
     version INTEGER NOT NULL CHECK (version > 0),
-    encrypted_payload BLOB NOT NULL,
+    payload_ciphertext BLOB NOT NULL CHECK (length(payload_ciphertext) >= 16),
+    payload_nonce BLOB NOT NULL CHECK (length(payload_nonce) = 24),
+    wrapped_data_key BLOB NOT NULL CHECK (length(wrapped_data_key) = 48),
+    wrap_nonce BLOB NOT NULL CHECK (length(wrap_nonce) = 24),
     created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (credential_id, version)
@@ -137,9 +141,9 @@ CREATE TABLE credential_versions (
 CREATE INDEX idx_credential_versions_credential ON credential_versions(credential_id, version DESC);
 
 CREATE TRIGGER credential_versions_identity_immutable
-BEFORE UPDATE OF credential_id, version ON credential_versions
+BEFORE UPDATE ON credential_versions
 BEGIN
-    SELECT RAISE(ABORT, 'credential version identity is immutable');
+    SELECT RAISE(ABORT, 'credential versions are immutable');
 END;
 
 CREATE TABLE credential_tags (

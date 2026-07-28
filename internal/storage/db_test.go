@@ -13,8 +13,8 @@ import (
 func TestOpenEnablesRequiredPragmasOnEveryConnection(t *testing.T) {
 	db := openTempDB(t)
 
-	assertPragmasOnConnections(t, db.Writer, 1)
-	assertPragmasOnConnections(t, db.Reader, 4)
+	assertPragmasOnConnections(t, db.Writer, 1, "0")
+	assertPragmasOnConnections(t, db.Reader, 4, "1")
 }
 
 func TestOpenConfiguresWriterAndReaderPools(t *testing.T) {
@@ -36,6 +36,28 @@ func TestOpenConfiguresWriterAndReaderPools(t *testing.T) {
 	}
 	if name != "Operations" {
 		t.Fatalf("space name = %q, want Operations", name)
+	}
+}
+
+func TestReaderRejectsWritesWhileWriterAcceptsThem(t *testing.T) {
+	db := openTempDB(t)
+
+	if _, err := db.Writer.Exec(`INSERT INTO spaces (id, name) VALUES ('writer-space', 'Writer')`); err != nil {
+		t.Fatalf("writer insert: %v", err)
+	}
+	if _, err := db.Reader.Exec(`INSERT INTO spaces (id, name) VALUES ('reader-space', 'Reader')`); err == nil {
+		t.Fatal("reader insert succeeded")
+	}
+	if _, err := db.Reader.Exec(`UPDATE spaces SET name = 'Changed' WHERE id = 'writer-space'`); err == nil {
+		t.Fatal("reader update succeeded")
+	}
+
+	var name string
+	if err := db.Reader.QueryRow(`SELECT name FROM spaces WHERE id = 'writer-space'`).Scan(&name); err != nil {
+		t.Fatalf("reader select: %v", err)
+	}
+	if name != "Writer" {
+		t.Fatalf("space name = %q, want Writer", name)
 	}
 }
 
@@ -73,6 +95,45 @@ func TestWithTxCommitsAndRollsBackUsingWriter(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("rolled-back row count = %d, want 0", count)
+	}
+}
+
+func TestWithTxRollsBackPanicAndReleasesWriter(t *testing.T) {
+	db := openTempDB(t)
+	ctx := context.Background()
+	sentinel := errors.New("panic sentinel")
+
+	var recovered any
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+		_ = WithTx(ctx, db, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO spaces (id, name) VALUES ('panic', 'Panic')`); err != nil {
+				t.Fatal(err)
+			}
+			panic(sentinel)
+		})
+	}()
+	if recovered != sentinel {
+		t.Fatalf("recovered panic = %v, want %v", recovered, sentinel)
+	}
+
+	txCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := WithTx(txCtx, db, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(txCtx, `INSERT INTO spaces (id, name) VALUES ('after-panic', 'After Panic')`)
+		return err
+	}); err != nil {
+		t.Fatalf("writer remained occupied after panic: %v", err)
+	}
+
+	var count int
+	if err := db.Writer.QueryRow(`SELECT count(*) FROM spaces WHERE id = 'panic'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("panicking transaction row count = %d, want 0", count)
 	}
 }
 
@@ -119,7 +180,7 @@ func openTempDB(t *testing.T) *DB {
 	return db
 }
 
-func assertPragmasOnConnections(t *testing.T, pool *sql.DB, count int) {
+func assertPragmasOnConnections(t *testing.T, pool *sql.DB, count int, wantQueryOnly string) {
 	t.Helper()
 	ctx := context.Background()
 	conns := make([]*sql.Conn, 0, count)
@@ -143,6 +204,7 @@ func assertPragmasOnConnections(t *testing.T, pool *sql.DB, count int) {
 			assertPragma(t, conn, "journal_mode", "wal")
 			assertPragma(t, conn, "foreign_keys", "1")
 			assertPragma(t, conn, "busy_timeout", "5000")
+			assertPragma(t, conn, "query_only", wantQueryOnly)
 		})
 	}
 }

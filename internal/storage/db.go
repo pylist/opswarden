@@ -32,8 +32,7 @@ func Open(path string) (_ *DB, err error) {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
 
-	dsn := sqliteDSN(absolutePath)
-	writer, err := sql.Open(driverName, dsn)
+	writer, err := sql.Open(driverName, sqliteDSN(absolutePath))
 	if err != nil {
 		return nil, fmt.Errorf("open writer: %w", err)
 	}
@@ -52,7 +51,7 @@ func Open(path string) (_ *DB, err error) {
 		return nil, fmt.Errorf("migrate database: %w", err)
 	}
 
-	reader, err := sql.Open(driverName, dsn)
+	reader, err := sql.Open(driverName, sqliteReaderDSN(absolutePath))
 	if err != nil {
 		return nil, fmt.Errorf("open reader: %w", err)
 	}
@@ -96,6 +95,7 @@ func WithTx(ctx context.Context, db *DB, fn func(*sql.Tx) error) error {
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
+	defer tx.Rollback()
 	if err := fn(tx); err != nil {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil {
 			return errors.Join(err, fmt.Errorf("rollback transaction: %w", rollbackErr))
@@ -109,11 +109,22 @@ func WithTx(ctx context.Context, db *DB, fn func(*sql.Tx) error) error {
 }
 
 func sqliteDSN(path string) string {
+	return sqliteDSNWithQueryOnly(path, false)
+}
+
+func sqliteReaderDSN(path string) string {
+	return sqliteDSNWithQueryOnly(path, true)
+}
+
+func sqliteDSNWithQueryOnly(path string, queryOnly bool) string {
 	location := url.URL{Scheme: "file", Path: path}
 	query := url.Values{}
 	query.Add("_pragma", "journal_mode(WAL)")
 	query.Add("_pragma", "foreign_keys(ON)")
 	query.Add("_pragma", "busy_timeout(5000)")
+	if queryOnly {
+		query.Add("_pragma", "query_only(1)")
+	}
 	location.RawQuery = query.Encode()
 	return location.String()
 }
