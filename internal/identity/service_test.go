@@ -1,0 +1,519 @@
+package identity
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/base32"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"opswarden/internal/cryptobox"
+	"opswarden/internal/storage"
+)
+
+const (
+	testEmail    = "Owner@Example.com"
+	testPassword = "correct horse battery staple fixture"
+	testTOTPSeed = "JBSWY3DPEHPK3PXP"
+)
+
+func TestCreateInitialOwnerRestrictsSourceAndPersistsApprovedArgonParameters(t *testing.T) {
+	h := newIdentityHarnessWithoutOwner(t)
+
+	_, err := h.service.CreateInitialOwner(h.ctx, CreateOwnerInput{
+		Email: testEmail, Password: testPassword, TOTPSeed: testTOTPSeed,
+		SourceIP: netip.MustParseAddr("203.0.113.8"),
+	})
+	if !errors.Is(err, ErrInitialOwnerSourceDenied) {
+		t.Fatalf("public source error = %v", err)
+	}
+
+	result, err := h.service.CreateInitialOwner(h.ctx, CreateOwnerInput{
+		Email: testEmail, Password: testPassword, TOTPSeed: testTOTPSeed,
+		SourceIP: netip.MustParseAddr("10.23.4.5"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.UserID == "" || len(result.RecoveryCodes) != RecoveryCodeCount {
+		t.Fatalf("owner result = %+v", result)
+	}
+
+	var hash []byte
+	var role string
+	if err := h.db.Reader.QueryRowContext(h.ctx,
+		`SELECT password_hash, system_role FROM users WHERE id = ?`, result.UserID,
+	).Scan(&hash, &role); err != nil {
+		t.Fatal(err)
+	}
+	if role != SystemRoleOwner {
+		t.Fatalf("system role = %q", role)
+	}
+	encoded := string(hash)
+	for _, fragment := range []string{
+		"$argon2id$v=19$", "m=65536", "t=3", "p=2",
+	} {
+		if !strings.Contains(encoded, fragment) {
+			t.Fatalf("password hash %q missing %q", encoded, fragment)
+		}
+	}
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 {
+		t.Fatalf("password hash parts = %d", len(parts))
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
+	if err != nil || len(salt) != 16 {
+		t.Fatalf("salt length = %d, err = %v", len(salt), err)
+	}
+	sum, err := base64.RawStdEncoding.DecodeString(parts[5])
+	if err != nil || len(sum) != 32 {
+		t.Fatalf("output length = %d, err = %v", len(sum), err)
+	}
+
+	_, err = h.service.CreateInitialOwner(h.ctx, CreateOwnerInput{
+		Email: "other@example.com", Password: "another sufficiently long password",
+		TOTPSeed: testTOTPSeed, SourceIP: netip.MustParseAddr("127.0.0.1"),
+	})
+	if !errors.Is(err, ErrInitialOwnerExists) {
+		t.Fatalf("second owner error = %v", err)
+	}
+}
+
+func TestBeginLoginUsesUnifiedCredentialError(t *testing.T) {
+	h := newIdentityHarness(t)
+
+	for name, credentials := range map[string][2]string{
+		"unknown account": {"missing@example.com", "wrong password"},
+		"wrong password":  {testEmail, "wrong password"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := h.service.BeginLogin(h.ctx, credentials[0], credentials[1])
+			if err != ErrInvalidCredentials {
+				t.Fatalf("error = %#v, want shared ErrInvalidCredentials", err)
+			}
+		})
+	}
+
+	challenge, err := h.service.BeginLogin(h.ctx, "  OWNER@example.COM ", testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if challenge.ID == "" || !challenge.ExpiresAt.Equal(h.clock.Now().Add(LoginChallengeLifetime)) {
+		t.Fatalf("challenge = %+v", challenge)
+	}
+}
+
+func TestLoginRequiresOneTimeChallengeAndTOTPWithinWindow(t *testing.T) {
+	h := newIdentityHarness(t)
+
+	challenge := h.beginLogin(t, testPassword)
+	if _, err := h.service.CompleteLogin(h.ctx, challenge.ID, "000000"); !errors.Is(err, ErrInvalidTOTP) {
+		t.Fatalf("wrong TOTP error = %v", err)
+	}
+	if _, err := h.service.CompleteLogin(h.ctx, challenge.ID, h.totpAt(h.clock.Now())); !errors.Is(err, ErrInvalidChallenge) {
+		t.Fatalf("reused failed challenge error = %v", err)
+	}
+
+	previousWindow := h.totpAt(h.clock.Now().Add(-TOTPPeriod))
+	session, err := h.service.CompleteLogin(h.ctx, h.beginLogin(t, testPassword).ID, previousWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.RawToken == "" || !session.ExpiresAt.Equal(h.clock.Now().Add(SessionAbsoluteLifetime)) ||
+		!session.IdleExpiresAt.Equal(h.clock.Now().Add(SessionIdleLifetime)) {
+		t.Fatalf("session = %+v", session)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(session.RawToken)
+	if err != nil || len(raw) != 32 {
+		t.Fatalf("session token bytes = %d, err = %v", len(raw), err)
+	}
+
+	if _, err := h.service.CompleteLogin(
+		h.ctx, h.beginLogin(t, testPassword).ID, previousWindow,
+	); !errors.Is(err, ErrTOTPReplay) {
+		t.Fatalf("replayed TOTP error = %v", err)
+	}
+
+	h.clock.Advance(2 * TOTPPeriod)
+	tooOld := h.totpAt(h.clock.Now().Add(-2 * TOTPPeriod))
+	if _, err := h.service.CompleteLogin(
+		h.ctx, h.beginLogin(t, testPassword).ID, tooOld,
+	); !errors.Is(err, ErrInvalidTOTP) {
+		t.Fatalf("out-of-window TOTP error = %v", err)
+	}
+}
+
+func TestConcurrentTOTPReplayAllowsOneSession(t *testing.T) {
+	h := newIdentityHarness(t)
+	code := h.totpAt(h.clock.Now())
+	challenges := []LoginChallenge{
+		h.beginLogin(t, testPassword),
+		h.beginLogin(t, testPassword),
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, len(challenges))
+	var ready sync.WaitGroup
+	ready.Add(len(challenges))
+	for _, challenge := range challenges {
+		go func() {
+			ready.Done()
+			<-start
+			_, err := h.service.CompleteLogin(h.ctx, challenge.ID, code)
+			errs <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+
+	var succeeded, replayed int
+	for range challenges {
+		switch err := <-errs; {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrTOTPReplay):
+			replayed++
+		default:
+			t.Fatalf("unexpected login error: %v", err)
+		}
+	}
+	if succeeded != 1 || replayed != 1 {
+		t.Fatalf("succeeded/replayed = %d/%d", succeeded, replayed)
+	}
+}
+
+func TestRecoveryCodeIsAtomicallySingleUse(t *testing.T) {
+	h := newIdentityHarness(t)
+	code := h.owner.RecoveryCodes[0]
+	challenges := []LoginChallenge{
+		h.beginLogin(t, testPassword),
+		h.beginLogin(t, testPassword),
+	}
+
+	start := make(chan struct{})
+	type result struct {
+		session Session
+		err     error
+	}
+	results := make(chan result, len(challenges))
+	var ready sync.WaitGroup
+	ready.Add(len(challenges))
+	for _, challenge := range challenges {
+		go func() {
+			ready.Done()
+			<-start
+			session, err := h.service.CompleteLogin(h.ctx, challenge.ID, code)
+			results <- result{session: session, err: err}
+		}()
+	}
+	ready.Wait()
+	close(start)
+
+	var succeeded, rejected int
+	var recoverySession Session
+	for range challenges {
+		result := <-results
+		switch {
+		case result.err == nil:
+			succeeded++
+			recoverySession = result.session
+		case errors.Is(result.err, ErrInvalidRecoveryCode):
+			rejected++
+		default:
+			t.Fatalf("unexpected recovery login error: %v", result.err)
+		}
+	}
+	if succeeded != 1 || rejected != 1 {
+		t.Fatalf("succeeded/rejected = %d/%d", succeeded, rejected)
+	}
+	principal, err := h.service.ResolveSession(h.ctx, recoverySession.RawToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if principal.HasRecentTOTP(h.clock.Now()) {
+		t.Fatal("recovery-code login incorrectly granted recent-TOTP status")
+	}
+}
+
+func TestChallengeExpiresAfterFiveMinutes(t *testing.T) {
+	h := newIdentityHarness(t)
+	challenge := h.beginLogin(t, testPassword)
+	h.clock.Advance(LoginChallengeLifetime)
+
+	if _, err := h.service.CompleteLogin(
+		h.ctx, challenge.ID, h.totpAt(h.clock.Now()),
+	); !errors.Is(err, ErrInvalidChallenge) {
+		t.Fatalf("expired challenge error = %v", err)
+	}
+}
+
+func TestSessionIdleAbsoluteRecentTOTPAndRevocation(t *testing.T) {
+	t.Run("idle", func(t *testing.T) {
+		h := newIdentityHarness(t)
+		session := h.login(t)
+		h.clock.Advance(SessionIdleLifetime + time.Nanosecond)
+		if _, err := h.service.ResolveSession(h.ctx, session.RawToken); !errors.Is(err, ErrSessionExpired) {
+			t.Fatalf("idle expiry error = %v", err)
+		}
+	})
+
+	t.Run("absolute despite activity", func(t *testing.T) {
+		h := newIdentityHarness(t)
+		session := h.login(t)
+		for range 3 {
+			h.clock.Advance(7 * time.Hour)
+			if _, err := h.service.ResolveSession(h.ctx, session.RawToken); err != nil {
+				t.Fatal(err)
+			}
+		}
+		h.clock.Advance(3*time.Hour + time.Nanosecond)
+		if _, err := h.service.ResolveSession(h.ctx, session.RawToken); !errors.Is(err, ErrSessionExpired) {
+			t.Fatalf("absolute expiry error = %v", err)
+		}
+	})
+
+	t.Run("recent TOTP and explicit revocation", func(t *testing.T) {
+		h := newIdentityHarness(t)
+		session := h.login(t)
+		h.clock.Advance(RecentTOTPLifetime + time.Nanosecond)
+		principal, err := h.service.ResolveSession(h.ctx, session.RawToken)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if principal.HasRecentTOTP(h.clock.Now()) {
+			t.Fatal("login TOTP remained recent beyond five minutes")
+		}
+		if _, err := h.service.VerifyRecentTOTP(
+			h.ctx, session.RawToken, h.totpAt(h.clock.Now()),
+		); err != nil {
+			t.Fatal(err)
+		}
+		principal, err = h.service.ResolveSession(h.ctx, session.RawToken)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !principal.HasRecentTOTP(h.clock.Now()) {
+			t.Fatal("recent TOTP timestamp was not persisted")
+		}
+		if err := h.service.RevokeUserSessions(h.ctx, h.owner.UserID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.service.ResolveSession(h.ctx, session.RawToken); !errors.Is(err, ErrSessionRevoked) {
+			t.Fatalf("revoked session error = %v", err)
+		}
+	})
+
+	t.Run("logout", func(t *testing.T) {
+		h := newIdentityHarness(t)
+		session := h.login(t)
+		if err := h.service.Logout(h.ctx, session.RawToken); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.service.ResolveSession(h.ctx, session.RawToken); !errors.Is(err, ErrSessionRevoked) {
+			t.Fatalf("logout error = %v", err)
+		}
+	})
+}
+
+func TestResetPasswordRevokesSessionsAndChangesCredential(t *testing.T) {
+	h := newIdentityHarness(t)
+	session := h.login(t)
+	newPassword := "new correct horse battery staple"
+
+	if err := h.service.ResetPassword(h.ctx, h.owner.UserID, newPassword); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.ResolveSession(h.ctx, session.RawToken); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("old session error = %v", err)
+	}
+	if _, err := h.service.BeginLogin(h.ctx, testEmail, testPassword); err != ErrInvalidCredentials {
+		t.Fatalf("old password error = %v", err)
+	}
+	if _, err := h.service.BeginLogin(h.ctx, testEmail, newPassword); err != nil {
+		t.Fatalf("new password error = %v", err)
+	}
+}
+
+func TestResetPasswordInvalidatesOutstandingLoginChallenge(t *testing.T) {
+	h := newIdentityHarness(t)
+	challenge := h.beginLogin(t, testPassword)
+
+	if err := h.service.ResetPassword(
+		h.ctx, h.owner.UserID, "replacement password fixture",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.service.CompleteLogin(
+		h.ctx, challenge.ID, h.totpAt(h.clock.Now()),
+	); !errors.Is(err, ErrInvalidChallenge) {
+		t.Fatalf("pre-reset challenge error = %v", err)
+	}
+}
+
+func TestPasswordHashParserRejectsNonCanonicalAndUnsafeParameters(t *testing.T) {
+	valid, err := hashPassword("fixture password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(string(valid), "$")
+	if len(parts) != 6 {
+		t.Fatalf("hash parts = %d", len(parts))
+	}
+	tests := map[string]string{
+		"trailing parameter data": "m=65536,t=3,p=2junk",
+		"memory below lanes":      "m=8,t=3,p=8",
+		"extra parameter":         "m=65536,t=3,p=2,x=1",
+	}
+	for name, parameters := range tests {
+		t.Run(name, func(t *testing.T) {
+			malformed := strings.Join(
+				[]string{"", parts[1], parts[2], parameters, parts[4], parts[5]},
+				"$",
+			)
+			if _, _, _, ok := parsePasswordHash([]byte(malformed)); ok {
+				t.Fatalf("accepted parameters %q", parameters)
+			}
+		})
+	}
+}
+
+func TestSensitiveFixturesAreAbsentFromRawDatabase(t *testing.T) {
+	h := newIdentityHarness(t)
+	recoveryCode := h.owner.RecoveryCodes[0]
+	session, err := h.service.CompleteLogin(
+		h.ctx, h.beginLogin(t, testPassword).ID, recoveryCode,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Writer.ExecContext(h.ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(h.databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, fixture := range map[string]string{
+		"password":      testPassword,
+		"TOTP seed":     testTOTPSeed,
+		"recovery code": recoveryCode,
+		"session token": session.RawToken,
+	} {
+		if bytes.Contains(raw, []byte(fixture)) {
+			t.Fatalf("%s fixture found in database", name)
+		}
+	}
+}
+
+type identityHarness struct {
+	ctx          context.Context
+	databasePath string
+	db           *storage.DB
+	clock        *fakeClock
+	service      *Service
+	owner        CreateOwnerResult
+}
+
+func newIdentityHarness(t *testing.T) *identityHarness {
+	t.Helper()
+	h := newIdentityHarnessWithoutOwner(t)
+	owner, err := h.service.CreateInitialOwner(h.ctx, CreateOwnerInput{
+		Email: testEmail, Password: testPassword, TOTPSeed: testTOTPSeed,
+		SourceIP: netip.MustParseAddr("127.0.0.1"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.owner = owner
+	return h
+}
+
+func newIdentityHarnessWithoutOwner(t *testing.T) *identityHarness {
+	t.Helper()
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "opswarden.db")
+	db, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	clock := &fakeClock{now: time.Date(2026, 7, 28, 9, 30, 0, 0, time.UTC)}
+	box := cryptobox.New([32]byte{1, 2, 3, 4})
+	service, err := NewService(db, box, clock, Config{
+		InternalCIDRs: []netip.Prefix{netip.MustParsePrefix("10.23.0.0/16")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &identityHarness{
+		ctx: ctx, databasePath: databasePath, db: db, clock: clock, service: service,
+	}
+}
+
+func (h *identityHarness) beginLogin(t *testing.T, password string) LoginChallenge {
+	t.Helper()
+	challenge, err := h.service.BeginLogin(h.ctx, testEmail, password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return challenge
+}
+
+func (h *identityHarness) login(t *testing.T) Session {
+	t.Helper()
+	session, err := h.service.CompleteLogin(
+		h.ctx, h.beginLogin(t, testPassword).ID, h.totpAt(h.clock.Now()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func (h *identityHarness) totpAt(at time.Time) string {
+	secret, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(testTOTPSeed)
+	if err != nil {
+		panic(err)
+	}
+	counter := uint64(at.Unix() / int64(TOTPPeriod/time.Second))
+	var message [8]byte
+	binary.BigEndian.PutUint64(message[:], counter)
+	mac := hmac.New(sha1.New, secret)
+	_, _ = mac.Write(message[:])
+	sum := mac.Sum(nil)
+	offset := sum[len(sum)-1] & 0x0f
+	value := (binary.BigEndian.Uint32(sum[offset:offset+4]) & 0x7fffffff) % 1_000_000
+	return fmt.Sprintf("%06d", value)
+}
+
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(duration)
+}

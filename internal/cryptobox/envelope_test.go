@@ -273,6 +273,108 @@ func TestCredentialAADUsesDomainSeparatedCanonicalEncoding(t *testing.T) {
 	}
 }
 
+func TestIdentityEnvelopeRoundTripAndDomainSeparation(t *testing.T) {
+	box := newTestBox(1)
+	ctx := IdentityContext{UserID: "user-1", Purpose: "login-totp"}
+	plaintext := []byte("JBSWY3DPEHPK3PXP")
+
+	env, err := box.EncryptIdentity(ctx, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := MarshalEnvelope(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := UnmarshalEnvelope(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := box.DecryptIdentity(ctx, decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatal("decrypted identity plaintext mismatch")
+	}
+
+	for name, moved := range map[string]IdentityContext{
+		"user":    {UserID: "user-2", Purpose: "login-totp"},
+		"purpose": {UserID: "user-1", Purpose: "credential-totp"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := box.DecryptIdentity(moved, decoded); !errors.Is(err, ErrAuthentication) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+	if _, err := box.DecryptCredential(testContext(), decoded); !errors.Is(err, ErrAuthentication) {
+		t.Fatalf("identity envelope decrypted in credential domain: %v", err)
+	}
+}
+
+func TestIdentityAADUsesCanonicalEncoding(t *testing.T) {
+	ctx := IdentityContext{UserID: "用户-1", Purpose: "login-totp"}
+	var fields bytes.Buffer
+	for _, field := range []string{ctx.UserID, ctx.Purpose} {
+		if err := binary.Write(&fields, binary.BigEndian, uint64(len([]byte(field)))); err != nil {
+			t.Fatal(err)
+		}
+		fields.WriteString(field)
+	}
+
+	wantPayload := append([]byte("opswarden/identity-payload/v1"), fields.Bytes()...)
+	wantWrap := append([]byte("opswarden/identity-data-key-wrap/v1"), fields.Bytes()...)
+	if got := identityAAD(identityPayloadDomain, ctx); !bytes.Equal(got, wantPayload) {
+		t.Fatal("identity payload AAD mismatch")
+	}
+	if got := identityAAD(identityWrapDomain, ctx); !bytes.Equal(got, wantWrap) {
+		t.Fatal("identity wrap AAD mismatch")
+	}
+}
+
+func TestEnvelopeBinaryRejectsMalformedInput(t *testing.T) {
+	box := newTestBox(1)
+	env, err := box.EncryptIdentity(
+		IdentityContext{UserID: "user-1", Purpose: "login-totp"},
+		[]byte("JBSWY3DPEHPK3PXP"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := MarshalEnvelope(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := map[string][]byte{
+		"empty":          nil,
+		"truncated":      bytes.Clone(encoded[:len(encoded)-1]),
+		"trailing bytes": append(bytes.Clone(encoded), 0),
+		"bad magic":      append([]byte("FAIL"), encoded[4:]...),
+		"bad version":    append(bytes.Clone(encoded[:4]), append([]byte{2}, encoded[5:]...)...),
+		"oversize":       make([]byte, maxSerializedEnvelopeSize+1),
+	}
+	badNonceLength := bytes.Clone(encoded)
+	// Four-byte magic, one-byte version, then the ciphertext field.
+	ciphertextLength := binary.BigEndian.Uint32(badNonceLength[5:9])
+	nonceLengthOffset := 9 + int(ciphertextLength)
+	binary.BigEndian.PutUint32(badNonceLength[nonceLengthOffset:nonceLengthOffset+4], 23)
+	tests["bad nonce length"] = badNonceLength
+
+	for name, input := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := UnmarshalEnvelope(input)
+			if !errors.Is(err, ErrEnvelopeFormat) {
+				t.Fatalf("got %v", err)
+			}
+			if err != nil && strings.Contains(err.Error(), "JBSWY3DPEHPK3PXP") {
+				t.Fatal("parse error exposed envelope content")
+			}
+		})
+	}
+}
+
 func TestEnvelopeRoundTrip(t *testing.T) {
 	box := newTestBox(1)
 	ctx := testContext()

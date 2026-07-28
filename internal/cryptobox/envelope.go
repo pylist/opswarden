@@ -17,6 +17,8 @@ import (
 const (
 	payloadDomain         = "opswarden/credential-payload/v1"
 	wrapDomain            = "opswarden/data-key-wrap/v1"
+	identityPayloadDomain = "opswarden/identity-payload/v1"
+	identityWrapDomain    = "opswarden/identity-data-key-wrap/v1"
 	maxEncodedKeyFileSize = 1024
 )
 
@@ -33,6 +35,11 @@ type CredentialContext struct {
 	SpaceID      string
 	Version      uint64
 	Type         string
+}
+
+type IdentityContext struct {
+	UserID  string
+	Purpose string
 }
 
 type Envelope struct {
@@ -177,6 +184,22 @@ func validateStableMasterKeyFileInfo(before, after os.FileInfo) error {
 }
 
 func (b *Box) EncryptCredential(ctx CredentialContext, plaintext []byte) (Envelope, error) {
+	return b.encryptEnvelope(
+		credentialAAD(payloadDomain, ctx),
+		credentialAAD(wrapDomain, ctx),
+		plaintext,
+	)
+}
+
+func (b *Box) EncryptIdentity(ctx IdentityContext, plaintext []byte) (Envelope, error) {
+	return b.encryptEnvelope(
+		identityAAD(identityPayloadDomain, ctx),
+		identityAAD(identityWrapDomain, ctx),
+		plaintext,
+	)
+}
+
+func (b *Box) encryptEnvelope(payloadAAD, wrapAAD, plaintext []byte) (Envelope, error) {
 	var env Envelope
 	dataKey := make([]byte, chacha20poly1305.KeySize)
 	defer clear(dataKey)
@@ -195,7 +218,7 @@ func (b *Box) EncryptCredential(ctx CredentialContext, plaintext []byte) (Envelo
 		nil,
 		env.Nonce[:],
 		plaintext,
-		credentialAAD(payloadDomain, ctx),
+		payloadAAD,
 	)
 
 	wrappingAEAD, err := chacha20poly1305.NewX(b.masterKey[:])
@@ -209,20 +232,36 @@ func (b *Box) EncryptCredential(ctx CredentialContext, plaintext []byte) (Envelo
 		nil,
 		env.WrapNonce[:],
 		dataKey,
-		credentialAAD(wrapDomain, ctx),
+		wrapAAD,
 	)
 
 	return env, nil
 }
 
 func (b *Box) DecryptCredential(ctx CredentialContext, env Envelope) ([]byte, error) {
-	dataKey, err := b.unwrapDataKey(ctx, env)
+	return b.decryptEnvelope(
+		credentialAAD(payloadDomain, ctx),
+		credentialAAD(wrapDomain, ctx),
+		env,
+	)
+}
+
+func (b *Box) DecryptIdentity(ctx IdentityContext, env Envelope) ([]byte, error) {
+	return b.decryptEnvelope(
+		identityAAD(identityPayloadDomain, ctx),
+		identityAAD(identityWrapDomain, ctx),
+		env,
+	)
+}
+
+func (b *Box) decryptEnvelope(payloadAAD, wrapAAD []byte, env Envelope) ([]byte, error) {
+	dataKey, err := b.unwrapDataKey(wrapAAD, env)
 	if err != nil {
 		return nil, err
 	}
 	defer clear(dataKey)
 
-	return decryptPayload(ctx, env, dataKey)
+	return decryptPayload(payloadAAD, env, dataKey)
 }
 
 func (b *Box) RewrapDataKey(
@@ -234,13 +273,13 @@ func (b *Box) RewrapDataKey(
 		return Envelope{}, ErrContextChange
 	}
 
-	dataKey, err := b.unwrapDataKey(oldCtx, env)
+	dataKey, err := b.unwrapDataKey(credentialAAD(wrapDomain, oldCtx), env)
 	if err != nil {
 		return Envelope{}, err
 	}
 	defer clear(dataKey)
 
-	plaintext, err := decryptPayload(oldCtx, env, dataKey)
+	plaintext, err := decryptPayload(credentialAAD(payloadDomain, oldCtx), env, dataKey)
 	if err != nil {
 		return Envelope{}, err
 	}
@@ -267,7 +306,7 @@ func (b *Box) RewrapDataKey(
 	return rewrapped, nil
 }
 
-func (b *Box) unwrapDataKey(ctx CredentialContext, env Envelope) ([]byte, error) {
+func (b *Box) unwrapDataKey(wrapAAD []byte, env Envelope) ([]byte, error) {
 	wrappingAEAD, err := chacha20poly1305.NewX(b.masterKey[:])
 	if err != nil {
 		return nil, fmt.Errorf("create wrapping cipher: %w", err)
@@ -276,7 +315,7 @@ func (b *Box) unwrapDataKey(ctx CredentialContext, env Envelope) ([]byte, error)
 		nil,
 		env.WrapNonce[:],
 		env.WrappedDataKey,
-		credentialAAD(wrapDomain, ctx),
+		wrapAAD,
 	)
 	if err != nil || len(dataKey) != chacha20poly1305.KeySize {
 		clear(dataKey)
@@ -285,7 +324,7 @@ func (b *Box) unwrapDataKey(ctx CredentialContext, env Envelope) ([]byte, error)
 	return dataKey, nil
 }
 
-func decryptPayload(ctx CredentialContext, env Envelope, dataKey []byte) ([]byte, error) {
+func decryptPayload(payloadAAD []byte, env Envelope, dataKey []byte) ([]byte, error) {
 	payloadAEAD, err := chacha20poly1305.NewX(dataKey)
 	if err != nil {
 		return nil, ErrAuthentication
@@ -294,7 +333,7 @@ func decryptPayload(ctx CredentialContext, env Envelope, dataKey []byte) ([]byte
 		nil,
 		env.Nonce[:],
 		env.Ciphertext,
-		credentialAAD(payloadDomain, ctx),
+		payloadAAD,
 	)
 	if err != nil {
 		clear(plaintext)
@@ -312,6 +351,15 @@ func credentialAAD(domain string, ctx CredentialContext) []byte {
 	aad = appendLengthPrefixed(aad, ctx.SpaceID)
 	aad = binary.BigEndian.AppendUint64(aad, ctx.Version)
 	aad = appendLengthPrefixed(aad, ctx.Type)
+	return aad
+}
+
+func identityAAD(domain string, ctx IdentityContext) []byte {
+	size := len(domain) + 8 + len(ctx.UserID) + 8 + len(ctx.Purpose)
+	aad := make([]byte, 0, size)
+	aad = append(aad, domain...)
+	aad = appendLengthPrefixed(aad, ctx.UserID)
+	aad = appendLengthPrefixed(aad, ctx.Purpose)
 	return aad
 }
 

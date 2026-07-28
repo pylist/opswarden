@@ -40,8 +40,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := db.Writer.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	if before != 1 || after != before {
-		t.Fatalf("migration counts before/after = %d/%d, want 1/1", before, after)
+	if before != 2 || after != before {
+		t.Fatalf("migration counts before/after = %d/%d, want 2/2", before, after)
 	}
 }
 
@@ -87,8 +87,8 @@ func TestConcurrentMigrateOnIndependentDatabases(t *testing.T) {
 			if err := databases[0].QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&versions); err != nil {
 				t.Fatal(err)
 			}
-			if versions != 1 {
-				t.Fatalf("schema migration count = %d, want 1", versions)
+			if versions != 2 {
+				t.Fatalf("schema migration count = %d, want 2", versions)
 			}
 		})
 	}
@@ -224,6 +224,32 @@ func TestInitialSchemaEnforcesRequiredIntegrity(t *testing.T) {
 	if _, err := db.Writer.Exec(`DELETE FROM credential_versions WHERE id = 'cv1'`); err != nil {
 		t.Fatalf("delete immutable credential version: %v", err)
 	}
+}
+
+func TestIdentityStateMigrationAddsRoleReplayAndSessionExpiryColumns(t *testing.T) {
+	db := openTempDB(t)
+
+	mustExec(t, db.Writer, `INSERT INTO users
+		(id, email, normalized_email, password_hash, system_role)
+		VALUES ('identity-user', 'owner@example.com', 'owner@example.com', X'01', 'system_owner')`)
+	if _, err := db.Writer.Exec(`INSERT INTO users
+		(id, email, normalized_email, password_hash, system_role)
+		VALUES ('bad-role', 'bad@example.com', 'bad@example.com', X'01', 'invalid')`); err == nil {
+		t.Fatal("invalid system role succeeded")
+	}
+
+	mustExec(t, db.Writer, `INSERT INTO user_totp
+		(user_id, encrypted_secret, last_used_counter)
+		VALUES ('identity-user', X'01', 42)`)
+	if _, err := db.Writer.Exec(`UPDATE user_totp SET last_used_counter = -1
+		WHERE user_id = 'identity-user'`); err == nil {
+		t.Fatal("negative TOTP counter succeeded")
+	}
+
+	mustExec(t, db.Writer, `INSERT INTO sessions
+		(id, user_id, token_hash, expires_at, idle_expires_at, recent_totp_at)
+		VALUES ('identity-session', 'identity-user', X'02',
+			'2026-07-29T09:30:00Z', '2026-07-28T17:30:00Z', '2026-07-28T09:30:00Z')`)
 }
 
 func TestInitialSchemaContainsHashSoftDeleteAndLookupColumns(t *testing.T) {
