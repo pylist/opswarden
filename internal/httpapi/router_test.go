@@ -351,6 +351,115 @@ func TestBootstrapCreatesInitialOwnerOnlyFromRequestSource(t *testing.T) {
 	}
 }
 
+func TestBootstrapStatusReportsOnlyWhetherLocalSetupIsNeeded(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		hasOwner   bool
+		needsOwner bool
+	}{
+		{name: "setup needed", needsOwner: true},
+		{name: "owner exists", hasOwner: true, needsOwner: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeIdentityService{hasOwner: test.hasOwner}
+			handler := newTestHandler(Dependencies{
+				Identity: service, Clock: &fixedClock{now: time.Now().UTC()},
+				MasterKey: [32]byte{1},
+			})
+			request := httptest.NewRequest(
+				http.MethodGet, "/api/v1/bootstrap/status", nil,
+			)
+			request.RemoteAddr = "127.0.0.1:4444"
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var result struct {
+				NeedsInitialOwner bool `json:"needsInitialOwner"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.NeedsInitialOwner != test.needsOwner {
+				t.Fatalf("needsInitialOwner=%t", result.NeedsInitialOwner)
+			}
+			if queries := service.ownerQueries.Load(); queries != 1 {
+				t.Fatalf("owner queries=%d", queries)
+			}
+			if service.ownerCalls != 0 {
+				t.Fatalf("status reached owner creation %d times", service.ownerCalls)
+			}
+			if got := response.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("Cache-Control=%q", got)
+			}
+		})
+	}
+}
+
+func TestBootstrapStatusRejectsExternalSourceBeforeOwnerQuery(t *testing.T) {
+	service := &fakeIdentityService{hasOwner: true}
+	handler := newTestHandler(Dependencies{
+		Identity: service, Clock: &fixedClock{now: time.Now().UTC()},
+		MasterKey: [32]byte{1},
+	})
+	request := httptest.NewRequest(
+		http.MethodGet, "/api/v1/bootstrap/status", nil,
+	)
+	request.RemoteAddr = "198.51.100.80:4444"
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if queries := service.ownerQueries.Load(); queries != 0 {
+		t.Fatalf("external source queried initialization state %d times", queries)
+	}
+}
+
+func TestBootstrapStatusUsesStrictMethodQueryAndDependencyPolicy(t *testing.T) {
+	service := &fakeIdentityService{}
+	handler := newTestHandler(Dependencies{
+		Identity: service, Clock: &fixedClock{now: time.Now().UTC()},
+		MasterKey: [32]byte{1},
+	})
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodPost, "/api/v1/bootstrap/status", nil),
+		httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap/status?probe=true", nil),
+	} {
+		request.RemoteAddr = "127.0.0.1:4444"
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code == http.StatusOK {
+			t.Fatalf("%s %s unexpectedly succeeded", request.Method, request.URL)
+		}
+	}
+	if queries := service.ownerQueries.Load(); queries != 0 {
+		t.Fatalf("invalid status request queried initialization state %d times", queries)
+	}
+
+	withoutAudit := New(Dependencies{
+		Identity: service, Clock: &fixedClock{now: time.Now().UTC()},
+		MasterKey: [32]byte{1},
+	})
+	request := httptest.NewRequest(
+		http.MethodGet, "/api/v1/bootstrap/status", nil,
+	)
+	request.RemoteAddr = "127.0.0.1:4444"
+	response := httptest.NewRecorder()
+	withoutAudit.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("nil-audit status=%d body=%s", response.Code, response.Body.String())
+	}
+	if queries := service.ownerQueries.Load(); queries != 0 {
+		t.Fatalf("nil-audit status queried initialization state %d times", queries)
+	}
+}
+
 func TestBootstrapExistingOwnerSkipsExpensiveCreation(t *testing.T) {
 	service := &fakeIdentityService{hasOwner: true}
 	handler := newTestHandler(Dependencies{

@@ -480,12 +480,14 @@ func writeRateLimitError(
 }
 
 func isPublicRoute(request *http.Request) bool {
-	if request.Method != http.MethodPost {
-		return false
+	if request.Method == http.MethodGet &&
+		request.URL.Path == "/api/v1/bootstrap/status" {
+		return true
 	}
-	return request.URL.Path == "/api/v1/auth/login/begin" ||
-		request.URL.Path == "/api/v1/auth/login/complete" ||
-		request.URL.Path == "/api/v1/bootstrap/initial-owner"
+	return request.Method == http.MethodPost &&
+		(request.URL.Path == "/api/v1/auth/login/begin" ||
+			request.URL.Path == "/api/v1/auth/login/complete" ||
+			request.URL.Path == "/api/v1/bootstrap/initial-owner")
 }
 
 func routeAllowsAgent(request *http.Request) bool {

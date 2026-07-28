@@ -204,6 +204,31 @@ type bootstrapRequest struct {
 	TOTPSeed string `json:"totpSeed"`
 }
 
+func (router *Router) handleBootstrapStatus(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
+	if request.Method != http.MethodGet || request.URL.RawQuery != "" ||
+		router.deps.Identity == nil {
+		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
+		return
+	}
+	metadata := requestMetadataFromContext(request.Context())
+	sourceIP, err := netip.ParseAddr(metadata.sourceIP)
+	if err != nil || !router.deps.Identity.InitialOwnerSourceAllowed(sourceIP) {
+		writeAPIError(writer, request, http.StatusForbidden, "PERMISSION_DENIED", false, nil)
+		return
+	}
+	exists, err := router.deps.Identity.HasInitialOwner(request.Context())
+	if err != nil {
+		writeDomainError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, struct {
+		NeedsInitialOwner bool `json:"needsInitialOwner"`
+	}{NeedsInitialOwner: !exists})
+}
+
 type reverifyRequest struct {
 	Code string `json:"code"`
 }

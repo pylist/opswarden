@@ -186,6 +186,8 @@ func (router *Router) dispatch(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	switch {
+	case request.URL.Path == "/api/v1/bootstrap/status":
+		router.handleBootstrapStatus(writer, request)
 	case request.URL.Path == "/api/v1/bootstrap/initial-owner":
 		router.handleBootstrap(writer, request)
 	case strings.HasPrefix(request.URL.Path, "/api/v1/auth/"):
