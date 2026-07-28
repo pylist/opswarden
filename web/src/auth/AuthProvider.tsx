@@ -185,7 +185,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
         if (
           !operationIsCurrent(auth) ||
-          !sessions.isCurrent(allocated)
+          !sessions.isCurrentLineage(allocated)
         ) {
           throw new SessionSupersededError();
         }
@@ -193,7 +193,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setStatus("authenticated");
       } catch (error) {
         if (operationIsCurrent(auth)) {
-          if (allocated) sessions.clearIfCurrent(allocated);
+          if (allocated) sessions.clearLineageIfCurrent(allocated);
           setPrincipal(null);
           setStatus("anonymous");
         }

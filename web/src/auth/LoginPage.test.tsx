@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { ApiClient, MemorySessionController } from "../api/client";
 import { AuthProvider } from "./AuthProvider";
+import { generateTOTPCode } from "./totp";
 
 const originalMatchMedia = window.matchMedia;
 
@@ -275,6 +276,7 @@ describe("application shell", () => {
     }
     expect(await screen.findByLabelText("当前空间")).toHaveValue("spc-main");
     expect(screen.getByText("所有者")).toBeVisible();
+    expect(screen.getByText("全局 Agent 数量")).toBeVisible();
   });
 
   it("supports a keyboard-dismissable mobile navigation drawer", async () => {
@@ -300,13 +302,18 @@ describe("application shell", () => {
     first.focus();
     fireEvent.keyDown(first, { key: "Tab", shiftKey: true });
     expect(last).toHaveFocus();
+    const appColumn = document.querySelector(".app-column");
+    const menuButton = screen.getByRole("button", { name: "打开导航" });
+    const focus = vi.spyOn(menuButton, "focus").mockImplementation(() => {
+      expect(appColumn).not.toHaveAttribute("inert");
+    });
     fireEvent.keyDown(document, { key: "Escape" });
     await waitFor(() =>
       expect(
         document.querySelector('nav[aria-label="主导航"]'),
       ).toHaveAttribute("aria-hidden", "true"),
     );
-    expect(screen.getByRole("button", { name: "打开导航" })).toHaveFocus();
+    expect(focus).toHaveBeenCalledOnce();
   });
 
   it("uses exact route names and synchronizes view and validated Space on popstate", async () => {
@@ -399,7 +406,64 @@ describe("application shell", () => {
 
 describe("initial setup", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("requires a locally verified TOTP code and guards pending bootstrap navigation", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-07-28T00:00:00Z"));
+    installDeterministicRandom(0);
+    window.history.replaceState({}, "", "/setup");
+    const bootstrap = deferredResponse();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      if (String(input) === "/api/v1/bootstrap/status") {
+        return jsonResponse({ body: { needsInitialOwner: true } });
+      }
+      return bootstrap.promise;
+    });
+    render(<App />);
+
+    fireEvent.change(await screen.findByLabelText("管理员邮箱"), {
+      target: { value: "owner@example.com" },
+    });
+    fireEvent.change(screen.getByLabelText("管理员密码"), {
+      target: { value: "a-long-local-password" },
+    });
+    const submit = screen.getByRole("button", { name: "创建初始管理员" });
+    expect(submit).toBeDisabled();
+    fireEvent.submit(submit.closest("form")!);
+    expect(
+      vi.mocked(fetch).mock.calls.filter(
+        ([path]) => String(path) === "/api/v1/bootstrap/initial-owner",
+      ),
+    ).toHaveLength(0);
+    fireEvent.change(screen.getByRole("textbox", { name: "动态验证码" }), {
+      target: { value: "578926" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "验证动态验证码" }));
+    expect(await screen.findByText("动态验证码已验证")).toBeVisible();
+    expect(submit).toBeEnabled();
+
+    fireEvent.click(submit);
+    expect(
+      screen.queryByRole("button", { name: "返回登录" }),
+    ).not.toBeInTheDocument();
+    const unload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(true);
+    window.history.pushState({}, "", "/");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    expect(window.location.pathname).toBe("/setup");
+    expect(screen.getByRole("heading", { name: "设置初始管理员" })).toBeVisible();
+
+    bootstrap.resolve(
+      jsonResponse({ status: 201, body: { userId: "u", recoveryCodes: ["one"] } }),
+    );
+    expect(await screen.findByText("one")).toBeVisible();
+    const settledUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(settledUnload);
+    expect(settledUnload.defaultPrevented).toBe(false);
   });
 
   it("shows recovery codes once and clears them when leaving setup", async () => {
@@ -430,6 +494,7 @@ describe("initial setup", () => {
     expect(screen.getByLabelText("TOTP 种子")).toHaveAttribute("type", "password");
     fireEvent.click(screen.getByRole("button", { name: "显示种子" }));
     expect(screen.getByLabelText("TOTP 种子")).toHaveAttribute("type", "text");
+    await verifyDisplayedTOTP();
     fireEvent.click(screen.getByRole("button", { name: "创建初始管理员" }));
 
     expect(await screen.findByText("recovery-one")).toBeVisible();
@@ -462,6 +527,7 @@ describe("initial setup", () => {
     });
     const submit = screen.getByRole("button", { name: "创建初始管理员" });
 
+    await verifyDisplayedTOTP();
     fireEvent.click(submit);
     fireEvent.submit(submit.closest("form")!);
 
@@ -469,8 +535,10 @@ describe("initial setup", () => {
       ([path]) => String(path) === "/api/v1/bootstrap/initial-owner",
     );
     expect(posts).toHaveLength(1);
-    const body = JSON.parse(String(posts[0][1]?.body)) as { totpSeed: string };
+    const body = JSON.parse(String(posts[0][1]?.body)) as Record<string, unknown>;
     expect(body.totpSeed).toBe("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    expect(body).not.toHaveProperty("totpCode");
+    expect(body).not.toHaveProperty("verificationCode");
     bootstrap.resolve(
       jsonResponse({ status: 201, body: { userId: "u", recoveryCodes: ["one"] } }),
     );
@@ -496,11 +564,13 @@ describe("initial setup", () => {
     fireEvent.change(screen.getByLabelText("管理员密码"), {
       target: { value: "a-long-local-password" },
     });
+    await verifyDisplayedTOTP();
     fireEvent.click(screen.getByRole("button", { name: "创建初始管理员" }));
     expect(await screen.findByRole("alert")).not.toHaveTextContent("network-secret-value");
     fireEvent.change(screen.getByLabelText("管理员密码"), {
       target: { value: "a-long-local-password" },
     });
+    await verifyDisplayedTOTP();
     fireEvent.click(screen.getByRole("button", { name: "创建初始管理员" }));
     expect(await screen.findByRole("alert")).not.toHaveTextContent("success-secret-value");
   });
@@ -515,6 +585,17 @@ describe("initial setup", () => {
     expect(await screen.findByRole("button", { name: "初始化管理员" })).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "初始化管理员" }));
     expect(await screen.findByRole("heading", { name: "设置初始管理员" })).toBeVisible();
+  });
+
+  it("never enables setup for a malformed bootstrap status boolean", async () => {
+    window.history.replaceState({}, "", "/setup");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({ body: { needsInitialOwner: "false" } }),
+    );
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "登录 OpsWarden" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "初始化管理员" })).not.toBeInTheDocument();
   });
 
   it("hides setup and keeps login available when status is forbidden", async () => {
@@ -600,6 +681,60 @@ describe("initial setup", () => {
       "Bearer memory-token",
     );
   });
+
+  it("rejects a malformed initial Space response without changing the URL", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/v1/bootstrap/status") {
+        return jsonResponse({ body: { needsInitialOwner: false } });
+      }
+      if (path === "/api/v1/auth/login/begin") {
+        return jsonResponse({
+          body: { challengeId: "c", expiresAt: "2099-01-01T00:00:00Z" },
+        });
+      }
+      if (path === "/api/v1/auth/login/complete") {
+        return jsonResponse({
+          body: {
+            token: "memory-token",
+            expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+          },
+        });
+      }
+      if (path === "/api/v1/me") {
+        return jsonResponse({
+          body: {
+            userId: "usr-owner",
+            systemRole: "system_owner",
+            issuedAt: "2026-07-28T00:00:00Z",
+          },
+        });
+      }
+      if (path === "/api/v1/spaces" && init?.method !== "POST") {
+        return jsonResponse({ body: { items: [] } });
+      }
+      if (path === "/api/v1/spaces") {
+        return jsonResponse({
+          status: 201,
+          body: { id: "//", name: "malformed", role: "owner" },
+        });
+      }
+      return jsonResponse({ body: { items: [] } });
+    });
+    window.history.replaceState({}, "", "/");
+    render(<App />);
+    await completePasswordAndTotpLogin();
+    fireEvent.change(await screen.findByLabelText("初始空间名称"), {
+      target: { value: "内部工具" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "创建空间" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "请求失败，请检查网络连接后重试。",
+    );
+    expect(window.location.search).not.toContain("space=");
+    expect(screen.queryByLabelText("当前空间")).not.toBeInTheDocument();
+  });
 });
 
 function installDeterministicRandom(byte: number) {
@@ -610,6 +745,16 @@ function installDeterministicRandom(byte: number) {
       array.fill(byte);
       return array;
     }) as typeof globalThis.crypto.getRandomValues);
+}
+
+async function verifyDisplayedTOTP() {
+  const seed = (screen.getByLabelText("TOTP 种子") as HTMLInputElement).value;
+  const code = await generateTOTPCode(seed);
+  fireEvent.change(screen.getByRole("textbox", { name: "动态验证码" }), {
+    target: { value: code },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "验证动态验证码" }));
+  await screen.findByText("动态验证码已验证");
 }
 
 function deferredResponse() {

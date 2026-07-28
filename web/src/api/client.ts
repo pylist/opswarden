@@ -13,6 +13,7 @@ export type SessionSnapshot = {
   readonly token: string;
   readonly expiresAt: number;
   readonly generation: number;
+  readonly lineage: number;
   readonly signal: AbortSignal;
 };
 
@@ -110,6 +111,25 @@ export class MemorySessionController implements SessionAccess {
   }
 
   allocate(token: string, expiresAt: number): SessionSnapshot {
+    return this.allocateForLineage(token, expiresAt);
+  }
+
+  isCurrentLineage(snapshot: SessionSnapshot) {
+    return this.current?.lineage === snapshot.lineage;
+  }
+
+  clearLineageIfCurrent(snapshot: SessionSnapshot) {
+    if (!this.isCurrentLineage(snapshot)) {
+      return false;
+    }
+    return this.clearIfCurrent(this.current ?? undefined);
+  }
+
+  private allocateForLineage(
+    token: string,
+    expiresAt: number,
+    lineage?: number,
+  ): SessionSnapshot {
     if (
       token.length === 0 ||
       token.length > 16_384 ||
@@ -124,6 +144,7 @@ export class MemorySessionController implements SessionAccess {
       token,
       expiresAt,
       generation: ++this.generation,
+      lineage: lineage ?? this.generation,
       signal: controller.signal,
     });
     this.current = snapshot;
@@ -140,7 +161,7 @@ export class MemorySessionController implements SessionAccess {
     if (!this.isCurrent(snapshot)) {
       return null;
     }
-    return this.allocate(token, expiresAt);
+    return this.allocateForLineage(token, expiresAt, snapshot.lineage);
   }
 
   clearIfCurrent(snapshot?: SessionSnapshot) {
@@ -350,6 +371,8 @@ export function assertCanonicalAPIPath(path: string) {
   const rawPath = queryIndex === -1 ? path : path.slice(0, queryIndex);
   if (
     rawPath.includes("%") ||
+    rawPath.includes("//") ||
+    rawPath.endsWith("/") ||
     rawPath.split("/").some((segment) => segment === "." || segment === "..")
   ) {
     throw new Error("仅允许访问同源 API");

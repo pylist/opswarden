@@ -84,6 +84,9 @@ export function SpaceSwitcher({
         method: "POST",
         body: { name: initialName.trim() },
       });
+      if (!isSpace(created)) {
+        throw new Error("invalid response");
+      }
       setSpaces([created]);
       setInitialName("");
       onChange(created);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { apiPath } from "../api/client";
 import type { ListResponse, Space } from "../api/types";
@@ -28,12 +28,20 @@ export function AppShell() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [currentSpace, setCurrentSpace] = useState<Space | null>(null);
   const menuButton = useRef<HTMLButtonElement>(null);
+  const restoreMenuFocus = useRef(false);
   const isMobile = useMobileLayout();
 
   const closeDrawer = useCallback(() => {
+    restoreMenuFocus.current = isMobile;
     setDrawerOpen(false);
-    if (isMobile) menuButton.current?.focus();
   }, [isMobile]);
+
+  useLayoutEffect(() => {
+    if (!drawerOpen && restoreMenuFocus.current) {
+      restoreMenuFocus.current = false;
+      menuButton.current?.focus();
+    }
+  }, [drawerOpen]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -190,7 +198,7 @@ function Overview({
   const cards = [
     ["当前页凭据", metrics.credentials, "仅统计已加载的元数据"],
     ["当前页资产", metrics.assets, "当前空间可见范围"],
-    ["Agent 数量", metrics.agents, "受系统权限约束"],
+    ["全局 Agent 数量", metrics.agents, "跨空间，受系统权限约束"],
     ["近期审计", metrics.audit, "最近一页事件"],
   ];
   return (

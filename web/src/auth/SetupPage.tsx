@@ -1,7 +1,8 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { ApiClient, ApiError, formatApiError } from "../api/client";
 import type { BootstrapResponse } from "../api/types";
+import { verifyTOTPCode } from "./totp";
 
 const base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -28,24 +29,72 @@ export function generateTOTPSeed() {
 
 export function SetupPage({
   onLogin,
+  onPendingChange,
 }: {
   onLogin: (completed: boolean, unavailable?: boolean) => void;
+  onPendingChange: (pending: boolean) => void;
 }) {
   const client = useRef(new ApiClient()).current;
   const submitting = useRef(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [totpSeed, setTotpSeed] = useState(generateTOTPSeed);
+  const [totpCode, setTotpCode] = useState("");
+  const [verification, setVerification] = useState<
+    "idle" | "checking" | "verified"
+  >("idle");
   const [seedVisible, setSeedVisible] = useState(false);
   const [recoveryCodes, setRecoveryCodes] = useState<string[]>([]);
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const verificationGeneration = useRef(0);
+  const pendingCleanup = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      pendingCleanup.current?.();
+      pendingCleanup.current = null;
+      verificationGeneration.current += 1;
+    };
+  }, []);
+
+  function clearVerification() {
+    verificationGeneration.current += 1;
+    setTotpCode("");
+    setVerification("idle");
+  }
 
   function clearEnrollment() {
     setPassword("");
     setTotpSeed("");
     setSeedVisible(false);
+    clearVerification();
+  }
+
+  function regenerateEnrollment() {
+    setTotpSeed(generateTOTPSeed());
+    setSeedVisible(false);
+    clearVerification();
+  }
+
+  function startPendingGuard() {
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", beforeUnload);
+    onPendingChange(true);
+    const cleanup = () => {
+      window.removeEventListener("beforeunload", beforeUnload);
+      onPendingChange(false);
+    };
+    pendingCleanup.current = cleanup;
+  }
+
+  function stopPendingGuard() {
+    pendingCleanup.current?.();
+    pendingCleanup.current = null;
   }
 
   function leaveSetup() {
@@ -57,10 +106,11 @@ export function SetupPage({
 
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (submitting.current) return;
+    if (submitting.current || verification !== "verified") return;
     submitting.current = true;
     setBusy(true);
     setError("");
+    startPendingGuard();
     const submittedSeed = totpSeed;
     try {
       const result = await client.publicRequest<BootstrapResponse>(
@@ -85,11 +135,11 @@ export function SetupPage({
       setPassword("");
       if (reason instanceof ApiError && reason.code === "VERSION_CONFLICT") {
         clearEnrollment();
+        stopPendingGuard();
         onLogin(false, true);
         return;
       }
-      setTotpSeed(generateTOTPSeed());
-      setSeedVisible(false);
+      regenerateEnrollment();
       setError(
         reason instanceof ApiError && reason.code === "PERMISSION_DENIED"
           ? supportMessage(
@@ -99,8 +149,29 @@ export function SetupPage({
           : formatApiError(reason),
       );
     } finally {
+      stopPendingGuard();
       submitting.current = false;
       setBusy(false);
+    }
+  }
+
+  async function verifyCode() {
+    const generation = ++verificationGeneration.current;
+    setVerification("checking");
+    setError("");
+    try {
+      const valid = await verifyTOTPCode(totpSeed, totpCode);
+      if (generation !== verificationGeneration.current) return;
+      if (!valid) {
+        setVerification("idle");
+        setError("动态验证码不正确，请检查验证器时间后重试。");
+        return;
+      }
+      setVerification("verified");
+    } catch {
+      if (generation !== verificationGeneration.current) return;
+      setVerification("idle");
+      setError("无法验证动态验证码，请重新生成初始化信息后重试。");
     }
   }
 
@@ -168,12 +239,51 @@ export function SetupPage({
                   复制种子
                 </button>
               </div>
-              <button className="primary-button" disabled={busy} type="submit">
+              <label htmlFor="setup-totp-code">动态验证码</label>
+              <div className="seed-field">
+                <input
+                  id="setup-totp-code"
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  value={totpCode}
+                  onChange={(event) => {
+                    verificationGeneration.current += 1;
+                    setTotpCode(event.target.value);
+                    setVerification("idle");
+                  }}
+                  required
+                />
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={busy || verification === "checking"}
+                  onClick={() => void verifyCode()}
+                >
+                  {verification === "checking"
+                    ? "正在验证…"
+                    : "验证动态验证码"}
+                </button>
+              </div>
+              {verification === "verified" && (
+                <p className="verification-success" role="status">
+                  动态验证码已验证
+                </p>
+              )}
+              <button
+                className="primary-button"
+                disabled={busy || verification !== "verified"}
+                type="submit"
+              >
                 {busy ? "正在创建…" : "创建初始管理员"}
               </button>
-              <button className="text-button" type="button" onClick={leaveSetup}>
-                返回登录
-              </button>
+              {!busy && (
+                <button className="text-button" type="button" onClick={leaveSetup}>
+                  返回登录
+                </button>
+              )}
             </form>
           </>
         ) : (

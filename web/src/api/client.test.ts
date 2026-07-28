@@ -44,6 +44,9 @@ describe("canonical API paths", () => {
     "/api/v1/%252e%252e/admin",
     "/api/v1/me ",
     "/api/v1",
+    "/api/v1//x",
+    "/api/v1/me/",
+    "/api/v1/me/?limit=1",
   ])("rejects %s before fetch", async (path) => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
     const sessions = new MemorySessionController();

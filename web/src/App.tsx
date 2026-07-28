@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { ApiClient, ApiError } from "./api/client";
 import { AuthProvider, useAuth } from "./auth/AuthProvider";
@@ -19,9 +19,17 @@ function AppContent() {
     "loading" | "available" | "unavailable" | "forbidden"
   >("loading");
   const [setupRequestId, setSetupRequestId] = useState("");
+  const setupPending = useRef(false);
 
   useEffect(() => {
-    const sync = () => setPath(window.location.pathname);
+    const sync = () => {
+      if (setupPending.current) {
+        window.history.pushState({}, "", "/setup");
+        setPath("/setup");
+        return;
+      }
+      setPath(window.location.pathname);
+    };
     window.addEventListener("popstate", sync);
     return () => window.removeEventListener("popstate", sync);
   }, []);
@@ -32,6 +40,9 @@ function AppContent() {
       .publicRequest<{ needsInitialOwner: boolean }>("/api/v1/bootstrap/status")
       .then((result) => {
         if (active) {
+          if (typeof result.needsInitialOwner !== "boolean") {
+            throw new ApiError("INVALID_RESPONSE", "", 502);
+          }
           setSetupAvailability(
             result.needsInitialOwner ? "available" : "unavailable",
           );
@@ -68,6 +79,9 @@ function AppContent() {
   if (path === "/setup" && setupAvailability === "available") {
     return (
       <SetupPage
+        onPendingChange={(pending) => {
+          setupPending.current = pending;
+        }}
         onLogin={(completed, unavailable) => {
           if (completed || unavailable) {
             setSetupAvailability("unavailable");
