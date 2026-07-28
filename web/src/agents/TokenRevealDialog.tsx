@@ -6,7 +6,11 @@ import {
   type FormEvent,
 } from "react";
 
-import { newIdempotencyKey } from "../admin-api";
+import {
+  MemoryIdempotencyIntent,
+  canonicalRFC3339NanoUTC,
+  retainIdempotencyOnError,
+} from "../admin-api";
 import { apiPath, formatApiError } from "../api/client";
 import { Modal } from "../layout/Modal";
 import type { WorkflowAPI } from "../workflow-api";
@@ -48,6 +52,8 @@ export function TokenRevealDialog({
   const submitting = useRef(false);
   const generation = useRef(0);
   const operation = useRef<Operation | null>(null);
+  const issueIdempotency = useRef(new MemoryIdempotencyIntent());
+  const revokeIdempotency = useRef(new MemoryIdempotencyIntent());
 
   const erase = useCallback(() => {
     setRawToken("");
@@ -69,12 +75,16 @@ export function TokenRevealDialog({
 
   useEffect(() => () => {
     invalidate(true);
+    issueIdempotency.current.clear();
+    revokeIdempotency.current.clear();
     setTotp("");
     setRevokeTOTP("");
   }, [invalidate]);
 
   function close() {
     if (!invalidate()) return;
+    issueIdempotency.current.clear();
+    revokeIdempotency.current.clear();
     erase();
     setTotp("");
     setRevokeTOTP("");
@@ -96,6 +106,11 @@ export function TokenRevealDialog({
     const current = beginOperation(operation, generation, submitting);
     setPhase("reverify");
     setError("");
+    const intentSignature = JSON.stringify({
+      agentID,
+      expiresAt: expiresAt ?? "",
+    });
+    const idempotencyKey = issueIdempotency.current.keyFor(intentSignature);
     try {
       await api.reverifyTOTP(totp, current.controller.signal);
       if (!operationCurrent(operation.current, current)) return;
@@ -106,7 +121,7 @@ export function TokenRevealDialog({
         {
           method: "POST",
           body: expiresAt ? { expiresAt } : {},
-          headers: { "Idempotency-Key": newIdempotencyKey() },
+          headers: { "Idempotency-Key": idempotencyKey },
           signal: current.controller.signal,
         },
       );
@@ -122,9 +137,13 @@ export function TokenRevealDialog({
       setReplayed(issued.replayed);
       setTotp("");
       setPhase("revealed");
+      issueIdempotency.current.clear();
       onChanged();
     } catch (caught) {
       if (operationCurrent(operation.current, current)) {
+        if (!retainIdempotencyOnError(caught)) {
+          issueIdempotency.current.clear();
+        }
         setError(formatApiError(caught));
       }
     } finally {
@@ -155,6 +174,7 @@ export function TokenRevealDialog({
     setRevoking(false);
     setRevokeTOTP("");
     setError("");
+    revokeIdempotency.current.clear();
   }
 
   async function revoke(event: FormEvent) {
@@ -168,6 +188,9 @@ export function TokenRevealDialog({
     }
     const current = beginOperation(operation, generation, submitting);
     setError("");
+    const idempotencyKey = revokeIdempotency.current.keyFor(
+      JSON.stringify({ agentID, tokenID }),
+    );
     try {
       await api.reverifyTOTP(revokeTOTP, current.controller.signal);
       if (!operationCurrent(operation.current, current)) return;
@@ -176,7 +199,7 @@ export function TokenRevealDialog({
         apiPath(["agents", agentID, "tokens", tokenID]),
         {
           method: "DELETE",
-          headers: { "Idempotency-Key": newIdempotencyKey() },
+          headers: { "Idempotency-Key": idempotencyKey },
           signal: current.controller.signal,
         },
       );
@@ -187,10 +210,14 @@ export function TokenRevealDialog({
       erase();
       setRevokeTOTP("");
       setRevoking(false);
+      revokeIdempotency.current.clear();
       onChanged();
       onClose();
     } catch (caught) {
       if (operationCurrent(operation.current, current)) {
+        if (!retainIdempotencyOnError(caught)) {
+          revokeIdempotency.current.clear();
+        }
         setError(formatApiError(caught));
       }
     } finally {
@@ -229,9 +256,16 @@ export function TokenRevealDialog({
                 </p>
               </>
             ) : replayed ? (
-              <p className="warning-copy">
-                该幂等请求已处理，完整 Token 不会再次返回。请关闭后创建新 Token。
-              </p>
+              <>
+                <p className="warning-copy">
+                  该请求已在服务端成功处理，但首次响应中的完整 Token 已无法恢复。
+                  如未保存原值，请吊销此 Token 后再创建新的 Token。
+                </p>
+                <dl className="detail-list">
+                  <div><dt>Token ID</dt><dd><code>{tokenID}</code></dd></div>
+                  <div><dt>Token 前缀</dt><dd><code>{prefix}</code></dd></div>
+                </dl>
+              </>
             ) : null}
             <div className="button-row">
               <button className="secondary-button" type="button" onClick={close}>
@@ -372,17 +406,16 @@ function parseIssuedAgentToken(value: unknown): {
   if (
     Object.keys(candidate).some((key) => !allowed.has(key)) ||
     typeof candidate.id !== "string" ||
-    !/^[A-Za-z0-9_-]+$/.test(candidate.id) ||
+    !validPrefixedRawURL(candidate.id, "tok_", 16) ||
     typeof candidate.prefix !== "string" ||
-    !/^owat_[A-Za-z0-9_-]{1,64}$/.test(candidate.prefix) ||
+    !/^owat_[A-Za-z0-9_-]{8}$/u.test(candidate.prefix) ||
     typeof candidate.token !== "string" ||
-    candidate.token.length > 4096 ||
     typeof candidate.replayed !== "boolean" ||
     (candidate.expiresAt !== undefined &&
-      (typeof candidate.expiresAt !== "string" ||
-        !Number.isFinite(Date.parse(candidate.expiresAt)))) ||
+      !canonicalRFC3339NanoUTC(candidate.expiresAt)) ||
     (!candidate.replayed &&
-      !/^owat_[A-Za-z0-9_-]{8,}$/.test(candidate.token)) ||
+      (!validPrefixedRawURL(candidate.token, "owat_", 32) ||
+        candidate.prefix !== candidate.token.slice(0, "owat_".length + 8))) ||
     (candidate.replayed && candidate.token !== "")
   ) {
     return null;
@@ -396,4 +429,22 @@ function parseIssuedAgentToken(value: unknown): {
       ? { expiresAt: candidate.expiresAt }
       : {}),
   };
+}
+
+function validPrefixedRawURL(value: string, prefix: string, bytes: number) {
+  if (!value.startsWith(prefix)) return false;
+  const encoded = value.slice(prefix.length);
+  if (
+    encoded.length !== Math.ceil(bytes * 8 / 6) ||
+    !/^[A-Za-z0-9_-]+$/u.test(encoded)
+  ) {
+    return false;
+  }
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const final = alphabet.indexOf(encoded.at(-1) ?? "");
+  const remainder = (bytes * 8) % 6;
+  return final >= 0 &&
+    (remainder !== 2 || (final & 0x0f) === 0) &&
+    (remainder !== 4 || (final & 0x03) === 0);
 }

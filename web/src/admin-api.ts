@@ -39,13 +39,37 @@ export type Member = {
   createdAt: string;
 };
 
+export class MemoryIdempotencyIntent {
+  private signature = "";
+  private key = "";
+
+  keyFor(signature: string) {
+    if (!signature || this.signature !== signature || !this.key) {
+      this.signature = signature;
+      this.key = newIdempotencyKey();
+    }
+    return this.key;
+  }
+
+  clear() {
+    this.signature = "";
+    this.key = "";
+  }
+}
+
+export function retainIdempotencyOnError(error: unknown) {
+  return !(error instanceof ApiError) ||
+    error.status >= 500 ||
+    error.status === 429;
+}
+
 export function parseAgentUsage(value: unknown): AgentUsage | null {
   if (
     !isRecord(value) ||
     !onlyKeys(value, [
       "agentId", "name", "tokenCount", "activeTokens", "lastUsedAt",
     ]) ||
-    !validID(value.agentId) ||
+    !validPrefixedRawURLID(value.agentId, "agt_", 16) ||
     !safeText(value.name, 256) ||
     !nonNegativeInteger(value.tokenCount) ||
     !nonNegativeInteger(value.activeTokens) ||
@@ -69,7 +93,7 @@ export function parseAgentRecord(value: unknown): AgentRecord | null {
   if (
     !isRecord(value) ||
     !onlyKeys(value, ["id", "name", "createdAt", "updatedAt"]) ||
-    !validID(value.id) ||
+    !validPrefixedRawURLID(value.id, "agt_", 16) ||
     !safeText(value.name, 256) ||
     !validDate(value.createdAt) ||
     !validDate(value.updatedAt)
@@ -85,6 +109,10 @@ export function parseAgentRecord(value: unknown): AgentRecord | null {
 }
 
 export function parseAuditRow(value: unknown): AuditRow | null {
+  const errorCode =
+    typeof (value as Record<string, unknown> | null)?.errorCode === "string"
+      ? (value as Record<string, unknown>).errorCode as string
+      : "";
   if (
     !isRecord(value) ||
     !onlyKeys(value, [
@@ -92,23 +120,26 @@ export function parseAuditRow(value: unknown): AuditRow | null {
       "action", "spaceId", "resourceType", "resourceId", "sourceIp",
       "userAgent", "success", "errorCode", "changeFields", "reason",
     ]) ||
-    !validID(value.id) ||
-    !safeOpaque(value.requestId, 256) ||
-    !validDate(value.createdAt) ||
+    !validAuditIdentifier(value.id) ||
+    !validAuditIdentifier(value.requestId) ||
+    !canonicalRFC3339NanoUTC(value.createdAt) ||
     !["user", "agent", "anonymous"].includes(String(value.actorType)) ||
-    !safeOpaque(value.actorId, 256, true) ||
-    !safeOpaque(value.fingerprint, 256, true) ||
-    !safeOpaque(value.action, 256) ||
-    !optionalID(value.spaceId) ||
-    !safeOpaque(value.resourceType, 128) ||
-    !safeOpaque(value.resourceId, 256, true) ||
-    !safeOpaque(value.sourceIp, 128) ||
-    !safeOpaque(value.userAgent, 2048, true) ||
+    !validAuditIdentifier(value.actorId) ||
+    typeof value.fingerprint !== "string" ||
+    !/^[0-9a-f]{16}$/u.test(value.fingerprint) ||
+    !validAuditAction(value.action) ||
+    !optionalAuditIdentifier(value.spaceId) ||
+    !validAuditResourceType(value.resourceType) ||
+    !optionalAuditIdentifier(value.resourceId) ||
+    !canonicalIP(value.sourceIp) ||
+    !validAuditText(value.userAgent ?? "") ||
     typeof value.success !== "boolean" ||
-    !safeOpaque(value.errorCode, 128, true) ||
+    (value.success
+      ? errorCode !== ""
+      : !/^[A-Z0-9_]{1,128}$/u.test(errorCode)) ||
     !Array.isArray(value.changeFields) ||
-    !value.changeFields.every((field) => safeOpaque(field, 128)) ||
-    !safeOpaque(value.reason, 1024, true)
+    !validAuditChangeFields(value.changeFields) ||
+    !validAuditText(value.reason ?? "")
   ) {
     return null;
   }
@@ -123,7 +154,7 @@ export function parseAuditRow(value: unknown): AuditRow | null {
     resourceId: (value.resourceId as string | undefined) ?? "",
     sourceIp: value.sourceIp as string,
     success: value.success,
-    errorCode: (value.errorCode as string | undefined) ?? "",
+    errorCode,
   };
 }
 
@@ -221,12 +252,8 @@ function validID(value: unknown): value is string {
   return typeof value === "string" && safeID.test(value);
 }
 
-function optionalID(value: unknown) {
-  return value === undefined || validID(value);
-}
-
 function validDate(value: unknown): value is string {
-  return typeof value === "string" && Number.isFinite(Date.parse(value));
+  return canonicalRFC3339NanoUTC(value);
 }
 
 function optionalDate(value: unknown) {
@@ -251,16 +278,179 @@ function safeText(value: unknown, max: number): value is string {
   );
 }
 
-function safeOpaque(
+export function canonicalRFC3339NanoUTC(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/u.exec(
+    value,
+  );
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, fraction] =
+    match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth(year, month) ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return false;
+  }
+  return fraction === undefined || /[1-9]$/u.test(fraction);
+}
+
+function daysInMonth(year: number, month: number) {
+  if (month === 2) {
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    return leap ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+}
+
+function validPrefixedRawURLID(
   value: unknown,
-  max: number,
-  optional = false,
-): value is string | undefined {
-  if (optional && value === undefined) return true;
+  prefix: string,
+  bytes: number,
+): value is string {
   return (
     typeof value === "string" &&
-    (optional || value.length > 0) &&
-    value.length <= max &&
-    !/[\u0000-\u001f\u007f]/u.test(value)
+    value.startsWith(prefix) &&
+    canonicalRawURL(value.slice(prefix.length), bytes)
   );
+}
+
+function canonicalRawURL(value: string, bytes: number) {
+  const expectedLength = Math.ceil(bytes * 8 / 6);
+  if (
+    value.length !== expectedLength ||
+    !/^[A-Za-z0-9_-]+$/u.test(value)
+  ) {
+    return false;
+  }
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const remainder = (bytes * 8) % 6;
+  const final = alphabet.indexOf(value.at(-1) ?? "");
+  if (final < 0) return false;
+  if (remainder === 2 && (final & 0x0f) !== 0) return false;
+  if (remainder === 4 && (final & 0x03) !== 0) return false;
+  return true;
+}
+
+function validAuditIdentifier(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 256 &&
+    /^[A-Za-z0-9_.:@/-]+$/u.test(value)
+  );
+}
+
+function optionalAuditIdentifier(value: unknown) {
+  return value === undefined || validAuditIdentifier(value);
+}
+
+function validAuditAction(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[a-z0-9._]{1,128}$/u.test(value)
+  );
+}
+
+function validAuditResourceType(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[a-z0-9_]{1,128}$/u.test(value)
+  );
+}
+
+function canonicalIP(value: unknown): value is string {
+  if (typeof value !== "string" || value.includes("%")) return false;
+  if (!value.includes(":")) return canonicalIPv4(value);
+  if (
+    value.startsWith("::ffff:") &&
+    canonicalIPv4(value.slice("::ffff:".length))
+  ) {
+    return true;
+  }
+  try {
+    const parsed = new URL(`http://[${value}]/`);
+    return parsed.hostname === `[${value}]`;
+  } catch {
+    return false;
+  }
+}
+
+function canonicalIPv4(value: string) {
+  const parts = value.split(".");
+  return (
+    parts.length === 4 &&
+    parts.every((part) =>
+      /^(?:0|[1-9]\d{0,2})$/u.test(part) &&
+      Number(part) <= 255
+    )
+  );
+}
+
+const allowedAuditChangeFields = new Set([
+  "display_name",
+  "tags",
+  "asset_links",
+  "credential_type",
+  "expires_at",
+  "deleted_at",
+  "name",
+  "description",
+  "role",
+  "space_grants",
+  "token_status",
+  "system_role",
+  "version",
+]);
+
+function validAuditChangeFields(value: unknown[]) {
+  const seen = new Set<string>();
+  for (const field of value) {
+    if (
+      typeof field !== "string" ||
+      !allowedAuditChangeFields.has(field) ||
+      seen.has(field)
+    ) {
+      return false;
+    }
+    seen.add(field);
+  }
+  return true;
+}
+
+function validAuditText(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const first = value.charCodeAt(index);
+    if (first <= 0x1f || (first >= 0x7f && first <= 0x9f)) return false;
+    if (first <= 0x7f) {
+      bytes += 1;
+    } else if (first <= 0x7ff) {
+      bytes += 2;
+    } else if (first >= 0xd800 && first <= 0xdbff) {
+      const second = value.charCodeAt(index + 1);
+      if (second < 0xdc00 || second > 0xdfff) return false;
+      bytes += 4;
+      index += 1;
+    } else if (first >= 0xdc00 && first <= 0xdfff) {
+      return false;
+    } else {
+      bytes += 3;
+    }
+    if (bytes > 512) return false;
+  }
+  return true;
 }

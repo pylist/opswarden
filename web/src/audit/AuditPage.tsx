@@ -77,6 +77,7 @@ export function AuditPage({
     if (!allowed || !space || !sessionActive) return;
     if (!after) {
       cursorFlow.current.reset();
+      setItems([]);
       setNextCursor("");
     }
     const attempt = cursorFlow.current.begin(after);
@@ -167,6 +168,14 @@ export function AuditPage({
   }, [from, items, requestID, result, to]);
 
   function changeFilter(key: keyof SupportedFilters, value: string) {
+    generation.current += 1;
+    controller.current?.abort();
+    controller.current = null;
+    cursorFlow.current.reset();
+    setItems([]);
+    setNextCursor("");
+    setError("");
+    setLoading(true);
     setFilters((current) => ({ ...current, [key]: value.trim() }));
   }
 
@@ -346,6 +355,16 @@ export function AuditPage({
           onClick={() => void load(nextCursor)}
         >
           {loading ? "正在加载…" : "加载更多审计事件"}
+        </button>
+      )}
+      {error && !nextCursor && (
+        <button
+          className="secondary-button top-gap"
+          type="button"
+          disabled={loading}
+          onClick={() => void load()}
+        >
+          重新加载审计
         </button>
       )}
     </>

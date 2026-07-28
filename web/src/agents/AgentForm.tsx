@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 
 import {
-  newIdempotencyKey,
+  MemoryIdempotencyIntent,
   parseAgentRecord,
+  retainIdempotencyOnError,
   type AgentRecord,
 } from "../admin-api";
 import { apiPath, formatApiError } from "../api/client";
@@ -30,6 +31,7 @@ export function AgentForm({ api, onClose, onCreated }: AgentFormProps) {
   const submitting = useRef(false);
   const generation = useRef(0);
   const operation = useRef<PrivilegedOperation | null>(null);
+  const idempotency = useRef(new MemoryIdempotencyIntent());
 
   const invalidate = useCallback((force = false) => {
     if (operation.current?.phase === "mutation" && !force) return false;
@@ -43,12 +45,14 @@ export function AgentForm({ api, onClose, onCreated }: AgentFormProps) {
 
   useEffect(() => () => {
     invalidate(true);
+    idempotency.current.clear();
     setName("");
     setTotp("");
   }, [invalidate]);
 
   function close() {
     if (!invalidate()) return;
+    idempotency.current.clear();
     setName("");
     setTotp("");
     onClose();
@@ -75,6 +79,8 @@ export function AgentForm({ api, onClose, onCreated }: AgentFormProps) {
     submitting.current = true;
     setPhase("reverify");
     setError("");
+    const intentSignature = JSON.stringify({ name: trimmed });
+    const idempotencyKey = idempotency.current.keyFor(intentSignature);
     try {
       await api.reverifyTOTP(totp, current.controller.signal);
       if (!operationCurrent(operation.current, current)) return;
@@ -83,7 +89,7 @@ export function AgentForm({ api, onClose, onCreated }: AgentFormProps) {
       const value = await api.request<unknown>(apiPath(["agents"]), {
         method: "POST",
         body: { name: trimmed },
-        headers: { "Idempotency-Key": newIdempotencyKey() },
+        headers: { "Idempotency-Key": idempotencyKey },
         signal: current.controller.signal,
       });
       if (!operationCurrent(operation.current, current)) return;
@@ -96,10 +102,14 @@ export function AgentForm({ api, onClose, onCreated }: AgentFormProps) {
       submitting.current = false;
       setName("");
       setTotp("");
+      idempotency.current.clear();
       onCreated(created);
       onClose();
     } catch (caught) {
       if (operationCurrent(operation.current, current)) {
+        if (!retainIdempotencyOnError(caught)) {
+          idempotency.current.clear();
+        }
         setError(formatApiError(caught));
       }
     } finally {
@@ -201,6 +211,7 @@ export function AgentGrantForm({
   const submitting = useRef(false);
   const generation = useRef(0);
   const operation = useRef<PrivilegedOperation | null>(null);
+  const idempotency = useRef(new MemoryIdempotencyIntent());
 
   const invalidate = useCallback((force = false) => {
     if (operation.current?.phase === "mutation" && !force) return false;
@@ -214,11 +225,13 @@ export function AgentGrantForm({
 
   useEffect(() => () => {
     invalidate(true);
+    idempotency.current.clear();
     setTotp("");
   }, [invalidate]);
 
   function close() {
     if (!invalidate()) return;
+    idempotency.current.clear();
     setTotp("");
     onClose();
   }
@@ -255,6 +268,13 @@ export function AgentGrantForm({
     submitting.current = true;
     setPhase("reverify");
     setError("");
+    const intentSignature = JSON.stringify({
+      agentID,
+      spaceID: space.id,
+      scopes,
+      requiredLabels: key ? { [key]: value } : {},
+    });
+    const idempotencyKey = idempotency.current.keyFor(intentSignature);
     try {
       await api.reverifyTOTP(totp, current.controller.signal);
       if (!operationCurrent(operation.current, current)) return;
@@ -269,7 +289,7 @@ export function AgentGrantForm({
             scopes,
             requiredLabels: key ? { [key]: value } : {},
           },
-          headers: { "Idempotency-Key": newIdempotencyKey() },
+          headers: { "Idempotency-Key": idempotencyKey },
           signal: current.controller.signal,
         },
       );
@@ -278,10 +298,14 @@ export function AgentGrantForm({
       generation.current += 1;
       submitting.current = false;
       setTotp("");
+      idempotency.current.clear();
       onSaved();
       onClose();
     } catch (caught) {
       if (operationCurrent(operation.current, current)) {
+        if (!retainIdempotencyOnError(caught)) {
+          idempotency.current.clear();
+        }
         setError(formatApiError(caught));
       }
     } finally {

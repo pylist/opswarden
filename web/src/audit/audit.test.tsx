@@ -13,10 +13,12 @@ const space: Space = {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function apiFor(
@@ -35,7 +37,7 @@ const event = {
   createdAt: "2026-07-28T12:00:00Z",
   actorType: "user",
   actorId: "usr_1",
-  fingerprint: "fingerprint",
+  fingerprint: "0123456789abcdef",
   action: "credential.read",
   spaceId: "spc_prod",
   resourceType: "credential",
@@ -43,7 +45,7 @@ const event = {
   sourceIp: "10.0.0.8",
   userAgent: "fixture",
   success: true,
-  changeFields: ["password"],
+  changeFields: ["display_name"],
   reason: "unsafe reason fixture",
 };
 
@@ -150,5 +152,47 @@ describe("audit page", () => {
     expect(await screen.findByRole("alert")).toBeVisible();
     expect(document.body).not.toHaveTextContent("owat_audit_hostile_plaintext");
     expect(screen.queryByText("req_1")).toBeNull();
+  });
+
+  it("detaches old evidence immediately when server filters change and keeps it clear on failure", async () => {
+    const filtered = deferred<unknown>();
+    let retry = false;
+    const api = apiFor(async (path) => {
+      if (!path.includes("action=credential.read")) return { items: [event] };
+      if (!retry) return filtered.promise;
+      return {
+        items: [{
+          ...event,
+          id: "aud_filtered",
+          requestId: "req_filtered",
+        }],
+      };
+    });
+    render(
+      <AuditPage
+        api={api}
+        space={space}
+        systemRole="member"
+        sessionActive
+      />,
+    );
+    expect(await screen.findByText("req_1")).toBeVisible();
+    fireEvent.change(screen.getByLabelText("动作"), {
+      target: { value: "credential.read" },
+    });
+    expect(screen.queryByText("req_1")).toBeNull();
+    await act(async () => {
+      filtered.reject(new Error("network"));
+      try {
+        await filtered.promise;
+      } catch {
+        // Expected network failure.
+      }
+    });
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.queryByText("req_1")).toBeNull();
+    retry = true;
+    fireEvent.click(screen.getByRole("button", { name: "重新加载审计" }));
+    expect(await screen.findByText("req_filtered")).toBeVisible();
   });
 });
