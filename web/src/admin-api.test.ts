@@ -8,8 +8,8 @@ import {
   parseMember,
 } from "./admin-api";
 
-const agentID = "agt_AAAAAAAAAAAAAAAAAAAAAA";
-const tokenID = "tok_AAAAAAAAAAAAAAAAAAAAAA";
+const agentID = "agt_0123456789abcdef0123456789abcdef";
+const tokenID = "tok_0123456789abcdef0123456789abcdef";
 
 describe("strict administration contracts", () => {
   it("retains one memory-only key per unchanged intent and rotates on intent reset", () => {
@@ -62,8 +62,10 @@ describe("strict administration contracts", () => {
   it("rejects noncanonical Agent and Token identifier shapes", () => {
     for (const id of [
       "agt_1",
-      "agt_AAAAAAAAAAAAAAAAAAAAA",
-      "agt_AAAAAAAAAAAAAAAAAAAAAB",
+      "agt_0123456789abcdef0123456789abcde",
+      "agt_0123456789abcdef0123456789abcdef0",
+      "agt_0123456789abcdef0123456789abcdeg",
+      "agt_0123456789ABCDEF0123456789ABCDEF",
       tokenID,
     ]) {
       expect(parseAgentRecord({
@@ -132,5 +134,30 @@ describe("strict administration contracts", () => {
       success: false,
       errorCode: "",
     })).toBeNull();
+  });
+
+  it("matches netip canonical IPv4-mapped IPv6 rendering", () => {
+    const base = {
+      id: "aud_1",
+      requestId: "req_1",
+      createdAt: "2026-07-28T12:00:00Z",
+      actorType: "agent",
+      actorId: agentID,
+      fingerprint: "0123456789abcdef",
+      action: "credential.read",
+      resourceType: "credential",
+      sourceIp: "::ffff:192.0.2.1",
+      success: true,
+      changeFields: [],
+    };
+    expect(parseAuditRow(base)).not.toBeNull();
+    for (const sourceIp of [
+      "::ffff:c000:201",
+      "::FFFF:192.0.2.1",
+      "::ffff:192.000.2.1",
+      "::ffff:192.0.2.01",
+    ]) {
+      expect(parseAuditRow({ ...base, sourceIp })).toBeNull();
+    }
   });
 });

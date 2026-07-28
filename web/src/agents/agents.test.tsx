@@ -53,7 +53,7 @@ describe("Agent administration", () => {
       }
       if (path === "/api/v1/agents" && options?.method === "POST") {
         return {
-          id: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "agt_0123456789abcdef0123456789abcdef",
           name: "Hermes",
           createdAt: "2026-07-28T12:00:00Z",
           updatedAt: "2026-07-28T12:00:00Z",
@@ -95,17 +95,17 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
           }],
         };
       }
-      if (path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens" &&
+      if (path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens" &&
           options?.method === "POST") {
         return {
-          id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "tok_0123456789abcdef0123456789abcdef",
           prefix: "owat_AAAAAAAA",
           token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           replayed: false,
@@ -130,7 +130,7 @@ describe("Agent administration", () => {
     expect(await screen.findByText("owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).toBeVisible();
     expect(api.reverifyTOTP).toHaveBeenCalledTimes(1);
     expect(api.request).toHaveBeenCalledWith(
-      "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens",
+      "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens",
       expect.objectContaining({
         method: "POST",
         headers: expect.anything(),
@@ -141,7 +141,7 @@ describe("Agent administration", () => {
     expect(screen.queryByText("owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).toBeNull();
     expect(
       api.request.mock.calls.filter(
-        ([path]) => path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens",
+        ([path]) => path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens",
       ),
     ).toHaveLength(1);
   });
@@ -152,14 +152,14 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
           }],
         };
       }
-      if (path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens") return issue.promise;
+      if (path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens") return issue.promise;
       throw new Error(`unexpected ${path}`);
     });
     const rendered = render(
@@ -195,14 +195,14 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 1,
             activeTokens: 1,
           }],
         };
       }
-      if (path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/grants") return grant.promise;
+      if (path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/grants") return grant.promise;
       throw new Error(`unexpected ${path}`);
     });
     render(
@@ -230,11 +230,11 @@ describe("Agent administration", () => {
     await waitFor(() => expect(api.reverifyTOTP).toHaveBeenCalledTimes(1));
     expect(
       api.request.mock.calls.filter(
-        ([path]) => path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/grants",
+        ([path]) => path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/grants",
       ),
     ).toHaveLength(1);
     expect(api.request).toHaveBeenCalledWith(
-      "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/grants",
+      "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/grants",
       expect.objectContaining({
         method: "PUT",
         body: {
@@ -273,7 +273,7 @@ describe("Agent administration", () => {
           hostileList = false;
           return {
             items: [{
-              agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+              agentId: "agt_0123456789abcdef0123456789abcdef",
               name: "Hermes",
               tokenCount: 0,
               activeTokens: 0,
@@ -283,16 +283,16 @@ describe("Agent administration", () => {
         }
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
           }],
         };
       }
-      if (path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens") {
+      if (path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens") {
         return {
-          id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "tok_0123456789abcdef0123456789abcdef",
           prefix: "owat_AAAAAAAA",
           token: "owat_hostile_issue_plaintext",
           replayed: false,
@@ -327,7 +327,7 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 1,
             activeTokens: 1,
@@ -335,18 +335,18 @@ describe("Agent administration", () => {
         };
       }
       if (
-        path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens" &&
+        path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens" &&
         options?.method === "POST"
       ) {
         return {
-          id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "tok_0123456789abcdef0123456789abcdef",
           prefix: "owat_AAAAAAAA",
           token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           replayed: false,
         };
       }
       if (
-        path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens/tok_AAAAAAAAAAAAAAAAAAAAAA" &&
+        path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens/tok_0123456789abcdef0123456789abcdef" &&
         options?.method === "DELETE"
       ) {
         return undefined;
@@ -382,7 +382,7 @@ describe("Agent administration", () => {
     fireEvent.click(screen.getByRole("button", { name: "验证并吊销" }));
     await waitFor(() => {
       expect(api.request).toHaveBeenCalledWith(
-        "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens/tok_AAAAAAAAAAAAAAAAAAAAAA",
+        "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens/tok_0123456789abcdef0123456789abcdef",
         expect.objectContaining({ method: "DELETE" }),
       );
     });
@@ -394,16 +394,16 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
           }],
         };
       }
-      if (path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens") {
+      if (path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens") {
         return {
-          id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "tok_0123456789abcdef0123456789abcdef",
           prefix: "owat_AAAAAAAA",
           token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           expiresAt: "2030-01-02T03:04:00Z",
@@ -433,7 +433,7 @@ describe("Agent administration", () => {
       .toISOString()
       .replace(/\.000Z$/u, "Z");
     expect(api.request).toHaveBeenCalledWith(
-      "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens",
+      "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens",
       expect.objectContaining({
         body: { expiresAt: canonicalExpiry },
       }),
@@ -445,16 +445,16 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
           }],
         };
       }
-      if (path === "/api/v1/agents/agt_AAAAAAAAAAAAAAAAAAAAAA/tokens") {
+      if (path === "/api/v1/agents/agt_0123456789abcdef0123456789abcdef/tokens") {
         return {
-          id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "tok_0123456789abcdef0123456789abcdef",
           prefix: "owat_AAAAAAAA",
           token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           replayed: false,
@@ -499,7 +499,7 @@ describe("Agent administration", () => {
         attempt += 1;
         if (attempt === 1) throw new Error("lost response");
         return {
-          id: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "agt_0123456789abcdef0123456789abcdef",
           name: "Hermes",
           createdAt: "2026-07-28T12:00:00Z",
           updatedAt: "2026-07-28T12:00:00Z",
@@ -540,7 +540,7 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
@@ -552,7 +552,7 @@ describe("Agent administration", () => {
         attempt += 1;
         if (attempt === 1) {
           return {
-            id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+            id: "tok_0123456789abcdef0123456789abcdef",
             prefix: "owat_AAAAAAAA",
             token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             replayed: false,
@@ -560,7 +560,7 @@ describe("Agent administration", () => {
           };
         }
         return {
-          id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "tok_0123456789abcdef0123456789abcdef",
           prefix: "owat_AAAAAAAA",
           token: "",
           replayed: true,
@@ -585,7 +585,7 @@ describe("Agent administration", () => {
     expect(await screen.findByRole("alert")).toBeVisible();
     fireEvent.click(submit);
     expect(await screen.findByText(/首次响应中的完整 Token 已无法恢复/)).toBeVisible();
-    expect(screen.getByText("tok_AAAAAAAAAAAAAAAAAAAAAA")).toBeVisible();
+    expect(screen.getByText("tok_0123456789abcdef0123456789abcdef")).toBeVisible();
     expect(screen.getByText("owat_AAAAAAAA")).toBeVisible();
     expect(screen.getByRole("button", { name: "立即吊销 Token" })).toBeVisible();
     expect(keys).toHaveLength(2);
@@ -599,7 +599,7 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
@@ -611,7 +611,7 @@ describe("Agent administration", () => {
         attempt += 1;
         if (attempt === 1) throw new Error("lost response");
         return {
-          id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "tok_0123456789abcdef0123456789abcdef",
           prefix: "owat_AAAAAAAA",
           token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           expiresAt: new Date("2030-01-02T03:04")
@@ -653,7 +653,7 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
@@ -696,7 +696,7 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 1,
             activeTokens: 1,
@@ -705,13 +705,13 @@ describe("Agent administration", () => {
       }
       if (path.endsWith("/tokens") && options?.method === "POST") {
         return {
-          id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "tok_0123456789abcdef0123456789abcdef",
           prefix: "owat_AAAAAAAA",
           token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
           replayed: false,
         };
       }
-      if (path.endsWith("/tokens/tok_AAAAAAAAAAAAAAAAAAAAAA")) {
+      if (path.endsWith("/tokens/tok_0123456789abcdef0123456789abcdef")) {
         revokeKeys.push(idempotencyKey(options));
         revokeAttempt += 1;
         if (revokeAttempt === 1) throw new Error("lost response");
@@ -752,7 +752,7 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
@@ -764,7 +764,7 @@ describe("Agent administration", () => {
         attempt += 1;
         if (attempt === 1) throw new Error("lost response");
         return {
-          id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+          id: "tok_0123456789abcdef0123456789abcdef",
           prefix: "owat_AAAAAAAA",
           token: "",
           replayed: true,
@@ -808,9 +808,27 @@ describe("Agent administration", () => {
       },
     },
     {
+      name: "uppercase Token ID",
+      response: {
+        id: "tok_0123456789ABCDEF0123456789ABCDEF",
+        prefix: "owat_AAAAAAAA",
+        token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        replayed: false,
+      },
+    },
+    {
+      name: "nonhex Token ID",
+      response: {
+        id: "tok_0123456789abcdef0123456789abcdeg",
+        prefix: "owat_AAAAAAAA",
+        token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        replayed: false,
+      },
+    },
+    {
       name: "prefix mismatch",
       response: {
-        id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+        id: "tok_0123456789abcdef0123456789abcdef",
         prefix: "owat_BBBBBBBB",
         token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         replayed: false,
@@ -819,7 +837,7 @@ describe("Agent administration", () => {
     {
       name: "noncanonical expiry",
       response: {
-        id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+        id: "tok_0123456789abcdef0123456789abcdef",
         prefix: "owat_AAAAAAAA",
         token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         expiresAt: "2030-01-02T03:04:00+00:00",
@@ -831,7 +849,7 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: 0,
             activeTokens: 0,
@@ -869,7 +887,7 @@ describe("Agent administration", () => {
       if (path === "/api/v1/agents" && !options?.method) {
         return {
           items: [{
-            agentId: "agt_AAAAAAAAAAAAAAAAAAAAAA",
+            agentId: "agt_0123456789abcdef0123456789abcdef",
             name: "Hermes",
             tokenCount: attempt,
             activeTokens: attempt,
@@ -881,13 +899,13 @@ describe("Agent administration", () => {
         attempt += 1;
         return attempt === 1
           ? {
-              id: "tok_AAAAAAAAAAAAAAAAAAAAAA",
+              id: "tok_0123456789abcdef0123456789abcdef",
               prefix: "owat_AAAAAAAA",
               token: "owat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
               replayed: false,
             }
           : {
-              id: `tok_${"B".repeat(21)}A`,
+              id: "tok_fedcba9876543210fedcba9876543210",
               prefix: "owat_BBBBBBBB",
               token: secondToken,
               replayed: false,

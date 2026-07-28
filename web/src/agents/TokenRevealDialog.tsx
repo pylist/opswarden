@@ -406,7 +406,7 @@ function parseIssuedAgentToken(value: unknown): {
   if (
     Object.keys(candidate).some((key) => !allowed.has(key)) ||
     typeof candidate.id !== "string" ||
-    !validPrefixedRawURL(candidate.id, "tok_", 16) ||
+    !/^tok_[0-9a-f]{32}$/u.test(candidate.id) ||
     typeof candidate.prefix !== "string" ||
     !/^owat_[A-Za-z0-9_-]{8}$/u.test(candidate.prefix) ||
     typeof candidate.token !== "string" ||

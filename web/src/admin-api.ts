@@ -69,7 +69,7 @@ export function parseAgentUsage(value: unknown): AgentUsage | null {
     !onlyKeys(value, [
       "agentId", "name", "tokenCount", "activeTokens", "lastUsedAt",
     ]) ||
-    !validPrefixedRawURLID(value.agentId, "agt_", 16) ||
+    !validHexID(value.agentId, "agt_") ||
     !safeText(value.name, 256) ||
     !nonNegativeInteger(value.tokenCount) ||
     !nonNegativeInteger(value.activeTokens) ||
@@ -93,7 +93,7 @@ export function parseAgentRecord(value: unknown): AgentRecord | null {
   if (
     !isRecord(value) ||
     !onlyKeys(value, ["id", "name", "createdAt", "updatedAt"]) ||
-    !validPrefixedRawURLID(value.id, "agt_", 16) ||
+    !validHexID(value.id, "agt_") ||
     !safeText(value.name, 256) ||
     !validDate(value.createdAt) ||
     !validDate(value.updatedAt)
@@ -314,34 +314,12 @@ function daysInMonth(year: number, month: number) {
   return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 
-function validPrefixedRawURLID(
-  value: unknown,
-  prefix: string,
-  bytes: number,
-): value is string {
+function validHexID(value: unknown, prefix: string): value is string {
   return (
     typeof value === "string" &&
     value.startsWith(prefix) &&
-    canonicalRawURL(value.slice(prefix.length), bytes)
+    /^[0-9a-f]{32}$/u.test(value.slice(prefix.length))
   );
-}
-
-function canonicalRawURL(value: string, bytes: number) {
-  const expectedLength = Math.ceil(bytes * 8 / 6);
-  if (
-    value.length !== expectedLength ||
-    !/^[A-Za-z0-9_-]+$/u.test(value)
-  ) {
-    return false;
-  }
-  const alphabet =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-  const remainder = (bytes * 8) % 6;
-  const final = alphabet.indexOf(value.at(-1) ?? "");
-  if (final < 0) return false;
-  if (remainder === 2 && (final & 0x0f) !== 0) return false;
-  if (remainder === 4 && (final & 0x03) !== 0) return false;
-  return true;
 }
 
 function validAuditIdentifier(value: unknown): value is string {
@@ -374,11 +352,8 @@ function validAuditResourceType(value: unknown): value is string {
 function canonicalIP(value: unknown): value is string {
   if (typeof value !== "string" || value.includes("%")) return false;
   if (!value.includes(":")) return canonicalIPv4(value);
-  if (
-    value.startsWith("::ffff:") &&
-    canonicalIPv4(value.slice("::ffff:".length))
-  ) {
-    return true;
+  if (value.startsWith("::ffff:")) {
+    return canonicalIPv4(value.slice("::ffff:".length));
   }
   try {
     const parsed = new URL(`http://[${value}]/`);

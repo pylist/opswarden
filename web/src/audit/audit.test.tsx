@@ -25,10 +25,11 @@ function apiFor(
   implementation: (path: string, options?: { signal?: AbortSignal }) =>
     Promise<unknown>,
 ) {
+  const request = vi.fn(implementation);
   return {
-    request: vi.fn(implementation),
+    request,
     reverifyTOTP: vi.fn(),
-  } as unknown as WorkflowAPI;
+  } as unknown as WorkflowAPI & { request: typeof request };
 }
 
 const event = {
@@ -193,6 +194,55 @@ describe("audit page", () => {
     expect(screen.queryByText("req_1")).toBeNull();
     retry = true;
     fireEvent.click(screen.getByRole("button", { name: "重新加载审计" }));
+    expect(await screen.findByText("req_filtered")).toBeVisible();
+  });
+
+  it("does not detach ready or in-flight evidence for normalized no-op filters", async () => {
+    const pending = deferred<unknown>();
+    let actionSignal: AbortSignal | undefined;
+    const api = apiFor(async (path, options) => {
+      if (path.includes("action=credential.read")) {
+        actionSignal = options?.signal;
+        return pending.promise;
+      }
+      return { items: [event] };
+    });
+    render(
+      <AuditPage
+        api={api}
+        space={space}
+        systemRole="member"
+        sessionActive
+      />,
+    );
+    expect(await screen.findByText("req_1")).toBeVisible();
+    const callsAtReady = api.request.mock.calls.length;
+    fireEvent.change(screen.getByLabelText("主体 ID"), {
+      target: { value: "   " },
+    });
+    expect(screen.getByText("req_1")).toBeVisible();
+    expect(api.request).toHaveBeenCalledTimes(callsAtReady);
+
+    fireEvent.change(screen.getByLabelText("动作"), {
+      target: { value: "credential.read" },
+    });
+    await waitFor(() => expect(actionSignal).toBeDefined());
+    const callsInFlight = api.request.mock.calls.length;
+    fireEvent.change(screen.getByLabelText("动作"), {
+      target: { value: "credential.read" },
+    });
+    expect(api.request).toHaveBeenCalledTimes(callsInFlight);
+    expect(actionSignal?.aborted).toBe(false);
+    await act(async () => {
+      pending.resolve({
+        items: [{
+          ...event,
+          id: "aud_filtered",
+          requestId: "req_filtered",
+        }],
+      });
+      await pending.promise;
+    });
     expect(await screen.findByText("req_filtered")).toBeVisible();
   });
 });

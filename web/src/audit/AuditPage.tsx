@@ -168,6 +168,8 @@ export function AuditPage({
   }, [from, items, requestID, result, to]);
 
   function changeFilter(key: keyof SupportedFilters, value: string) {
+    const normalized = value.trim();
+    if (filters[key] === normalized) return;
     generation.current += 1;
     controller.current?.abort();
     controller.current = null;
@@ -176,7 +178,7 @@ export function AuditPage({
     setNextCursor("");
     setError("");
     setLoading(true);
-    setFilters((current) => ({ ...current, [key]: value.trim() }));
+    setFilters((current) => ({ ...current, [key]: normalized }));
   }
 
   if (!space) {
