@@ -3,10 +3,12 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -131,6 +133,21 @@ type bearerTransport struct {
 	token string
 }
 
+type countingReadCloser struct {
+	reader io.Reader
+	bytes  int
+	reads  int
+}
+
+func (reader *countingReadCloser) Read(destination []byte) (int, error) {
+	reader.reads++
+	count, err := reader.reader.Read(destination)
+	reader.bytes += count
+	return count, err
+}
+
+func (*countingReadCloser) Close() error { return nil }
+
 func (transport bearerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	clone := request.Clone(request.Context())
 	clone.Header.Set("Authorization", "Bearer "+transport.token)
@@ -190,6 +207,23 @@ func TestOfficialClientDiscoversExactApprovedTools(t *testing.T) {
 		if (tool.Name == "credential_get" || tool.Name == "totp_generate") &&
 			!strings.Contains(tool.Description, "敏感") {
 			t.Fatalf("%s description does not mark sensitive output", tool.Name)
+		}
+		requiredDescriptionTerms := map[string][]string{
+			"credential_create": {"reason", "idempotency_key"},
+			"credential_update": {
+				"reason", "idempotency_key", "expected_version",
+			},
+			"credential_delete": {
+				"reason", "idempotency_key", "expected_version",
+			},
+		}
+		for _, term := range requiredDescriptionTerms[tool.Name] {
+			if !strings.Contains(tool.Description, term) {
+				t.Fatalf(
+					"%s description %q does not mention required %s",
+					tool.Name, tool.Description, term,
+				)
+			}
 		}
 	}
 	slices.Sort(got)
@@ -446,6 +480,217 @@ func TestBatchIsRejectedBeforeAuthenticationQuotaAndDomainWork(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOriginHeaderPresenceIsRejectedBeforeBodyOrProtectedWork(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		values []string
+	}{
+		{name: "empty", values: []string{""}},
+		{name: "multiple first empty", values: []string{"", "https://example.test"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+			authenticator := &fakeAuthenticator{}
+			limiter := agents.NewLimiter(agents.LimiterConfig{})
+			auditRecorder := &recordingAudit{}
+			handler, err := New(Dependencies{
+				Agents: authenticator, AuthAudit: auditRecorder,
+				Credentials: &fakeCredentialService{}, Assets: &fakeAssetService{},
+				Clock: fixedClock{now: now}, Limiter: limiter,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := &countingReadCloser{reader: strings.NewReader(
+				`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+			)}
+			request := httptest.NewRequest(
+				http.MethodPost, "http://opswarden.test/mcp", nil,
+			)
+			request.Body = body
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Accept", "application/json, text/event-stream")
+			request.Header["Origin"] = test.values
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf(
+					"status=%d body=%s", response.Code, response.Body.String(),
+				)
+			}
+			inspects, auths := authenticator.counts()
+			if body.bytes != 0 || body.reads != 0 || limiter.SubjectCount() != 0 ||
+				inspects != 0 || auths != 0 || len(auditRecorder.events) != 0 {
+				t.Fatalf(
+					"Origin reached protected work: bytes=%d reads=%d subjects=%d inspect=%d auth=%d audit=%d",
+					body.bytes, body.reads, limiter.SubjectCount(),
+					inspects, auths, len(auditRecorder.events),
+				)
+			}
+		})
+	}
+}
+
+func TestLongWhitespacePrefixIsRejectedWithConstantReadAndNoQuota(t *testing.T) {
+	now := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+	authenticator := &fakeAuthenticator{}
+	limiter := agents.NewLimiter(agents.LimiterConfig{})
+	auditRecorder := &recordingAudit{}
+	handler, err := New(Dependencies{
+		Agents: authenticator, AuthAudit: auditRecorder,
+		Credentials: &fakeCredentialService{}, Assets: &fakeAssetService{},
+		Clock: fixedClock{now: now}, Limiter: limiter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := &countingReadCloser{
+		reader: strings.NewReader(strings.Repeat(" ", 4096) + "["),
+	}
+	request := httptest.NewRequest(
+		http.MethodPost, "http://opswarden.test/mcp", nil,
+	)
+	request.Body = body
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	inspects, auths := authenticator.counts()
+	if body.bytes > 64 || body.reads > 64 || limiter.SubjectCount() != 0 ||
+		inspects != 0 || auths != 0 || len(auditRecorder.events) != 0 {
+		t.Fatalf(
+			"whitespace prefix work was not bounded: bytes=%d reads=%d subjects=%d inspect=%d auth=%d audit=%d",
+			body.bytes, body.reads, limiter.SubjectCount(),
+			inspects, auths, len(auditRecorder.events),
+		)
+	}
+}
+
+func TestGenericSourceQuotaPrecedesFullObjectDecode(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "many unique fields", body: nearLimitUniqueFieldObject()},
+		{name: "deep object", body: nearLimitDeepObject()},
+		{name: "malformed object", body: "{" + strings.Repeat(" ", int(maxRequestBytes)-2)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+			authenticator := &fakeAuthenticator{}
+			limiter := agents.NewLimiter(agents.LimiterConfig{
+				Capacity: map[agents.Operation]int{
+					agents.OperationAgentRequestWriteSource: 2,
+				},
+				RefillPerSecond: map[agents.Operation]float64{
+					agents.OperationAgentRequestWriteSource: 0.000001,
+				},
+			})
+			auditRecorder := &recordingAudit{}
+			credentialService := &fakeCredentialService{}
+			handler, err := New(Dependencies{
+				Agents: authenticator, AuthAudit: auditRecorder,
+				Credentials: credentialService, Assets: &fakeAssetService{},
+				Clock: fixedClock{now: now}, Limiter: limiter,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var readers []*countingReadCloser
+			for attempt := range 3 {
+				body := &countingReadCloser{
+					reader: strings.NewReader(test.body),
+				}
+				readers = append(readers, body)
+				request := httptest.NewRequest(
+					http.MethodPost, "http://opswarden.test/mcp", nil,
+				)
+				request.Body = body
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set(
+					"Accept", "application/json, text/event-stream",
+				)
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				want := http.StatusBadRequest
+				if attempt == 2 {
+					want = http.StatusTooManyRequests
+				}
+				if response.Code != want {
+					t.Fatalf(
+						"attempt %d status=%d want=%d body=%s",
+						attempt+1, response.Code, want, response.Body.String(),
+					)
+				}
+			}
+			if readers[0].bytes != len(test.body) ||
+				readers[1].bytes != len(test.body) {
+				t.Fatalf(
+					"allowed requests were not fully read: got %d/%d want %d",
+					readers[0].bytes, readers[1].bytes, len(test.body),
+				)
+			}
+			if readers[2].bytes > 64 || readers[2].reads > 64 {
+				t.Fatalf(
+					"rate-limited request reached full decode: bytes=%d reads=%d",
+					readers[2].bytes, readers[2].reads,
+				)
+			}
+			inspects, auths := authenticator.counts()
+			if inspects != 0 || auths != 0 ||
+				credentialService.createCalls != 0 ||
+				len(auditRecorder.events) != 0 {
+				t.Fatalf(
+					"invalid object reached domain: inspect=%d auth=%d create=%d audit=%d",
+					inspects, auths, credentialService.createCalls,
+					len(auditRecorder.events),
+				)
+			}
+		})
+	}
+}
+
+func nearLimitUniqueFieldObject() string {
+	var body strings.Builder
+	body.Grow(int(maxRequestBytes) - 1024)
+	body.WriteByte('{')
+	for index := 0; body.Len() < int(maxRequestBytes)-2048; index++ {
+		if index != 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(`"field_`)
+		body.WriteString(strings.Repeat("0", 8-len(strconv.Itoa(index))))
+		body.WriteString(strconv.Itoa(index))
+		body.WriteString(`":"`)
+		body.WriteString(strings.Repeat("x", 96))
+		body.WriteByte('"')
+	}
+	body.WriteByte('}')
+	return body.String()
+}
+
+func nearLimitDeepObject() string {
+	const depth = 24
+	var body strings.Builder
+	body.Grow(int(maxRequestBytes) - 1024)
+	for index := range depth {
+		body.WriteString(`{"level_`)
+		body.WriteString(strconv.Itoa(index))
+		body.WriteString(`":`)
+	}
+	body.WriteString(`{"padding":"`)
+	body.WriteString(strings.Repeat(
+		"x", int(maxRequestBytes)-body.Len()-depth-2048,
+	))
+	body.WriteString(`"}`)
+	body.WriteString(strings.Repeat("}", depth))
+	return body.String()
 }
 
 func TestRateLimitResponseIncludesRetryAfter(t *testing.T) {

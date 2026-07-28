@@ -177,7 +177,9 @@ func registerTools(server *mcp.Server, dependencies Dependencies) error {
 		},
 	}, handleCredentialGet)
 	add(&mcp.Tool{
-		Name: "credential_create", Description: "创建凭据；payload 是敏感数据。",
+		Name: "credential_create",
+		Description: "创建凭据；payload 是敏感数据；必须提供 reason 和 " +
+			"idempotency_key。",
 		InputSchema:  schemaCredentialCreate,
 		OutputSchema: schemaMutationOutput,
 		Annotations: &mcp.ToolAnnotations{
@@ -185,7 +187,9 @@ func registerTools(server *mcp.Server, dependencies Dependencies) error {
 		},
 	}, handleCredentialCreate)
 	add(&mcp.Tool{
-		Name: "credential_update", Description: "按版本更新凭据；payload 是敏感数据。",
+		Name: "credential_update",
+		Description: "按版本更新凭据；payload 是敏感数据；必须提供 reason、" +
+			"idempotency_key 和 expected_version。",
 		InputSchema:  schemaCredentialUpdate,
 		OutputSchema: schemaMutationOutput,
 		Annotations: &mcp.ToolAnnotations{
@@ -193,7 +197,9 @@ func registerTools(server *mcp.Server, dependencies Dependencies) error {
 		},
 	}, handleCredentialUpdate)
 	add(&mcp.Tool{
-		Name: "credential_delete", Description: "按版本将凭据移入回收站。",
+		Name: "credential_delete",
+		Description: "按版本将凭据移入回收站；必须提供 reason、idempotency_key " +
+			"和 expected_version。",
 		InputSchema:  schemaCredentialDelete,
 		OutputSchema: schemaDeleteOutput,
 		Annotations: &mcp.ToolAnnotations{

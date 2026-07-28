@@ -27,7 +27,10 @@ import (
 	"opswarden/internal/platform"
 )
 
-const maxRequestBytes = int64(1 << 20)
+const (
+	maxRequestBytes = int64(1 << 20)
+	maxPrefixBytes  = 64
+)
 
 type AuthenticationAuditRecorder interface {
 	RecordReadBeforeReturn(context.Context, audit.Event) error
@@ -135,7 +138,7 @@ func (handler *handler) ServeHTTP(
 		)
 		return
 	}
-	if request.Header.Get("Origin") != "" {
+	if len(request.Header.Values("Origin")) != 0 {
 		writeTransportError(
 			writer, http.StatusForbidden, "ORIGIN_NOT_ALLOWED", requestID,
 		)
@@ -166,23 +169,15 @@ func (handler *handler) ServeHTTP(
 		)
 		return
 	}
-	request.Body = http.MaxBytesReader(writer, request.Body, maxRequestBytes)
-	encoded, err := io.ReadAll(request.Body)
-	if err != nil || len(bytes.TrimSpace(encoded)) == 0 {
-		writeTransportError(
-			writer, http.StatusRequestEntityTooLarge, "INVALID_REQUEST", requestID,
-		)
-		return
-	}
-	envelope, err := decodeMCPEnvelope(encoded)
-	if err != nil {
+	body := request.Body
+	prefix, first, ok := inspectMCPBodyPrefix(body)
+	defer clear(prefix)
+	if !ok || first != '{' {
 		writeTransportError(
 			writer, http.StatusBadRequest, "INVALID_REQUEST", requestID,
 		)
 		return
 	}
-	request.Body = io.NopCloser(bytes.NewReader(encoded))
-	raw, ok := bearerToken(request.Header.Values("Authorization"))
 	sourceIP := requestSourceIP(request, handler.dependencies.TrustedProxyCIDRs)
 	now := handler.dependencies.Clock.Now().UTC()
 	sourceReservation, sourceDecision := handler.dependencies.Limiter.Reserve(
@@ -197,6 +192,30 @@ func (handler *handler) ServeHTTP(
 		return
 	}
 	sourceReservation.Commit()
+	request.Body = http.MaxBytesReader(
+		writer,
+		&prefixedReadCloser{
+			Reader: io.MultiReader(bytes.NewReader(prefix), body),
+			Closer: body,
+		},
+		maxRequestBytes,
+	)
+	encoded, err := io.ReadAll(request.Body)
+	defer clear(encoded)
+	if err != nil || len(bytes.TrimSpace(encoded)) == 0 {
+		writeTransportError(
+			writer, http.StatusRequestEntityTooLarge, "INVALID_REQUEST", requestID,
+		)
+		return
+	}
+	envelope, err := decodeMCPEnvelope(encoded)
+	if err != nil {
+		writeTransportError(
+			writer, http.StatusBadRequest, "INVALID_REQUEST", requestID,
+		)
+		return
+	}
+	request.Body = io.NopCloser(bytes.NewReader(encoded))
 	operation, sourceOperation := mcpRequestOperation(envelope)
 	// Apply the same credential list/read/write source buckets used by REST once
 	// the bounded JSON-RPC envelope reveals the requested tool.
@@ -213,7 +232,8 @@ func (handler *handler) ServeHTTP(
 		return
 	}
 	operationSourceReservation.Commit()
-	if !ok || !strings.HasPrefix(raw, "owat_") {
+	raw, hasBearer := bearerToken(request.Header.Values("Authorization"))
+	if !hasBearer || !strings.HasPrefix(raw, "owat_") {
 		handler.rejectAuthentication(writer, request, requestID, sourceIP, now)
 		return
 	}
@@ -264,6 +284,32 @@ func (handler *handler) ServeHTTP(
 		sourceIP: sourceIP, userAgent: safeUserAgent(request.UserAgent()),
 	})
 	handler.stream.ServeHTTP(writer, request.WithContext(ctx))
+}
+
+type prefixedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+func inspectMCPBodyPrefix(body io.Reader) ([]byte, byte, bool) {
+	if body == nil {
+		return nil, 0, false
+	}
+	prefix := make([]byte, 0, maxPrefixBytes)
+	var next [1]byte
+	for len(prefix) < maxPrefixBytes {
+		if _, err := io.ReadFull(body, next[:]); err != nil {
+			return prefix, 0, false
+		}
+		prefix = append(prefix, next[0])
+		switch next[0] {
+		case ' ', '\t', '\r', '\n':
+			continue
+		default:
+			return prefix, next[0], true
+		}
+	}
+	return prefix, 0, false
 }
 
 func acceptsMCPResponse(values []string) bool {
