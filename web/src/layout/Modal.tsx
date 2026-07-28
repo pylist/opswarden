@@ -16,7 +16,8 @@ const focusable =
   'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 const initialFocusable =
   'input:not([disabled]):not([readonly]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [href]';
-const modalStack: symbol[] = [];
+type ModalEntry = { token: symbol; element: HTMLElement };
+const modalStack: ModalEntry[] = [];
 
 export function Modal({ labelledBy, onClose, children, compact }: Props) {
   const dialog = useRef<HTMLElement>(null);
@@ -27,22 +28,33 @@ export function Modal({ labelledBy, onClose, children, compact }: Props) {
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
-    modalStack.push(token.current);
+    const element = dialog.current;
+    if (!element) return;
+    const previous = modalStack.at(-1);
+    if (previous) setSuspended(previous.element, true);
+    modalStack.push({ token: token.current, element });
     const target =
-      dialog.current?.querySelector<HTMLElement>("[data-modal-initial-focus]") ??
-      dialog.current?.querySelector<HTMLElement>("[autofocus]") ??
-      dialog.current?.querySelector<HTMLElement>(initialFocusable);
-    (target ?? dialog.current)?.focus();
+      element.querySelector<HTMLElement>("[data-modal-initial-focus]") ??
+      element.querySelector<HTMLElement>("[autofocus]") ??
+      element.querySelector<HTMLElement>(initialFocusable);
+    (target ?? element).focus();
     return () => {
-      const index = modalStack.lastIndexOf(token.current);
+      const index = modalStack.findIndex(
+        (entry) => entry.token === token.current,
+      );
+      const wasTop = index === modalStack.length - 1;
       if (index >= 0) modalStack.splice(index, 1);
+      if (wasTop) {
+        const resumed = modalStack.at(-1);
+        if (resumed) setSuspended(resumed.element, false);
+      }
       if (trigger?.isConnected) trigger.focus();
     };
   }, []);
 
   function onKeyDown(event: KeyboardEvent<HTMLElement>) {
     if (event.key === "Escape") {
-      if (modalStack.at(-1) !== token.current) return;
+      if (modalStack.at(-1)?.token !== token.current) return;
       event.preventDefault();
       event.stopPropagation();
       onClose();
@@ -82,4 +94,14 @@ export function Modal({ labelledBy, onClose, children, compact }: Props) {
       </section>
     </div>
   );
+}
+
+function setSuspended(element: HTMLElement, suspended: boolean) {
+  if (suspended) {
+    element.setAttribute("inert", "");
+    element.setAttribute("aria-hidden", "true");
+  } else {
+    element.removeAttribute("inert");
+    element.removeAttribute("aria-hidden");
+  }
 }

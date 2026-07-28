@@ -885,6 +885,131 @@ tbody tr:last-child td {
   font-size: 14px;
 }
 
+.top-gap {
+  margin-top: 16px;
+}
+
+.scope-fieldset {
+  margin: 8px 0 16px;
+  padding: 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+}
+
+.scope-fieldset legend {
+  padding: 0 6px;
+  color: #374151;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.scope-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+}
+
+.scope-grid .checkbox-row {
+  margin: 0;
+}
+
+.token-reveal-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.token-reveal-row code {
+  min-height: 40px;
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+  color: #111827;
+  background: #f9fafb;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  user-select: all;
+}
+
+.audit-toolbar {
+  margin-bottom: 0;
+}
+
+.audit-filters {
+  margin: 0 0 16px;
+}
+
+.filter-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 16px;
+}
+
+.filter-grid label {
+  display: block;
+  margin: 0 0 6px;
+  font-size: 12px;
+}
+
+.audit-table code,
+td code {
+  overflow-wrap: anywhere;
+  color: #374151;
+  font-size: 12px;
+}
+
+.status-success,
+.status-failure {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.status-success {
+  color: #15803d;
+}
+
+.status-failure {
+  color: #b91c1c;
+}
+
+.member-note {
+  display: block;
+  margin-top: 4px;
+  color: #6b7280;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.settings-summary {
+  margin-bottom: 24px;
+}
+
+.metric-card .metric-text {
+  overflow-wrap: anywhere;
+  font-size: 18px;
+  line-height: 1.35;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.settings-card {
+  min-height: 180px;
+  margin-top: 0;
+}
+
+.settings-state-title {
+  margin: 24px 0 8px;
+  color: #374151;
+  font-size: 15px;
+  font-weight: 650;
+}
+
 .drawer-backdrop {
   display: none;
 }
@@ -970,7 +1095,9 @@ tbody tr:last-child td {
   }
 
   .detail-grid,
-  .form-grid {
+  .form-grid,
+  .filter-grid,
+  .settings-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -991,6 +1118,11 @@ tbody tr:last-child td {
 
   .seed-field input {
     grid-column: 1 / -1;
+  }
+
+  .scope-grid,
+  .token-reveal-row {
+    grid-template-columns: 1fr;
   }
 }
 

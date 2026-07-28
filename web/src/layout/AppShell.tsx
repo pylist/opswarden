@@ -6,6 +6,10 @@ import { useAuth } from "../auth/AuthProvider";
 import { SpaceSwitcher } from "../spaces/SpaceSwitcher";
 import { CredentialListPage } from "../credentials/CredentialListPage";
 import { AssetListPage } from "../assets/AssetListPage";
+import { AgentListPage } from "../agents/AgentListPage";
+import { AuditPage } from "../audit/AuditPage";
+import { MembersPage } from "../members/MembersPage";
+import { SettingsPage } from "../settings/SettingsPage";
 import { Sidebar, type View } from "./Sidebar";
 
 const viewTitles: Record<View, string> = {
@@ -179,6 +183,38 @@ export function AppShell() {
               initialAssetId={selectedAssetID || undefined}
               onSelectionConsumed={consumeAssetSelection}
               onOpenCredential={openCredential}
+            />
+          ) : view === "agents" ? (
+            <AgentListPage
+              key={`${currentSpace?.id ?? "none"}:${principal?.userId ?? "none"}`}
+              api={api}
+              space={currentSpace}
+              systemRole={principal?.systemRole ?? ""}
+              sessionActive={Boolean(principal)}
+            />
+          ) : view === "audit" ? (
+            <AuditPage
+              key={`${currentSpace?.id ?? "none"}:${principal?.userId ?? "none"}`}
+              api={api}
+              space={currentSpace}
+              systemRole={principal?.systemRole ?? ""}
+              sessionActive={Boolean(principal)}
+            />
+          ) : view === "members" && currentSpace && principal ? (
+            <MembersPage
+              key={`${currentSpace.id}:${principal.userId}`}
+              api={api}
+              space={currentSpace}
+              principal={principal}
+              sessionActive
+            />
+          ) : view === "settings" && principal ? (
+            <SettingsPage
+              key={principal.userId}
+              api={api}
+              space={currentSpace}
+              principal={principal}
+              sessionActive
             />
           ) : (
             <EmptyView view={view} />
