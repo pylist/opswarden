@@ -6,15 +6,50 @@ import (
 )
 
 func TestValidatePayloadRejectsUnknownFields(t *testing.T) {
-	for _, credentialType := range []Type{
-		TypeLogin, TypeAPIToken, TypeSSHKey, TypeDatabase, TypeTOTP,
-	} {
+	tests := map[Type]string{
+		TypeLogin:    `{"url":"https://example.test","username":"alice","password":"password","unknown":"value"}`,
+		TypeAPIToken: `{"service":"example","token":"token","unknown":"value"}`,
+		TypeSSHKey:   `{"username":"root","private_key":"private","unknown":"value"}`,
+		TypeDatabase: `{"engine":"postgres","host":"db.test","unknown":"value"}`,
+		TypeTOTP:     `{"issuer":"Example","account":"alice","seed":"seed","algorithm":"SHA1","digits":6,"period":30,"unknown":"value"}`,
+	}
+	for credentialType, raw := range tests {
 		t.Run(string(credentialType), func(t *testing.T) {
-			_, err := ValidatePayload(credentialType, []byte(`{"unknown":"fixture-password"}`))
+			_, err := ValidatePayload(credentialType, []byte(raw))
 			if !errors.Is(err, ErrInvalidPayload) {
 				t.Fatalf("got %v", err)
 			}
 		})
+	}
+}
+
+func TestValidatePayloadRejectsCaseVariantFieldCollisions(t *testing.T) {
+	tests := map[Type]string{
+		TypeLogin:    `{"url":"https://example.test","username":"alice","password":"one","Password":"two"}`,
+		TypeAPIToken: `{"service":"example","token":"one","Token":"two"}`,
+		TypeSSHKey:   `{"username":"root","private_key":"one","Private_Key":"two"}`,
+		TypeDatabase: `{"engine":"postgres","Engine":"mysql","host":"db.test"}`,
+		TypeTOTP:     `{"issuer":"Example","account":"alice","seed":"one","Seed":"two","algorithm":"SHA1","digits":6,"period":30}`,
+	}
+	for credentialType, raw := range tests {
+		t.Run(string(credentialType), func(t *testing.T) {
+			_, err := ValidatePayload(credentialType, []byte(raw))
+			if !errors.Is(err, ErrInvalidPayload) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}
+
+func TestDatabaseParameterKeysAreCaseSensitiveBusinessKeys(t *testing.T) {
+	got, err := ValidatePayload(TypeDatabase, []byte(
+		`{"engine":"postgres","host":"db.test","parameters":{"Mode":"one","mode":"two"}}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) == 0 {
+		t.Fatal("validated payload is empty")
 	}
 }
 

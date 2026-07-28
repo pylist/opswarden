@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"opswarden/internal/cryptobox"
@@ -92,10 +93,8 @@ func (r *Repository) list(
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close credential rows: %w", err)
 	}
-	for index := range result {
-		if err := r.loadRelations(ctx, r.db.Reader, &result[index]); err != nil {
-			return nil, err
-		}
+	if err := loadRelationsBatch(ctx, r.db.Reader, result); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
@@ -236,6 +235,90 @@ func (r *Repository) loadRelations(
 	return nil
 }
 
+func loadRelationsBatch(
+	ctx context.Context,
+	queryer queryer,
+	metadata []Metadata,
+) error {
+	if len(metadata) == 0 {
+		return nil
+	}
+	indexByID := make(map[string]int, len(metadata))
+	arguments := make([]any, len(metadata))
+	for index := range metadata {
+		indexByID[metadata[index].ID] = index
+		arguments[index] = metadata[index].ID
+		metadata[index].Tags = make(map[string]string)
+		metadata[index].AssetIDs = []string{}
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(metadata)), ",")
+	tagRows, err := queryer.QueryContext(ctx, `
+		SELECT credential_id, tag
+		FROM credential_tags
+		WHERE credential_id IN (`+placeholders+`)
+		ORDER BY credential_id, tag
+	`, arguments...)
+	if err != nil {
+		return fmt.Errorf("read credential tag batch: %w", err)
+	}
+	for tagRows.Next() {
+		var credentialID, encoded string
+		if err := tagRows.Scan(&credentialID, &encoded); err != nil {
+			tagRows.Close()
+			return fmt.Errorf("scan credential tag batch: %w", err)
+		}
+		index, exists := indexByID[credentialID]
+		if !exists {
+			tagRows.Close()
+			return errors.New("credential tag batch contained an unknown credential")
+		}
+		pair, err := decodeStoredTag(encoded)
+		if err != nil {
+			tagRows.Close()
+			return err
+		}
+		metadata[index].Tags[pair[0]] = pair[1]
+	}
+	if err := tagRows.Err(); err != nil {
+		tagRows.Close()
+		return fmt.Errorf("iterate credential tag batch: %w", err)
+	}
+	if err := tagRows.Close(); err != nil {
+		return fmt.Errorf("close credential tag batch: %w", err)
+	}
+
+	assetRows, err := queryer.QueryContext(ctx, `
+		SELECT credential_id, asset_id
+		FROM asset_credentials
+		WHERE credential_id IN (`+placeholders+`)
+		ORDER BY credential_id, asset_id
+	`, arguments...)
+	if err != nil {
+		return fmt.Errorf("read credential asset batch: %w", err)
+	}
+	for assetRows.Next() {
+		var credentialID, assetID string
+		if err := assetRows.Scan(&credentialID, &assetID); err != nil {
+			assetRows.Close()
+			return fmt.Errorf("scan credential asset batch: %w", err)
+		}
+		index, exists := indexByID[credentialID]
+		if !exists {
+			assetRows.Close()
+			return errors.New("credential asset batch contained an unknown credential")
+		}
+		metadata[index].AssetIDs = append(metadata[index].AssetIDs, assetID)
+	}
+	if err := assetRows.Err(); err != nil {
+		assetRows.Close()
+		return fmt.Errorf("iterate credential asset batch: %w", err)
+	}
+	if err := assetRows.Close(); err != nil {
+		return fmt.Errorf("close credential asset batch: %w", err)
+	}
+	return nil
+}
+
 func loadTags(
 	ctx context.Context,
 	queryer queryer,
@@ -255,8 +338,9 @@ func loadTags(
 			return nil, fmt.Errorf("scan credential tag: %w", err)
 		}
 		var pair [2]string
-		if err := json.Unmarshal([]byte(encoded), &pair); err != nil || pair[0] == "" {
-			return nil, errors.New("invalid stored credential tag")
+		pair, err := decodeStoredTag(encoded)
+		if err != nil {
+			return nil, err
 		}
 		tags[pair[0]] = pair[1]
 	}
@@ -264,6 +348,14 @@ func loadTags(
 		return nil, fmt.Errorf("iterate credential tags: %w", err)
 	}
 	return tags, nil
+}
+
+func decodeStoredTag(encoded string) ([2]string, error) {
+	var pair [2]string
+	if err := json.Unmarshal([]byte(encoded), &pair); err != nil || pair[0] == "" {
+		return [2]string{}, errors.New("invalid stored credential tag")
+	}
+	return pair, nil
 }
 
 func loadAssetIDs(

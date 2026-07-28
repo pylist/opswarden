@@ -6,10 +6,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"time"
@@ -23,12 +25,22 @@ import (
 )
 
 const (
-	defaultListLimit = 100
-	maxListLimit     = 500
-	listScanBatch    = 256
-	maxListScan      = 4096
-	recycleRetention = 30 * 24 * time.Hour
+	defaultListLimit  = 100
+	maxListLimit      = 500
+	listScanBatch     = 256
+	maxListScan       = 4096
+	maxListCursor     = 1024
+	recycleRetention  = 30 * 24 * time.Hour
+	listCursorVersion = 1
 )
+
+var strictListCursorEncoding = base64.RawURLEncoding.Strict()
+
+type listCursorPayload struct {
+	Version    int    `json:"v"`
+	AfterID    string `json:"after_id"`
+	FilterHash string `json:"filter_hash"`
+}
 
 type AuditAppender interface {
 	AppendTx(context.Context, *sql.Tx, audit.Event) error
@@ -73,7 +85,7 @@ func (s *Service) List(
 	principal Principal,
 	filter ListFilter,
 ) ([]Metadata, string, error) {
-	limit, err := validateListFilter(filter)
+	limit, after, err := validateListFilter(filter)
 	if err != nil {
 		return nil, "", err
 	}
@@ -110,7 +122,6 @@ func (s *Service) List(
 		return nil, "", authorization.ErrUnauthenticated
 	}
 	authorized := make([]Metadata, 0, limit+1)
-	after := filter.After
 	scanned := 0
 	exhausted := false
 	for scanned < maxListScan && len(authorized) <= limit {
@@ -150,13 +161,20 @@ func (s *Service) List(
 		}
 	}
 	if len(authorized) > limit {
-		next := authorized[limit-1].ID
+		next, err := encodeListCursor(authorized[limit-1].ID, filter)
+		if err != nil {
+			return nil, "", err
+		}
 		return authorized[:limit], next, nil
 	}
 	if exhausted {
 		return authorized, "", nil
 	}
-	return authorized, after, nil
+	next, err := encodeListCursor(after, filter)
+	if err != nil {
+		return nil, "", err
+	}
+	return authorized, next, nil
 }
 
 func (s *Service) Get(
@@ -999,23 +1017,100 @@ func validateMutationContext(
 	return nil
 }
 
-func validateListFilter(filter ListFilter) (int, error) {
+func validateListFilter(filter ListFilter) (int, string, error) {
 	if !validIdentifier(filter.SpaceID) ||
 		(filter.Type != "" && !filter.Type.Valid()) ||
-		(filter.After != "" && !validIdentifier(filter.After)) {
-		return 0, ErrInvalidInput
+		len(filter.After) > maxListCursor {
+		return 0, "", ErrInvalidInput
 	}
 	if err := validateTags(filter.Tags); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	limit := filter.Limit
 	if limit == 0 {
 		limit = defaultListLimit
 	}
 	if limit < 1 || limit > maxListLimit {
-		return 0, ErrInvalidInput
+		return 0, "", ErrInvalidInput
 	}
-	return limit, nil
+	afterID := ""
+	if filter.After != "" {
+		var err error
+		afterID, err = decodeListCursor(filter.After, filter)
+		if err != nil {
+			return 0, "", err
+		}
+	}
+	return limit, afterID, nil
+}
+
+func encodeListCursor(afterID string, filter ListFilter) (string, error) {
+	if !validIdentifier(afterID) {
+		return "", ErrInvalidInput
+	}
+	filterHash, err := listFilterHash(filter)
+	if err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal(listCursorPayload{
+		Version: listCursorVersion, AfterID: afterID, FilterHash: filterHash,
+	})
+	if err != nil {
+		return "", ErrInvalidInput
+	}
+	cursor := strictListCursorEncoding.EncodeToString(encoded)
+	if len(cursor) > maxListCursor {
+		return "", ErrInvalidInput
+	}
+	return cursor, nil
+}
+
+func decodeListCursor(cursor string, filter ListFilter) (string, error) {
+	decoded, err := strictListCursorEncoding.DecodeString(cursor)
+	if err != nil || len(decoded) == 0 || len(decoded) > maxListCursor ||
+		strictListCursorEncoding.EncodeToString(decoded) != cursor {
+		return "", ErrInvalidInput
+	}
+	decoder := json.NewDecoder(bytes.NewReader(decoded))
+	decoder.DisallowUnknownFields()
+	var payload listCursorPayload
+	if err := decoder.Decode(&payload); err != nil {
+		return "", ErrInvalidInput
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return "", ErrInvalidInput
+	}
+	canonical, err := json.Marshal(payload)
+	if err != nil || !bytes.Equal(canonical, decoded) ||
+		payload.Version != listCursorVersion ||
+		!validIdentifier(payload.AfterID) ||
+		len(payload.FilterHash) != sha256.Size*2 {
+		return "", ErrInvalidInput
+	}
+	expectedHash, err := listFilterHash(filter)
+	if err != nil || payload.FilterHash != expectedHash {
+		return "", ErrInvalidInput
+	}
+	return payload.AfterID, nil
+}
+
+func listFilterHash(filter ListFilter) (string, error) {
+	encoded, err := json.Marshal(struct {
+		SpaceID        string            `json:"space_id"`
+		Type           Type              `json:"type,omitempty"`
+		Tags           map[string]string `json:"tags"`
+		IncludeDeleted bool              `json:"include_deleted"`
+		DeletedOnly    bool              `json:"deleted_only"`
+	}{
+		SpaceID: filter.SpaceID, Type: filter.Type, Tags: cloneTags(filter.Tags),
+		IncludeDeleted: filter.IncludeDeleted, DeletedOnly: filter.DeletedOnly,
+	})
+	if err != nil {
+		return "", ErrInvalidInput
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func validateTags(tags map[string]string) error {

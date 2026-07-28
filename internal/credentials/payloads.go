@@ -55,6 +55,9 @@ func ValidatePayload(credentialType Type, raw json.RawMessage) (json.RawMessage,
 	if !credentialType.Valid() || len(raw) == 0 || len(raw) > 1024*1024 {
 		return nil, ErrInvalidPayload
 	}
+	if err := validatePayloadJSONFields(credentialType, raw); err != nil {
+		return nil, err
+	}
 	switch credentialType {
 	case TypeLogin:
 		var payload LoginPayload
@@ -110,9 +113,6 @@ func ValidatePayload(credentialType Type, raw json.RawMessage) (json.RawMessage,
 }
 
 func strictDecode(raw []byte, destination any) error {
-	if err := rejectDuplicateJSONFields(raw); err != nil {
-		return err
-	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
@@ -125,14 +125,44 @@ func strictDecode(raw []byte, destination any) error {
 	return nil
 }
 
-func rejectDuplicateJSONFields(raw []byte) error {
+func validatePayloadJSONFields(credentialType Type, raw []byte) error {
+	var allowed map[string]struct{}
+	var arbitraryObjectFields map[string]struct{}
+	switch credentialType {
+	case TypeLogin:
+		allowed = exactFields("url", "username", "password", "totp_credential_id")
+	case TypeAPIToken:
+		allowed = exactFields("service", "token", "header_name", "expires_at")
+	case TypeSSHKey:
+		allowed = exactFields(
+			"username", "private_key", "public_key", "fingerprint", "passphrase",
+		)
+	case TypeDatabase:
+		allowed = exactFields(
+			"engine", "host", "port", "database", "username", "password",
+			"parameters", "connection_string",
+		)
+		arbitraryObjectFields = exactFields("parameters")
+	case TypeTOTP:
+		allowed = exactFields(
+			"issuer", "account", "seed", "algorithm", "digits", "period",
+		)
+	default:
+		return ErrInvalidPayload
+	}
+
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	first, err := decoder.Token()
 	if err != nil {
 		return ErrInvalidPayload
 	}
-	if err := consumeJSONValue(decoder, first); err != nil {
+	if first != json.Delim('{') {
+		return ErrInvalidPayload
+	}
+	if err := consumeJSONValue(
+		decoder, first, allowed, arbitraryObjectFields,
+	); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -141,7 +171,12 @@ func rejectDuplicateJSONFields(raw []byte) error {
 	return nil
 }
 
-func consumeJSONValue(decoder *json.Decoder, token json.Token) error {
+func consumeJSONValue(
+	decoder *json.Decoder,
+	token json.Token,
+	allowedFields map[string]struct{},
+	arbitraryObjectFields map[string]struct{},
+) error {
 	delimiter, isDelimiter := token.(json.Delim)
 	if !isDelimiter {
 		return nil
@@ -162,11 +197,22 @@ func consumeJSONValue(decoder *json.Decoder, token json.Token) error {
 				return ErrInvalidPayload
 			}
 			seen[key] = struct{}{}
+			if allowedFields != nil {
+				if _, allowed := allowedFields[key]; !allowed {
+					return ErrInvalidPayload
+				}
+			}
 			valueToken, err := decoder.Token()
 			if err != nil {
 				return ErrInvalidPayload
 			}
-			if err := consumeJSONValue(decoder, valueToken); err != nil {
+			var childAllowed map[string]struct{}
+			if _, arbitrary := arbitraryObjectFields[key]; !arbitrary {
+				childAllowed = map[string]struct{}{}
+			}
+			if err := consumeJSONValue(
+				decoder, valueToken, childAllowed, nil,
+			); err != nil {
 				return err
 			}
 		}
@@ -180,7 +226,9 @@ func consumeJSONValue(decoder *json.Decoder, token json.Token) error {
 			if err != nil {
 				return ErrInvalidPayload
 			}
-			if err := consumeJSONValue(decoder, valueToken); err != nil {
+			if err := consumeJSONValue(
+				decoder, valueToken, map[string]struct{}{}, nil,
+			); err != nil {
 				return err
 			}
 		}
@@ -192,6 +240,14 @@ func consumeJSONValue(decoder *json.Decoder, token json.Token) error {
 		return ErrInvalidPayload
 	}
 	return nil
+}
+
+func exactFields(fields ...string) map[string]struct{} {
+	result := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		result[field] = struct{}{}
+	}
+	return result
 }
 
 func canonicalPayload(payload any) (json.RawMessage, error) {

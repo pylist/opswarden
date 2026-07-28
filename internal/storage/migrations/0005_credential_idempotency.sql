@@ -22,6 +22,13 @@ WHERE
     AND json_type(CAST(response_headers AS TEXT), '$.version') = 'integer'
     AND json_extract(CAST(response_headers AS TEXT), '$.version') > 0;
 
+UPDATE idempotency_records
+SET response_headers = NULL, response_body = NULL
+WHERE
+    request_hash IS NOT NULL
+    AND resource_id IS NOT NULL
+    AND resource_version IS NOT NULL;
+
 CREATE TRIGGER idempotency_explicit_result_required
 BEFORE INSERT ON idempotency_records
 WHEN

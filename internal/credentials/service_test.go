@@ -477,6 +477,117 @@ func TestCrossSpaceListReturnsConcealedNotFound(t *testing.T) {
 	}
 }
 
+func TestListPaginationCrossesBatchAndScanBudgetWithoutLoss(t *testing.T) {
+	h := newCredentialHarness(t)
+	_, err := h.db.Writer.ExecContext(h.ctx, `
+		WITH RECURSIVE sequence(n) AS (
+			VALUES(1)
+			UNION ALL
+			SELECT n + 1 FROM sequence WHERE n < 4098
+		)
+		INSERT INTO credentials (
+			id, space_id, name, type, current_version, created_at, updated_at
+		)
+		SELECT
+			printf('crd_bulk_%05d', n), 'spc_main', printf('Bulk %05d', n),
+			'login', 1, '2026-07-28T12:00:00Z', '2026-07-28T12:00:00Z'
+		FROM sequence;
+
+		INSERT INTO credential_tags (credential_id, tag) VALUES
+			('crd_bulk_00256', '["page","batch"]'),
+			('crd_bulk_00257', '["page","batch"]'),
+			('crd_bulk_04097', '["page","budget"]');
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	batchFilter := ListFilter{
+		SpaceID: h.spaceID, Tags: map[string]string{"page": "batch"}, Limit: 1,
+	}
+	first, cursor, err := h.service.List(h.ctx, h.agent, batchFilter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].ID != "crd_bulk_00256" || cursor == "" {
+		t.Fatalf("first=%+v cursor=%q", first, cursor)
+	}
+	batchFilter.After = cursor
+	second, next, err := h.service.List(h.ctx, h.agent, batchFilter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].ID != "crd_bulk_00257" ||
+		second[0].ID == first[0].ID || next != "" {
+		t.Fatalf("second=%+v next=%q", second, next)
+	}
+
+	budgetFilter := ListFilter{
+		SpaceID: h.spaceID, Tags: map[string]string{"page": "budget"}, Limit: 1,
+	}
+	beforeBudget, budgetCursor, err := h.service.List(h.ctx, h.agent, budgetFilter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(beforeBudget) != 0 || budgetCursor == "" {
+		t.Fatalf("beforeBudget=%+v cursor=%q", beforeBudget, budgetCursor)
+	}
+	budgetFilter.After = budgetCursor
+	afterBudget, finalCursor, err := h.service.List(h.ctx, h.agent, budgetFilter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterBudget) != 1 || afterBudget[0].ID != "crd_bulk_04097" ||
+		finalCursor != "" {
+		t.Fatalf("afterBudget=%+v cursor=%q", afterBudget, finalCursor)
+	}
+}
+
+func TestListCursorIsBoundToSpaceAndFilter(t *testing.T) {
+	h := newCredentialHarness(t)
+	h.create(h.editor)
+	filter := ListFilter{SpaceID: h.spaceID, Limit: 1}
+	_, cursor, err := h.service.List(h.ctx, h.reader, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor == "" {
+		// A second row makes a continuation cursor deterministic.
+		input := h.createInput()
+		input.DisplayName = "Second"
+		if _, err := h.service.Create(
+			h.ctx, h.editor, input,
+			h.writeContext("human-second", h.editor.Actor),
+		); err != nil {
+			t.Fatal(err)
+		}
+		_, cursor, err = h.service.List(h.ctx, h.reader, filter)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if cursor == "" {
+		t.Fatal("missing continuation cursor")
+	}
+	for name, changed := range map[string]ListFilter{
+		"Space": {SpaceID: h.otherSpace, Limit: 1, After: cursor},
+		"tags": {
+			SpaceID: h.spaceID, Tags: map[string]string{"environment": "prod"},
+			Limit: 1, After: cursor,
+		},
+		"type": {
+			SpaceID: h.spaceID, Type: TypeDatabase, Limit: 1, After: cursor,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := h.service.List(h.ctx, h.reader, changed)
+			if !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}
+
 func TestGetDoesNotReturnPayloadWhenAuditFails(t *testing.T) {
 	h := newCredentialHarness(t)
 	created := h.create(h.editor)

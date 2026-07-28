@@ -135,6 +135,80 @@ func TestCredentialIdempotencyRequiresExplicitResultFields(t *testing.T) {
 	}
 }
 
+func TestCredentialIdempotencyMigrationBackfillsAndClearsLegacyEnvelope(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "idempotency-upgrade.db")
+	db, err := sql.Open(driverName, sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	available, err := loadMigrations(migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+			applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	for _, candidate := range available {
+		if candidate.version > 4 {
+			continue
+		}
+		mustExec(t, db, string(candidate.contents))
+		mustExec(t, db, `
+			INSERT INTO schema_migrations (version, name, checksum)
+			VALUES (?, ?, ?)
+		`, candidate.version, candidate.name, candidate.checksum)
+	}
+	mustExec(t, db, `
+		INSERT INTO users (id, email, normalized_email, password_hash)
+		VALUES ('legacy-idem-user', 'legacy-idem@example.test', 'legacy-idem@example.test', X'01')
+	`)
+	mustExec(t, db, `
+		INSERT INTO agents (id, name, created_by_user_id)
+		VALUES ('legacy-idem-agent', 'Legacy Idempotency Agent', 'legacy-idem-user')
+	`)
+	requestHash := strings.Repeat("a", 64)
+	legacyEnvelope := `{"request_hash":"` + requestHash +
+		`","resource_id":"legacy-credential","version":7}`
+	mustExec(t, db, `
+		INSERT INTO idempotency_records (
+			id, agent_id, endpoint, key_hash, response_status,
+			response_headers, response_body, created_at, expires_at
+		) VALUES (
+			'legacy-idem', 'legacy-idem-agent', 'credential.update/legacy-credential',
+			X'01', 200, ?, X'0102',
+			'2026-07-28T00:00:00Z', '2026-07-29T00:00:00Z'
+		)
+	`, []byte(legacyEnvelope))
+
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	var gotHash, resourceID string
+	var version uint64
+	var headers, body []byte
+	if err := db.QueryRow(`
+		SELECT
+			request_hash, resource_id, resource_version,
+			response_headers, response_body
+		FROM idempotency_records WHERE id = 'legacy-idem'
+	`).Scan(&gotHash, &resourceID, &version, &headers, &body); err != nil {
+		t.Fatal(err)
+	}
+	if gotHash != requestHash || resourceID != "legacy-credential" || version != 7 {
+		t.Fatalf("hash=%q resource=%q version=%d", gotHash, resourceID, version)
+	}
+	if headers != nil || body != nil {
+		t.Fatalf("legacy envelope retained: headers=%x body=%x", headers, body)
+	}
+}
+
 func TestImmediateMigrationTransactionLocksBeforeCallback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lock.db")
 	firstDB, err := sql.Open(driverName, sqliteDSN(path))
