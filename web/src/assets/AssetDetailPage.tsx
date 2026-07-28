@@ -55,6 +55,7 @@ export function AssetDetailPage({
     const current = ++generation.current;
     credentialGeneration.current += 1;
     credentialController.current?.abort();
+    setLoadingMoreCredentials(false);
     credentialCursorFlow.current.reset();
     const credentialAttempt = credentialCursorFlow.current.begin("");
     if (!credentialAttempt) return;

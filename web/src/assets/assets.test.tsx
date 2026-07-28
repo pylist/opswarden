@@ -266,6 +266,89 @@ describe("asset workflows", () => {
     expect(screen.queryByText("stale linked")).toBeNull();
   });
 
+  it("clears stale linked-page loading state when a new asset load takes over", async () => {
+    const oldLinked = {
+      id: "crd_orders",
+      spaceId: "spc_prod",
+      displayName: "orders database",
+      type: "database" as const,
+      version: 3,
+      tags: {},
+      assetIds: ["ast_orders"],
+    };
+    const otherAsset = { ...asset, id: "ast_other", name: "other asset" };
+    const otherLinked = {
+      ...oldLinked,
+      id: "crd_other",
+      displayName: "other credential",
+      assetIds: ["ast_other"],
+    };
+    const otherSecond = {
+      ...otherLinked,
+      id: "crd_other_second",
+      displayName: "other second credential",
+    };
+    const staleContinuation = deferred<unknown>();
+    const api = apiFor(async (path) => {
+      if (path.endsWith("/assets/ast_orders")) return asset;
+      if (path.endsWith("/assets/ast_other")) return otherAsset;
+      if (path.endsWith("/assets/ast_orders/credentials?limit=100")) {
+        return { items: [oldLinked], nextCursor: "old_1" };
+      }
+      if (path.endsWith("/assets/ast_orders/credentials?limit=100&after=old_1")) {
+        return staleContinuation.promise;
+      }
+      if (path.endsWith("/assets/ast_other/credentials?limit=100")) {
+        return { items: [otherLinked], nextCursor: "new_1" };
+      }
+      if (path.endsWith("/assets/ast_other/credentials?limit=100&after=new_1")) {
+        return { items: [otherSecond] };
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    const view = render(
+      <AssetDetailPage
+        api={api}
+        assetId="ast_orders"
+        space={{ id: "spc_prod", name: "生产", role: "reader" }}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "加载更多关联凭据" }));
+    await waitFor(() =>
+      expect(api.request).toHaveBeenCalledWith(
+        "/api/v1/spaces/spc_prod/assets/ast_orders/credentials?limit=100&after=old_1",
+        expect.anything(),
+      ),
+    );
+
+    view.rerender(
+      <AssetDetailPage
+        api={api}
+        assetId="ast_other"
+        space={{ id: "spc_prod", name: "生产", role: "reader" }}
+      />,
+    );
+    expect(await screen.findByText("other credential")).toBeVisible();
+    await act(async () => {
+      staleContinuation.resolve({
+        items: [{
+          ...oldLinked,
+          id: "crd_stale_old",
+          displayName: "stale old credential",
+        }],
+      });
+      await staleContinuation.promise;
+    });
+    expect(screen.queryByText("stale old credential")).toBeNull();
+
+    const loadMore = screen.getByRole("button", {
+      name: "加载更多关联凭据",
+    });
+    expect(loadMore).toBeEnabled();
+    fireEvent.click(loadMore);
+    expect(await screen.findByText("other second credential")).toBeVisible();
+  });
+
   it("rejects hostile linked credential metadata containing payload", async () => {
     const api = apiFor(async (path) => {
       if (path.endsWith("/assets/ast_orders")) return asset;
