@@ -785,3 +785,31 @@ func TestRestoreAndPurgeExpiredRecycleBin(t *testing.T) {
 		t.Fatal("expired credential remains")
 	}
 }
+
+func TestBoundSpaceConcealsCrossSpaceMutationFromSystemOwner(t *testing.T) {
+	h := newCredentialHarness(t)
+	created := h.create(h.editor)
+	systemOwner := humanCredentialPrincipal(
+		"usr_editor", "spc_other", authorization.RoleOwner,
+	)
+	systemOwner.Human.SystemRole = identity.SystemRoleOwner
+	systemOwner.BoundSpaceID = "spc_other"
+	name := "must not change"
+	_, err := h.service.Update(
+		h.ctx, systemOwner, UpdateInput{
+			CredentialID: created.ID, ExpectedVersion: created.Version,
+			DisplayName: &name,
+		},
+		h.writeContext("bound-space", systemOwner.Actor),
+	)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update error=%v, want concealed not found", err)
+	}
+	current, err := h.service.Get(h.ctx, h.editor, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Metadata.DisplayName == name {
+		t.Fatal("cross-Space mutation changed credential")
+	}
+}

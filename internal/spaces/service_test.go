@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"opswarden/internal/audit"
 	"opswarden/internal/identity"
+	"opswarden/internal/platform"
 	"opswarden/internal/spaces"
 	"opswarden/internal/storage"
 )
@@ -48,6 +50,60 @@ func TestCreateMakesAuthenticatedPrincipalOwnerAndListUsesPrincipal(t *testing.T
 		t.Fatalf("unassigned member Spaces = %+v", rows)
 	}
 }
+
+func TestAuditedCreateRollsBackWhenAuditAppendFails(t *testing.T) {
+	h := newSpacesHarness(t)
+	service, err := spaces.NewAuditedService(
+		h.db, h.revoker, failingSpaceAudit{}, fixedSpaceClock{now: h.now},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.CreateAudited(
+		h.ctx,
+		spaces.MutationContext{
+			Session: h.principal("owner"),
+			Actor: audit.Actor{
+				Type: audit.ActorUser, ID: "owner",
+				Fingerprint: "0123456789abcdef",
+			},
+			RequestID: "req_test", SourceIP: "127.0.0.1",
+		},
+		spaces.CreateInput{Name: "Must roll back"},
+	)
+	if !errors.Is(err, audit.ErrAuditUnavailable) {
+		t.Fatalf("create error=%v", err)
+	}
+	var count int
+	if err := h.db.Reader.QueryRowContext(
+		h.ctx, `SELECT count(*) FROM spaces WHERE name = ?`, "Must roll back",
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("spaces after failed audit=%d", count)
+	}
+}
+
+type failingSpaceAudit struct{}
+
+func (failingSpaceAudit) AppendTx(
+	context.Context,
+	*sql.Tx,
+	audit.Event,
+) error {
+	return audit.ErrAuditUnavailable
+}
+
+type fixedSpaceClock struct {
+	now time.Time
+}
+
+func (clock fixedSpaceClock) Now() time.Time {
+	return clock.now
+}
+
+var _ platform.Clock = fixedSpaceClock{}
 
 func TestServiceRejectsUnauthenticatedOrDeletedPrincipal(t *testing.T) {
 	h := newSpacesHarness(t)
@@ -417,6 +473,35 @@ func TestSpaceOwnerCannotMutateSoftDeletedSpace(t *testing.T) {
 	}
 	if h.membershipExists(t, spaceID, "member") {
 		t.Fatal("member was added to deleted Space")
+	}
+}
+
+func TestResolveAuthorizationPrincipalReadsCurrentRole(t *testing.T) {
+	h := newSpacesHarness(t)
+	spaceID := h.createSpace(t, "owner")
+
+	principal, err := h.service.ResolveAuthorizationPrincipal(
+		h.ctx, h.principal("owner"), spaceID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if principal.SpaceRoles[spaceID] != spaces.Owner {
+		t.Fatalf("initial role = %q", principal.SpaceRoles[spaceID])
+	}
+
+	h.mustExec(
+		`UPDATE space_memberships SET role = ? WHERE space_id = ? AND user_id = ?`,
+		spaces.Reader, spaceID, "owner",
+	)
+	principal, err = h.service.ResolveAuthorizationPrincipal(
+		h.ctx, h.principal("owner"), spaceID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if principal.SpaceRoles[spaceID] != spaces.Reader {
+		t.Fatalf("fresh role = %q", principal.SpaceRoles[spaceID])
 	}
 }
 

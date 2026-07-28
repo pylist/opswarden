@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"net"
 	"net/http"
 	"os"
@@ -14,9 +15,11 @@ import (
 
 func TestNewCreatesDatabaseInConfiguredDataDir(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")
+	masterKeyFile := writeMasterKey(t)
 	application, err := New(config.Config{
-		ListenAddr: "127.0.0.1:0",
-		DataDir:    dataDir,
+		ListenAddr:    "127.0.0.1:0",
+		DataDir:       dataDir,
+		MasterKeyFile: masterKeyFile,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -33,6 +36,33 @@ func TestNewCreatesDatabaseInConfiguredDataDir(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dataDir, "opswarden.db")); err != nil {
 		t.Fatalf("stat application database: %v", err)
 	}
+}
+
+func TestNewRejectsMissingMasterKey(t *testing.T) {
+	application, err := New(config.Config{
+		ListenAddr:    "127.0.0.1:0",
+		DataDir:       filepath.Join(t.TempDir(), "data"),
+		MasterKeyFile: filepath.Join(t.TempDir(), "missing.key"),
+	})
+	if err == nil || application != nil {
+		t.Fatalf("application=%v error=%v", application, err)
+	}
+}
+
+func writeMasterKey(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "master.key")
+	raw := make([]byte, 32)
+	for index := range raw {
+		raw[index] = byte(index + 1)
+	}
+	if err := os.WriteFile(
+		path, []byte(base64.StdEncoding.EncodeToString(raw)), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	clear(raw)
+	return path
 }
 
 func TestRunWaitsForInFlightRequestAfterContextCancellation(t *testing.T) {

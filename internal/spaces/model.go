@@ -4,7 +4,9 @@ import (
 	"errors"
 	"time"
 
+	"opswarden/internal/audit"
 	"opswarden/internal/authorization"
+	"opswarden/internal/identity"
 )
 
 type Role = authorization.Role
@@ -37,4 +39,12 @@ type Space struct {
 
 type CreateInput struct {
 	Name string
+}
+
+type MutationContext struct {
+	Session   identity.SessionPrincipal
+	Actor     audit.Actor
+	RequestID string
+	SourceIP  string
+	UserAgent string
 }

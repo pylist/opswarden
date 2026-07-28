@@ -954,6 +954,10 @@ func authorize(
 	resource authorization.Resource,
 	action authorization.Action,
 ) error {
+	if principal.BoundSpaceID != "" &&
+		resource.SpaceID != principal.BoundSpaceID {
+		return ErrNotFound
+	}
 	switch {
 	case principal.Human != nil && principal.Agent == nil:
 		if principal.Actor.Type != audit.ActorUser ||

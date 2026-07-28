@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"opswarden/internal/audit"
 	"opswarden/internal/authorization"
 	"opswarden/internal/identity"
+	"opswarden/internal/platform"
 	"opswarden/internal/storage"
 )
 
@@ -19,9 +21,15 @@ type SessionRevoker interface {
 	RevokeUserSessionsTx(context.Context, *sql.Tx, string) error
 }
 
+type AuditAppender interface {
+	AppendTx(context.Context, *sql.Tx, audit.Event) error
+}
+
 type Service struct {
 	repository repository
 	revoker    SessionRevoker
+	audit      AuditAppender
+	clock      platform.Clock
 }
 
 func NewService(db *storage.DB, revoker SessionRevoker) (*Service, error) {
@@ -35,6 +43,27 @@ func NewService(db *storage.DB, revoker SessionRevoker) (*Service, error) {
 		repository: repository{db: db},
 		revoker:    revoker,
 	}, nil
+}
+
+func NewAuditedService(
+	db *storage.DB,
+	revoker SessionRevoker,
+	auditAppender AuditAppender,
+	clock platform.Clock,
+) (*Service, error) {
+	service, err := NewService(db, revoker)
+	if err != nil {
+		return nil, err
+	}
+	if auditAppender == nil {
+		return nil, errors.New("Spaces audit appender is required")
+	}
+	if clock == nil {
+		return nil, errors.New("Spaces clock is required")
+	}
+	service.audit = auditAppender
+	service.clock = clock
+	return service, nil
 }
 
 func (s *Service) Create(
@@ -65,6 +94,74 @@ func (s *Service) Create(
 			return err
 		}
 		return s.repository.createTx(ctx, tx, space, principal.UserID)
+	})
+	if err != nil {
+		return Space{}, err
+	}
+	return space, nil
+}
+
+func (s *Service) CreateAudited(
+	ctx context.Context,
+	mutation MutationContext,
+	input CreateInput,
+) (Space, error) {
+	if s.audit == nil || s.clock == nil {
+		return Space{}, audit.ErrAuditUnavailable
+	}
+	if mutation.Session.UserID == "" || mutation.Session.SessionID == "" ||
+		mutation.Actor.Type != audit.ActorUser ||
+		mutation.Actor.ID != mutation.Session.UserID {
+		return Space{}, ErrUnauthenticated
+	}
+	name := strings.TrimSpace(input.Name)
+	if name == "" {
+		return Space{}, ErrInvalidName
+	}
+	id, err := randomID()
+	if err != nil {
+		return Space{}, err
+	}
+	now := s.clock.Now().UTC()
+	if now.IsZero() {
+		return Space{}, ErrInvalidName
+	}
+	space := Space{
+		ID: id, Name: name, Role: Owner, CreatedAt: now, UpdatedAt: now,
+	}
+	err = s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		human, err := s.repository.humanPrincipalTx(
+			ctx, tx, mutation.Session, "",
+		)
+		if err != nil {
+			return err
+		}
+		if err := decisionError(authorization.DecisionForHuman(
+			human, authorization.Resource{}, authorization.CreateSpace,
+		)); err != nil {
+			return err
+		}
+		if err := s.repository.createTx(
+			ctx, tx, space, mutation.Session.UserID,
+		); err != nil {
+			return err
+		}
+		eventID, err := randomID()
+		if err != nil {
+			return audit.ErrAuditUnavailable
+		}
+		event := audit.Event{
+			ID:        strings.Replace(eventID, "spc_", "aud_", 1),
+			RequestID: mutation.RequestID, CreatedAt: now,
+			Actor: mutation.Actor, Action: "space.create", SpaceID: space.ID,
+			ResourceType: "space", ResourceID: space.ID,
+			SourceIP: mutation.SourceIP, UserAgent: mutation.UserAgent,
+			Success: true, ChangeFields: audit.ChangeFields{audit.FieldName},
+		}
+		if err := s.audit.AppendTx(ctx, tx, event); err != nil {
+			return audit.ErrAuditUnavailable
+		}
+		return nil
 	})
 	if err != nil {
 		return Space{}, err
@@ -210,6 +307,23 @@ func (s *Service) ListForUser(
 		principal.UserID,
 		human.SystemRole == identity.SystemRoleOwner,
 	)
+}
+
+// ResolveAuthorizationPrincipal builds a fresh authorization view for one
+// request. Callers must not cache the result across requests because user and
+// Space roles can change while a server-side session remains active.
+func (s *Service) ResolveAuthorizationPrincipal(
+	ctx context.Context,
+	session identity.SessionPrincipal,
+	spaceID string,
+) (authorization.HumanPrincipal, error) {
+	var principal authorization.HumanPrincipal
+	err := s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		principal, err = s.repository.humanPrincipalTx(ctx, tx, session, spaceID)
+		return err
+	})
+	return principal, err
 }
 
 func (s *Service) authorizeMemberManagement(

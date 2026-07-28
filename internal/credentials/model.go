@@ -40,12 +40,13 @@ var (
 )
 
 type Principal struct {
-	Human     *authorization.HumanPrincipal
-	Agent     *authorization.AgentPrincipal
-	Actor     audit.Actor
-	RequestID string
-	SourceIP  string
-	UserAgent string
+	Human        *authorization.HumanPrincipal
+	Agent        *authorization.AgentPrincipal
+	BoundSpaceID string
+	Actor        audit.Actor
+	RequestID    string
+	SourceIP     string
+	UserAgent    string
 }
 
 type WriteContext struct {
