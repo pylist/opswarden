@@ -51,10 +51,14 @@ func New(masterKey [chacha20poly1305.KeySize]byte) *Box {
 }
 
 func LoadMasterKey(path string) ([chacha20poly1305.KeySize]byte, error) {
-	return loadMasterKey(path, nil)
+	return loadMasterKey(path, nil, nil)
 }
 
-func loadMasterKey(path string, afterLstat func() error) ([chacha20poly1305.KeySize]byte, error) {
+func loadMasterKey(
+	path string,
+	afterLstat func() error,
+	readAll func(io.Reader) ([]byte, error),
+) ([chacha20poly1305.KeySize]byte, error) {
 	var key [chacha20poly1305.KeySize]byte
 
 	pathInfo, err := os.Lstat(path)
@@ -84,11 +88,16 @@ func loadMasterKey(path string, afterLstat func() error) ([chacha20poly1305.KeyS
 		return key, err
 	}
 
-	encoded, err := io.ReadAll(io.LimitReader(file, maxEncodedKeyFileSize+1))
+	if readAll == nil {
+		readAll = func(reader io.Reader) ([]byte, error) {
+			return io.ReadAll(io.LimitReader(reader, maxEncodedKeyFileSize+1))
+		}
+	}
+	encoded, err := readAll(file)
+	defer clear(encoded)
 	if err != nil {
 		return key, fmt.Errorf("read master key file: %w", err)
 	}
-	defer clear(encoded)
 	if len(encoded) > maxEncodedKeyFileSize {
 		return key, ErrKeyFormat
 	}
@@ -129,7 +138,7 @@ func decodeMasterKey(encoded []byte) ([chacha20poly1305.KeySize]byte, error) {
 }
 
 func openMasterKeyFile(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return nil, ErrKeyFileType

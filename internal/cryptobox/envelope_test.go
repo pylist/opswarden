@@ -5,10 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestLoadMasterKeyAcceptsRestrictedRegularFile(t *testing.T) {
@@ -43,9 +47,50 @@ func TestLoadMasterKeyRejectsSymlinkSwapAfterLstat(t *testing.T) {
 		}
 		return os.Symlink(renamedPath, path)
 	}
-	_, err := loadMasterKey(path, afterLstat)
+	_, err := loadMasterKey(path, afterLstat, nil)
 	if !errors.Is(err, ErrKeyFileType) {
 		t.Fatalf("expected key file type error, got %v", err)
+	}
+}
+
+func TestLoadMasterKeyRejectsFIFOSwapWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "master.key")
+	renamedPath := filepath.Join(dir, "original.key")
+	raw := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	hookRan := make(chan struct{})
+	afterLstat := func() error {
+		if err := os.Rename(path, renamedPath); err != nil {
+			return err
+		}
+		if err := unix.Mkfifo(path, 0o600); err != nil {
+			return err
+		}
+		close(hookRan)
+		return nil
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := loadMasterKey(path, afterLstat, nil)
+		result <- err
+	}()
+
+	select {
+	case <-hookRan:
+	case <-time.After(time.Second):
+		t.Fatal("FIFO swap hook did not run promptly")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrKeyFileType) {
+			t.Fatalf("expected key file type error, got %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("master key loader blocked while opening FIFO")
 	}
 }
 
@@ -62,9 +107,36 @@ func TestLoadMasterKeyRejectsPermissionChangeAfterLstat(t *testing.T) {
 	afterLstat := func() error {
 		return os.Chmod(path, 0o600)
 	}
-	_, err := loadMasterKey(path, afterLstat)
+	_, err := loadMasterKey(path, afterLstat, nil)
 	if !errors.Is(err, ErrKeyPermissions) {
 		t.Fatalf("expected key permissions error, got %v", err)
+	}
+}
+
+func TestLoadMasterKeyClearsPartialReadBufferOnError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "master.key")
+	raw := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	partial := []byte(raw)
+	marker := bytes.Clone(partial)
+	defer clear(marker)
+	sentinel := errors.New("sentinel read failure")
+	readAll := func(io.Reader) ([]byte, error) {
+		return partial, sentinel
+	}
+
+	_, err := loadMasterKey(path, nil, readAll)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel read error, got %v", err)
+	}
+	if bytes.Contains([]byte(err.Error()), marker) {
+		t.Fatal("read error exposed partial master key content")
+	}
+	if !bytes.Equal(partial, make([]byte, len(partial))) {
+		t.Fatal("partial master key read buffer was not cleared")
 	}
 }
 
