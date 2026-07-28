@@ -343,14 +343,36 @@ func (r *repository) revokeUserSessions(ctx context.Context, userID string, now 
 
 func (r *repository) changeSystemRole(
 	ctx context.Context,
-	actorUserID, targetUserID, role string,
+	actorTokenHash []byte,
+	targetUserID, role string,
 	now time.Time,
 ) error {
 	return storage.WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		switch role {
+		case SystemRoleOwner, SystemRoleAdmin, SystemRoleMember:
+		default:
+			return ErrInvalidSystemRole
+		}
+
+		actorSession, err := querySession(ctx, tx, actorTokenHash)
+		if err != nil {
+			return err
+		}
+		if actorSession.Revoked {
+			return ErrSessionRevoked
+		}
+		if !now.Before(actorSession.ExpiresAt) ||
+			!now.Before(actorSession.IdleExpiresAt) {
+			return ErrSessionExpired
+		}
+		if !principalFromSession(actorSession).HasRecentTOTP(now) {
+			return ErrRecentTOTPRequired
+		}
+
 		var actorRole string
 		if err := tx.QueryRowContext(ctx, `
 			SELECT system_role FROM users WHERE id = ? AND deleted_at IS NULL
-		`, actorUserID).Scan(&actorRole); err != nil {
+		`, actorSession.UserID).Scan(&actorRole); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrForbidden
 			}
@@ -359,6 +381,30 @@ func (r *repository) changeSystemRole(
 		if actorRole != SystemRoleOwner {
 			return ErrForbidden
 		}
+
+		var targetRole string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT system_role FROM users WHERE id = ? AND deleted_at IS NULL
+		`, targetUserID).Scan(&targetRole); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrUserNotFound
+			}
+			return fmt.Errorf("read system-role target: %w", err)
+		}
+		if targetRole == SystemRoleOwner && role != SystemRoleOwner {
+			var remainingOwners int
+			if err := tx.QueryRowContext(ctx, `
+				SELECT count(*)
+				FROM users
+				WHERE system_role = ? AND deleted_at IS NULL AND id <> ?
+			`, SystemRoleOwner, targetUserID).Scan(&remainingOwners); err != nil {
+				return fmt.Errorf("count remaining System Owners: %w", err)
+			}
+			if remainingOwners == 0 {
+				return ErrLastSystemOwner
+			}
+		}
+
 		result, err := tx.ExecContext(ctx, `
 			UPDATE users SET system_role = ?, updated_at = ?
 			WHERE id = ? AND deleted_at IS NULL

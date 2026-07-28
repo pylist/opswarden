@@ -112,3 +112,38 @@ recent-TOTP verification, logout, user-wide revocation, and password reset.
 - PHC numeric fields must match the exact canonical parameter string, so leading
   zeros and every non-allowlisted cost are rejected without allocating their
   requested Argon2 resources.
+
+## Final role-authorization review remediation
+
+### RED / GREEN
+
+- RED: `go test ./internal/identity -run 'TestChangeSystemRole'` failed to
+  compile because `ErrRecentTOTPRequired` and `ErrLastSystemOwner` did not
+  exist; the old API also interpreted the raw session fixture as a caller-
+  supplied user ID.
+- GREEN: the same focused command passed after `ChangeSystemRole` was changed
+  to accept a raw actor session token and the repository transaction gained the
+  complete authorization and last-owner checks.
+
+### Security behavior
+
+- `Service.ChangeSystemRole` hashes the raw session token with SHA-256 before
+  repository access. No caller-supplied `SessionPrincipal` or actor user ID is
+  trusted.
+- One writer transaction validates that the actor session exists, is not
+  revoked, is within idle and absolute deadlines, and has TOTP verification
+  strictly newer than five minutes; it then verifies the actor is an active
+  System Owner.
+- The same transaction validates the requested role, prevents removal of the
+  final active System Owner with `ErrLastSystemOwner`, updates the target role,
+  and revokes every target session. Any error rolls all state back.
+- Tests cover recovery-code sessions without recent TOTP, the sole-owner
+  rollback preserving both role and session, safe promotion of a second owner
+  followed by demotion of the first, and expired/revoked actor sessions.
+  Sentinel errors are also checked not to contain the raw token.
+
+### Final verification
+
+- `go test -race ./internal/identity ./internal/storage ./internal/cryptobox`
+  passed: identity `37.490s`; storage and cryptobox cached.
+- `go test ./...`, `go vet ./...`, and `git diff --check` passed.

@@ -495,27 +495,118 @@ func TestResetPasswordInvalidatesOutstandingLoginChallenge(t *testing.T) {
 	}
 }
 
-func TestChangeSystemRoleUpdatesRoleAndRevokesSessionsAtomically(t *testing.T) {
+func TestChangeSystemRoleRequiresRecentTOTPFromActorSession(t *testing.T) {
+	h := newIdentityHarness(t)
+	session, err := h.service.CompleteLogin(
+		h.ctx, h.beginLogin(t, testPassword).ID, h.owner.RecoveryCodes[0],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = h.service.ChangeSystemRole(
+		h.ctx, session.RawToken, h.owner.UserID, SystemRoleMember,
+	)
+	if !errors.Is(err, ErrRecentTOTPRequired) {
+		t.Fatalf("role change error = %v", err)
+	}
+	if role := h.systemRole(t, h.owner.UserID); role != SystemRoleOwner {
+		t.Fatalf("system role changed to %q", role)
+	}
+	if _, err := h.service.ResolveSession(h.ctx, session.RawToken); err != nil {
+		t.Fatalf("actor session changed after rejected role change: %v", err)
+	}
+}
+
+func TestChangeSystemRolePreservesOnlyActiveOwnerAndSessionOnRollback(t *testing.T) {
 	h := newIdentityHarness(t)
 	session := h.login(t)
 
+	err := h.service.ChangeSystemRole(
+		h.ctx, session.RawToken, h.owner.UserID, SystemRoleMember,
+	)
+	if !errors.Is(err, ErrLastSystemOwner) {
+		t.Fatalf("unique-owner downgrade error = %v", err)
+	}
+	if role := h.systemRole(t, h.owner.UserID); role != SystemRoleOwner {
+		t.Fatalf("system role changed to %q", role)
+	}
+	if _, err := h.service.ResolveSession(h.ctx, session.RawToken); err != nil {
+		t.Fatalf("owner session was not rolled back: %v", err)
+	}
+}
+
+func TestChangeSystemRoleCanPromoteSecondOwnerThenSafelyDemoteFirst(t *testing.T) {
+	h := newIdentityHarness(t)
+	firstOwnerSession := h.login(t)
+	secondOwnerID := "second-owner"
+	h.insertUser(t, secondOwnerID, SystemRoleMember)
+	prePromotionToken := "second-owner-pre-promotion-session-fixture"
+	h.insertSession(t, secondOwnerID, prePromotionToken, true)
+
 	if err := h.service.ChangeSystemRole(
-		h.ctx, h.owner.UserID, h.owner.UserID, SystemRoleMember,
+		h.ctx, firstOwnerSession.RawToken, secondOwnerID, SystemRoleOwner,
 	); err != nil {
 		t.Fatal(err)
 	}
-	var role string
-	if err := h.db.Reader.QueryRowContext(h.ctx,
-		`SELECT system_role FROM users WHERE id = ?`, h.owner.UserID,
-	).Scan(&role); err != nil {
+	if role := h.systemRole(t, secondOwnerID); role != SystemRoleOwner {
+		t.Fatalf("second owner role = %q", role)
+	}
+	if _, err := h.service.ResolveSession(h.ctx, prePromotionToken); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("promoted target session error = %v", err)
+	}
+
+	secondOwnerSession := "second-owner-post-promotion-session-fixture"
+	h.insertSession(t, secondOwnerID, secondOwnerSession, true)
+	if err := h.service.ChangeSystemRole(
+		h.ctx, secondOwnerSession, h.owner.UserID, SystemRoleMember,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if role != SystemRoleMember {
-		t.Fatalf("system role = %q", role)
+	if role := h.systemRole(t, h.owner.UserID); role != SystemRoleMember {
+		t.Fatalf("first owner role = %q", role)
 	}
-	if _, err := h.service.ResolveSession(h.ctx, session.RawToken); !errors.Is(err, ErrSessionRevoked) {
-		t.Fatalf("role-change session error = %v", err)
+	if _, err := h.service.ResolveSession(
+		h.ctx, firstOwnerSession.RawToken,
+	); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("demoted target session error = %v", err)
 	}
+}
+
+func TestChangeSystemRoleRejectsExpiredOrRevokedActorSessionWithoutTokenLeak(t *testing.T) {
+	t.Run("expired", func(t *testing.T) {
+		h := newIdentityHarness(t)
+		session := h.login(t)
+		h.clock.Advance(SessionIdleLifetime + time.Nanosecond)
+
+		err := h.service.ChangeSystemRole(
+			h.ctx, session.RawToken, h.owner.UserID, SystemRoleMember,
+		)
+		if !errors.Is(err, ErrSessionExpired) {
+			t.Fatalf("expired actor error = %v", err)
+		}
+		if strings.Contains(err.Error(), session.RawToken) {
+			t.Fatal("expired-session error exposed raw token")
+		}
+	})
+
+	t.Run("revoked", func(t *testing.T) {
+		h := newIdentityHarness(t)
+		session := h.login(t)
+		if err := h.service.Logout(h.ctx, session.RawToken); err != nil {
+			t.Fatal(err)
+		}
+
+		err := h.service.ChangeSystemRole(
+			h.ctx, session.RawToken, h.owner.UserID, SystemRoleMember,
+		)
+		if !errors.Is(err, ErrSessionRevoked) {
+			t.Fatalf("revoked actor error = %v", err)
+		}
+		if strings.Contains(err.Error(), session.RawToken) {
+			t.Fatal("revoked-session error exposed raw token")
+		}
+	})
 }
 
 func TestSensitiveFixturesAreAbsentFromRawDatabase(t *testing.T) {
@@ -687,6 +778,52 @@ func (h *identityHarness) login(t *testing.T) Session {
 		t.Fatal(err)
 	}
 	return session
+}
+
+func (h *identityHarness) systemRole(t *testing.T, userID string) string {
+	t.Helper()
+	var role string
+	if err := h.db.Reader.QueryRowContext(h.ctx,
+		`SELECT system_role FROM users WHERE id = ?`, userID,
+	).Scan(&role); err != nil {
+		t.Fatal(err)
+	}
+	return role
+}
+
+func (h *identityHarness) insertUser(t *testing.T, userID, role string) {
+	t.Helper()
+	if _, err := h.db.Writer.ExecContext(h.ctx, `
+		INSERT INTO users
+			(id, email, normalized_email, password_hash, system_role, created_at, updated_at)
+		VALUES (?, ?, ?, X'01', ?, ?, ?)
+	`, userID, userID+"@example.com", userID+"@example.com", role,
+		formatTime(h.clock.Now()), formatTime(h.clock.Now())); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (h *identityHarness) insertSession(
+	t *testing.T,
+	userID, rawToken string,
+	recentTOTP bool,
+) {
+	t.Helper()
+	tokenHash := sha256.Sum256([]byte(rawToken))
+	now := h.clock.Now()
+	var recentTOTPAt any
+	if recentTOTP {
+		recentTOTPAt = formatTime(now)
+	}
+	if _, err := h.db.Writer.ExecContext(h.ctx, `
+		INSERT INTO sessions
+			(id, user_id, token_hash, created_at, expires_at, idle_expires_at, recent_totp_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, "session-"+userID+"-"+rawToken, userID, tokenHash[:], formatTime(now),
+		formatTime(now.Add(SessionAbsoluteLifetime)),
+		formatTime(now.Add(SessionIdleLifetime)), recentTOTPAt); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (h *identityHarness) totpAt(at time.Time) string {

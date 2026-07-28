@@ -319,18 +319,17 @@ func (s *Service) RevokeUserSessionsTx(
 
 func (s *Service) ChangeSystemRole(
 	ctx context.Context,
-	actorUserID, targetUserID, newRole string,
+	actorSessionToken, targetUserID, newRole string,
 ) error {
-	if actorUserID == "" || targetUserID == "" {
+	if actorSessionToken == "" {
+		return ErrInvalidSession
+	}
+	if targetUserID == "" {
 		return ErrUserNotFound
 	}
-	switch newRole {
-	case SystemRoleOwner, SystemRoleAdmin, SystemRoleMember:
-	default:
-		return ErrInvalidSystemRole
-	}
+	actorTokenHash := sha256.Sum256([]byte(actorSessionToken))
 	return s.repository.changeSystemRole(
-		ctx, actorUserID, targetUserID, newRole, s.now(),
+		ctx, actorTokenHash[:], targetUserID, newRole, s.now(),
 	)
 }
 

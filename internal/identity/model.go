@@ -34,6 +34,8 @@ var (
 	ErrUserNotFound             = errors.New("user not found")
 	ErrForbidden                = errors.New("identity operation forbidden")
 	ErrInvalidSystemRole        = errors.New("invalid system role")
+	ErrRecentTOTPRequired       = errors.New("recent TOTP verification required")
+	ErrLastSystemOwner          = errors.New("at least one active System Owner is required")
 )
 
 type Config struct {
