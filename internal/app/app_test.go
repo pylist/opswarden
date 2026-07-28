@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,6 +69,32 @@ func TestNewConfiguresDefensiveHTTPServerLimits(t *testing.T) {
 			server.ReadHeaderTimeout, server.ReadTimeout, server.WriteTimeout,
 			server.IdleTimeout, server.MaxHeaderBytes,
 		)
+	}
+}
+
+func TestNewMountsProtectedMCPRoute(t *testing.T) {
+	application, err := New(config.Config{
+		ListenAddr: "127.0.0.1:0", DataDir: t.TempDir(),
+		MasterKeyFile: writeMasterKey(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = application.Close() })
+	request := httptest.NewRequest(
+		http.MethodPost, "/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	response := httptest.NewRecorder()
+	application.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Cache-Control") != "no-store" ||
+		response.Header().Get("X-Request-ID") == "" {
+		t.Fatalf("missing MCP security headers: %v", response.Header())
 	}
 }
 

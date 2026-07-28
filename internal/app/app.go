@@ -15,6 +15,7 @@ import (
 	"opswarden/internal/cryptobox"
 	"opswarden/internal/httpapi"
 	"opswarden/internal/identity"
+	"opswarden/internal/mcpserver"
 	"opswarden/internal/platform"
 	"opswarden/internal/spaces"
 	"opswarden/internal/storage"
@@ -82,14 +83,31 @@ func New(cfg config.Config) (_ *App, err error) {
 	if err != nil {
 		return nil, err
 	}
-	handler := httpapi.New(httpapi.Dependencies{
+	limiter := agents.NewLimiter(agents.LimiterConfig{})
+	apiHandler := httpapi.New(httpapi.Dependencies{
 		Identity: identityService, Spaces: spaceService,
 		Credentials: credentialService, Assets: assetService,
 		Agents: agentService, Audit: auditService, AuthAudit: auditService,
-		Clock: clock, MasterKey: masterKey,
+		Limiter: limiter, Clock: clock, MasterKey: masterKey,
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
 		Fallback:          webui.Handler(),
 	})
+	mcpHandler, err := mcpserver.New(mcpserver.Dependencies{
+		Agents: agentService, Credentials: credentialService,
+		Assets: assetService, AuthAudit: auditService,
+		Limiter: limiter, Clock: clock,
+		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
+	})
+	if err != nil {
+		if closer, ok := apiHandler.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", mcpHandler)
+	mux.Handle("/", apiHandler)
+	handler := http.Handler(mux)
 	application := &App{
 		handler: handler,
 		db:      db,
@@ -103,7 +121,7 @@ func New(cfg config.Config) (_ *App, err error) {
 			MaxHeaderBytes:    32 << 10,
 		},
 	}
-	application.apiCloser, _ = handler.(interface{ Close() error })
+	application.apiCloser, _ = apiHandler.(interface{ Close() error })
 	return application, nil
 }
 
