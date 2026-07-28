@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"time"
 
 	"opswarden/internal/authorization"
@@ -21,13 +20,15 @@ type Repository struct {
 }
 
 type tokenRow struct {
-	ID        string
-	AgentID   string
-	Hash      []byte
-	Prefix    string
-	ExpiresAt *time.Time
-	RevokedAt *time.Time
-	AgentDead bool
+	ID         string
+	AgentID    string
+	Hash       []byte
+	Prefix     string
+	CreatedAt  time.Time
+	ExpiresAt  *time.Time
+	RevokedAt  *time.Time
+	LastUsedAt *time.Time
+	AgentDead  bool
 }
 
 func NewRepository(db *storage.DB) (*Repository, error) {
@@ -123,63 +124,64 @@ func (repository *Repository) requireActiveSpaceTx(
 	return nil
 }
 
-func (repository *Repository) tokenRowsTx(
+type rowQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (repository *Repository) tokenByHash(
 	ctx context.Context,
-	tx *sql.Tx,
-) ([]tokenRow, error) {
-	rows, err := tx.QueryContext(ctx, `
+	queryer rowQueryer,
+	hash []byte,
+) (tokenRow, bool, error) {
+	var token tokenRow
+	var createdAt string
+	var expiresAt, revokedAt, lastUsedAt sql.NullString
+	err := queryer.QueryRowContext(ctx, `
 		SELECT
 			t.id,
 			t.agent_id,
 			t.token_hash,
 			t.token_prefix,
+			t.created_at,
 			t.expires_at,
 			t.revoked_at,
+			t.last_used_at,
 			a.deleted_at IS NOT NULL
 		FROM agent_tokens t
 		JOIN agents a ON a.id = t.agent_id
-		ORDER BY t.id
-	`)
+		WHERE t.token_hash = ?
+	`, hash).Scan(
+		&token.ID, &token.AgentID, &token.Hash, &token.Prefix,
+		&createdAt, &expiresAt, &revokedAt, &lastUsedAt, &token.AgentDead,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return tokenRow{}, false, nil
+	}
 	if err != nil {
-		return nil, errors.New("authenticate agent")
+		return tokenRow{}, false, ErrAuthenticationUnavailable
 	}
-	defer rows.Close()
-	var tokens []tokenRow
-	for rows.Next() {
-		var token tokenRow
-		var expiresAt, revokedAt sql.NullString
-		if err := rows.Scan(
-			&token.ID, &token.AgentID, &token.Hash, &token.Prefix,
-			&expiresAt, &revokedAt, &token.AgentDead,
-		); err != nil {
-			return nil, errors.New("authenticate agent")
-		}
-		var parseErr error
-		if expiresAt.Valid {
-			parsed, err := parseAgentTime(expiresAt.String)
-			if err != nil {
-				parseErr = err
-			} else {
-				token.ExpiresAt = &parsed
-			}
-		}
-		if revokedAt.Valid {
-			parsed, err := parseAgentTime(revokedAt.String)
-			if err != nil {
-				parseErr = err
-			} else {
-				token.RevokedAt = &parsed
-			}
-		}
-		if parseErr != nil {
-			return nil, errors.New("authenticate agent")
-		}
-		tokens = append(tokens, token)
+	token.CreatedAt, err = parseAgentTime(createdAt)
+	if err != nil {
+		return tokenRow{}, false, ErrAuthenticationUnavailable
 	}
-	if err := rows.Err(); err != nil {
-		return nil, errors.New("authenticate agent")
+	for _, optional := range []struct {
+		encoded     sql.NullString
+		destination **time.Time
+	}{
+		{expiresAt, &token.ExpiresAt},
+		{revokedAt, &token.RevokedAt},
+		{lastUsedAt, &token.LastUsedAt},
+	} {
+		if !optional.encoded.Valid {
+			continue
+		}
+		parsed, err := parseAgentTime(optional.encoded.String)
+		if err != nil {
+			return tokenRow{}, false, ErrAuthenticationUnavailable
+		}
+		*optional.destination = &parsed
 	}
-	return tokens, nil
+	return token, true, nil
 }
 
 func (repository *Repository) grantsTx(
@@ -194,7 +196,7 @@ func (repository *Repository) grantsTx(
 		ORDER BY space_id
 	`, agentID)
 	if err != nil {
-		return nil, errors.New("read agent grants")
+		return nil, ErrAuthenticationUnavailable
 	}
 	defer rows.Close()
 	var grants []Grant
@@ -202,28 +204,54 @@ func (repository *Repository) grantsTx(
 		var grant Grant
 		var scopesJSON, labelsJSON []byte
 		if err := rows.Scan(&grant.SpaceID, &scopesJSON, &labelsJSON); err != nil {
-			return nil, errors.New("read agent grants")
+			return nil, ErrAuthenticationUnavailable
 		}
-		if err := decodeCanonicalJSON(scopesJSON, &grant.Scopes); err != nil {
-			return nil, errors.New("read agent grants")
-		}
-		if err := decodeCanonicalJSON(labelsJSON, &grant.RequiredLabels); err != nil {
-			return nil, errors.New("read agent grants")
-		}
-		normalized, err := normalizeGrant(grant)
-		if err != nil ||
-			!slices.Equal(normalized.Scopes, grant.Scopes) {
-			return nil, errors.New("read agent grants")
+		normalized, err := decodeGrant(
+			grant.SpaceID, scopesJSON, labelsJSON,
+		)
+		if err != nil {
+			return nil, ErrAuthenticationUnavailable
 		}
 		grants = append(grants, normalized)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, errors.New("read agent grants")
+		return nil, ErrAuthenticationUnavailable
 	}
 	return grants, nil
 }
 
-func decodeCanonicalJSON(encoded []byte, destination any) error {
+func decodeGrant(
+	spaceID string,
+	scopesJSON, labelsJSON []byte,
+) (Grant, error) {
+	if len(scopesJSON) == 0 || scopesJSON[0] != '[' ||
+		len(labelsJSON) == 0 || labelsJSON[0] != '{' {
+		return Grant{}, ErrInvalidGrant
+	}
+	var scopes []authorization.Scope
+	if err := decodeJSON(scopesJSON, &scopes); err != nil || scopes == nil {
+		return Grant{}, ErrInvalidGrant
+	}
+	var labels map[string]string
+	if err := decodeJSON(labelsJSON, &labels); err != nil || labels == nil {
+		return Grant{}, ErrInvalidGrant
+	}
+	normalized, err := normalizeGrant(Grant{
+		SpaceID: spaceID, Scopes: scopes, RequiredLabels: labels,
+	})
+	if err != nil {
+		return Grant{}, ErrInvalidGrant
+	}
+	canonicalScopes, canonicalLabels, err := encodeGrant(normalized)
+	if err != nil ||
+		!bytes.Equal(canonicalScopes, scopesJSON) ||
+		!bytes.Equal(canonicalLabels, labelsJSON) {
+		return Grant{}, ErrInvalidGrant
+	}
+	return normalized, nil
+}
+
+func decodeJSON(encoded []byte, destination any) error {
 	if len(encoded) == 0 || len(encoded) > 16*1024 {
 		return ErrInvalidGrant
 	}
@@ -234,10 +262,6 @@ func decodeCanonicalJSON(encoded []byte, destination any) error {
 	}
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return ErrInvalidGrant
-	}
-	canonical, err := json.Marshal(destination)
-	if err != nil || !bytes.Equal(canonical, encoded) {
 		return ErrInvalidGrant
 	}
 	return nil

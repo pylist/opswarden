@@ -67,6 +67,58 @@ func TestLimiterIsBoundedRaceSafeAndTimeRollbackFailsSafe(t *testing.T) {
 	}
 }
 
+func TestLimiterSubjectCapacityIsPerOperation(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{
+			OperationAuthFailure:    1,
+			OperationCredentialRead: 1,
+		},
+		RefillPerSecond: map[Operation]float64{
+			OperationAuthFailure:    1,
+			OperationCredentialRead: 1,
+		},
+		MaxSubjects: 1,
+	})
+	if !limiter.Allow("attacker-ip", OperationAuthFailure, now).Allowed {
+		t.Fatal("auth failure bucket denied first subject")
+	}
+	if !limiter.Allow(
+		"human:session", OperationCredentialRead, now,
+	).Allowed {
+		t.Fatal("auth-failure subject cap blocked credential read")
+	}
+}
+
+func TestLimiterFullOperationEvictsOldestForNewLegitimateSubject(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{OperationAuthFailure: 1},
+		RefillPerSecond: map[Operation]float64{
+			OperationAuthFailure: 1,
+		},
+		MaxSubjects: 2,
+		IdleTTL:     time.Hour,
+	})
+	if !limiter.Allow("attacker-a", OperationAuthFailure, now).Allowed ||
+		!limiter.Allow(
+			"attacker-b", OperationAuthFailure, now.Add(time.Second),
+		).Allowed {
+		t.Fatal("attack subjects did not enter")
+	}
+	if !limiter.Allow(
+		"legitimate", OperationAuthFailure, now.Add(2*time.Second),
+	).Allowed {
+		t.Fatal("full bucket map permanently locked out new subject")
+	}
+	if limiter.SubjectCountFor(OperationAuthFailure) != 2 {
+		t.Fatalf(
+			"auth subjects=%d",
+			limiter.SubjectCountFor(OperationAuthFailure),
+		)
+	}
+}
+
 func subjectForTest(index int) string {
 	const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
 	return "subject-" + string(digits[index%len(digits)])

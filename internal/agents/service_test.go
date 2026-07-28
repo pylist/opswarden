@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -340,5 +341,203 @@ func TestTokenPrefixCannotAuthenticate(t *testing.T) {
 	}
 	if _, err := h.service.Authenticate(h.ctx, issued.Prefix); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestAuthenticationFailuresHaveOnePublicMessage(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	expired, err := h.service.IssueToken(
+		h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.clock.now = h.clock.now.Add(time.Hour)
+	_, expiredErr := h.service.Authenticate(h.ctx, expired.Raw)
+	_, invalidErr := h.service.Authenticate(h.ctx, "not-a-token")
+	if expiredErr == nil || invalidErr == nil ||
+		expiredErr.Error() != invalidErr.Error() {
+		t.Fatalf("expired=%q invalid=%q", expiredErr, invalidErr)
+	}
+	if !errors.Is(expiredErr, ErrTokenExpired) ||
+		!errors.Is(expiredErr, ErrAuthenticationFailed) ||
+		!errors.Is(invalidErr, ErrInvalidToken) ||
+		!errors.Is(invalidErr, ErrAuthenticationFailed) {
+		t.Fatalf("expired=%v invalid=%v", expiredErr, invalidErr)
+	}
+}
+
+func TestAuthenticateFailsClosedOnClockRollbackWithoutRegressingUsage(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	issued, err := h.service.IssueToken(
+		h.ctx, h.owner, agent.ID, h.clock.now.Add(24*time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstUsedAt := h.clock.now.Add(time.Hour)
+	h.clock.now = firstUsedAt
+	if _, err := h.service.Authenticate(h.ctx, issued.Raw); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.now = firstUsedAt.Add(-time.Minute)
+	if _, err := h.service.Authenticate(
+		h.ctx, issued.Raw,
+	); !errors.Is(err, ErrInvalidClock) {
+		t.Fatalf("got %v", err)
+	}
+	var stored string
+	if err := h.db.Reader.QueryRow(`
+		SELECT last_used_at FROM agent_tokens WHERE id = ?
+	`, issued.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != formatAgentTime(firstUsedAt) {
+		t.Fatalf("last_used_at regressed to %q", stored)
+	}
+	h.clock.now = time.Time{}
+	if _, err := h.service.Authenticate(
+		h.ctx, issued.Raw,
+	); !errors.Is(err, ErrInvalidClock) {
+		t.Fatalf("zero clock: %v", err)
+	}
+}
+
+func TestAuthenticateFailsClosedOnMalformedGrantShapes(t *testing.T) {
+	for name, corruption := range map[string]struct {
+		scopes string
+		labels string
+	}{
+		"labels null": {
+			scopes: `["credential:read"]`, labels: `null`,
+		},
+		"labels array": {
+			scopes: `["credential:read"]`, labels: `[]`,
+		},
+		"labels scalar": {
+			scopes: `["credential:read"]`, labels: `"dev"`,
+		},
+		"labels duplicate": {
+			scopes: `["credential:read"]`,
+			labels: `{"environment":"dev","environment":"dev"}`,
+		},
+		"labels noncanonical": {
+			scopes: `["credential:read"]`, labels: `{ "environment":"dev"}`,
+		},
+		"labels invalid key": {
+			scopes: `["credential:read"]`, labels: `{" Environment":"dev"}`,
+		},
+		"scopes null": {
+			scopes: `null`, labels: `{}`,
+		},
+		"scopes object": {
+			scopes: `{"scope":"credential:read"}`, labels: `{}`,
+		},
+		"scopes scalar": {
+			scopes: `"credential:read"`, labels: `{}`,
+		},
+		"scopes duplicate": {
+			scopes: `["credential:read","credential:read"]`, labels: `{}`,
+		},
+		"scopes wrong case": {
+			scopes: `["Credential:Read"]`, labels: `{}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newAgentHarness(t)
+			agent := h.createAgent(t)
+			issued, err := h.service.IssueToken(
+				h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.db.Writer.Exec(`
+				INSERT INTO agent_space_grants (
+					agent_id, space_id, role, scopes_json, labels_json
+				) VALUES (?, ?, 'scoped', ?, ?)
+			`, agent.ID, h.spaceID, corruption.scopes, corruption.labels); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.service.Authenticate(
+				h.ctx, issued.Raw,
+			); !errors.Is(err, ErrAuthenticationUnavailable) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthenticateRemainsCorrectWithManyNonmatchingTokens(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	target, err := h.service.IssueToken(
+		h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 2_000; index++ {
+		hash := sha256.Sum256([]byte("nonmatching-" + strconv.Itoa(index)))
+		if _, err := h.db.Writer.Exec(`
+			INSERT INTO agent_tokens (
+				id, agent_id, token_hash, token_prefix, created_at, expires_at
+			) VALUES (?, ?, ?, 'owat_unused', ?, ?)
+		`, "bulk_"+subjectForTest(index)+"_"+strings.Repeat("x", index/36),
+			agent.ID, hash[:], formatAgentTime(h.clock.now),
+			formatAgentTime(h.clock.now.Add(time.Hour))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.service.Authenticate(h.ctx, target.Raw); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentRevocationNeverAuthenticatesAfterCommit(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	issued, err := h.service.IssueToken(
+		h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	revokeDone := make(chan struct{})
+	errs := make(chan error, 8)
+	for range 8 {
+		go func() {
+			<-start
+			for {
+				select {
+				case <-revokeDone:
+					for range 20 {
+						if _, err := h.service.Authenticate(
+							h.ctx, issued.Raw,
+						); err == nil {
+							errs <- errors.New("authenticated after revocation commit")
+							return
+						}
+					}
+					errs <- nil
+					return
+				default:
+					_, _ = h.service.Authenticate(h.ctx, issued.Raw)
+				}
+			}
+		}()
+	}
+	close(start)
+	if err := h.service.RevokeToken(h.ctx, h.owner, issued.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(revokeDone)
+	for range 8 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
 	}
 }

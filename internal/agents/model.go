@@ -13,19 +13,38 @@ import (
 )
 
 var (
-	ErrInvalidInput     = errors.New("invalid agent input")
-	ErrInvalidScope     = errors.New("invalid agent scope")
-	ErrInvalidGrant     = errors.New("invalid agent grant")
-	ErrAgentNotFound    = errors.New("agent not found")
-	ErrAgentDisabled    = errors.New("agent is disabled")
-	ErrTokenNotFound    = errors.New("agent token not found")
-	ErrInvalidToken     = errors.New("invalid agent token")
-	ErrTokenRevoked     = errors.New("agent token is revoked")
-	ErrTokenExpired     = errors.New("agent token is expired")
-	ErrUnauthenticated  = errors.New("agent operation is unauthenticated")
-	ErrForbidden        = errors.New("agent operation is forbidden")
-	ErrAuditUnavailable = audit.ErrAuditUnavailable
+	ErrInvalidInput              = errors.New("invalid agent input")
+	ErrInvalidScope              = errors.New("invalid agent scope")
+	ErrInvalidGrant              = errors.New("invalid agent grant")
+	ErrAgentNotFound             = errors.New("agent not found")
+	ErrAgentDisabled             = errors.New("agent is disabled")
+	ErrTokenNotFound             = errors.New("agent token not found")
+	ErrInvalidToken              = errors.New("invalid agent token")
+	ErrTokenRevoked              = errors.New("agent token is revoked")
+	ErrTokenExpired              = errors.New("agent token is expired")
+	ErrInvalidClock              = errors.New("agent authentication clock is invalid")
+	ErrAuthenticationFailed      = errors.New("agent authentication failed")
+	ErrAuthenticationUnavailable = errors.New("agent authentication unavailable")
+	ErrUnauthenticated           = errors.New("agent operation is unauthenticated")
+	ErrForbidden                 = errors.New("agent operation is forbidden")
+	ErrAuditUnavailable          = audit.ErrAuditUnavailable
 )
+
+type authenticationError struct {
+	reason error
+}
+
+func (err authenticationError) Error() string {
+	return ErrAuthenticationFailed.Error()
+}
+
+func (err authenticationError) Is(target error) bool {
+	return target == ErrAuthenticationFailed || target == err.reason
+}
+
+func authenticationFailed(reason error) error {
+	return authenticationError{reason: reason}
+}
 
 type Agent struct {
 	ID        string

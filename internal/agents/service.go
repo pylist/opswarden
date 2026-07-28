@@ -327,50 +327,75 @@ func (service *Service) Authenticate(
 	ctx context.Context,
 	raw string,
 ) (AuthenticatedPrincipal, error) {
-	hash := sha256.Sum256([]byte(raw))
-	validShape := validRawToken(raw)
+	if !validRawToken(raw) {
+		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidToken)
+	}
 	now := service.clock.Now().UTC()
+	if now.IsZero() {
+		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidClock)
+	}
+	hash := sha256.Sum256([]byte(raw))
+	candidate, found, err := service.repository.tokenByHash(
+		ctx, service.repository.db.Reader, hash[:],
+	)
+	if err != nil {
+		clear(hash[:])
+		return AuthenticatedPrincipal{}, err
+	}
+	if !found {
+		clear(hash[:])
+		return AuthenticatedPrincipal{}, authenticationFailed(ErrInvalidToken)
+	}
+	if err := validateAuthenticationCandidate(candidate, raw, hash[:], now); err != nil {
+		clear(hash[:])
+		return AuthenticatedPrincipal{}, err
+	}
 	var principal AuthenticatedPrincipal
-	var authErr error
-	err := service.repository.withTx(ctx, func(tx *sql.Tx) error {
-		tokens, err := service.repository.tokenRowsTx(ctx, tx)
+	err = service.repository.withTx(ctx, func(tx *sql.Tx) error {
+		token, found, err := service.repository.tokenByHash(ctx, tx, hash[:])
 		if err != nil {
 			return err
 		}
-		match := -1
-		for index := range tokens {
-			equal := subtle.ConstantTimeCompare(tokens[index].Hash, hash[:])
-			if equal == 1 {
-				match = index
-			}
+		if !found {
+			return authenticationFailed(ErrInvalidToken)
 		}
-		if !validShape || match < 0 {
-			authErr = ErrInvalidToken
-			return nil
+		if err := validateAuthenticationCandidate(
+			token, raw, hash[:], now,
+		); err != nil {
+			return err
 		}
-		token := tokens[match]
-		switch {
-		case token.Prefix != raw[:len("owat_")+8]:
-			authErr = ErrInvalidToken
-			return nil
-		case token.AgentDead:
-			authErr = ErrAgentDisabled
-			return nil
-		case token.RevokedAt != nil:
-			authErr = ErrTokenRevoked
-			return nil
-		case token.ExpiresAt != nil && !now.Before(*token.ExpiresAt):
-			authErr = ErrTokenExpired
-			return nil
+		formattedNow := formatAgentTime(now)
+		result, err := tx.ExecContext(ctx, `
+			UPDATE agent_tokens
+			SET last_used_at = CASE
+				WHEN last_used_at IS NULL OR last_used_at < ? THEN ?
+				ELSE last_used_at
+			END
+			WHERE id = ?
+			  AND token_hash = ?
+			  AND revoked_at IS NULL
+			  AND created_at <= ?
+			  AND (last_used_at IS NULL OR last_used_at <= ?)
+			  AND (expires_at IS NULL OR expires_at > ?)
+			  AND EXISTS (
+				SELECT 1 FROM agents
+				WHERE id = agent_tokens.agent_id AND deleted_at IS NULL
+			  )
+		`, formattedNow, formattedNow, token.ID, hash[:],
+			formattedNow, formattedNow, formattedNow)
+		if err != nil {
+			return ErrAuthenticationUnavailable
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return ErrAuthenticationUnavailable
+		}
+		if affected != 1 {
+			return authenticationFailed(ErrInvalidToken)
 		}
 		grants, err := service.repository.grantsTx(ctx, tx, token.AgentID)
 		if err != nil {
 			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE agent_tokens SET last_used_at = ? WHERE id = ?
-		`, formatAgentTime(now), token.ID); err != nil {
-			return errors.New("authenticate agent")
 		}
 		principal = AuthenticatedPrincipal{
 			AgentID: token.AgentID, TokenID: token.ID,
@@ -382,10 +407,34 @@ func (service *Service) Authenticate(
 	if err != nil {
 		return AuthenticatedPrincipal{}, err
 	}
-	if authErr != nil {
-		return AuthenticatedPrincipal{}, authErr
-	}
 	return cloneAuthenticatedPrincipal(principal), nil
+}
+
+func validateAuthenticationCandidate(
+	token tokenRow,
+	raw string,
+	hash []byte,
+	now time.Time,
+) error {
+	if subtle.ConstantTimeCompare(token.Hash, hash) != 1 {
+		return ErrAuthenticationUnavailable
+	}
+	switch {
+	case token.Prefix != raw[:len("owat_")+8]:
+		return authenticationFailed(ErrInvalidToken)
+	case token.AgentDead:
+		return authenticationFailed(ErrAgentDisabled)
+	case token.RevokedAt != nil:
+		return authenticationFailed(ErrTokenRevoked)
+	case token.ExpiresAt != nil && !now.Before(*token.ExpiresAt):
+		return authenticationFailed(ErrTokenExpired)
+	case now.Before(token.CreatedAt):
+		return authenticationFailed(ErrInvalidClock)
+	case token.LastUsedAt != nil && now.Before(*token.LastUsedAt):
+		return authenticationFailed(ErrInvalidClock)
+	default:
+		return nil
+	}
 }
 
 func (service *Service) ListUsage(

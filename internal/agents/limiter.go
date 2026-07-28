@@ -46,7 +46,8 @@ type Limiter struct {
 	refill      map[Operation]float64
 	maxSubjects int
 	idleTTL     time.Duration
-	subjects    map[string]map[Operation]*limiterBucket
+	buckets     map[Operation]map[string]*limiterBucket
+	lastNow     map[Operation]time.Time
 }
 
 func NewLimiter(config LimiterConfig) *Limiter {
@@ -61,7 +62,8 @@ func NewLimiter(config LimiterConfig) *Limiter {
 		refill:      make(map[Operation]float64, len(allOperations)),
 		maxSubjects: config.MaxSubjects,
 		idleTTL:     config.IdleTTL,
-		subjects:    make(map[string]map[Operation]*limiterBucket),
+		buckets:     make(map[Operation]map[string]*limiterBucket),
+		lastNow:     make(map[Operation]time.Time),
 	}
 	defaultCapacity := map[Operation]int{
 		OperationAuthFailure: 5, OperationCredentialList: 60,
@@ -77,11 +79,12 @@ func NewLimiter(config LimiterConfig) *Limiter {
 			capacity = defaultCapacity[operation]
 		}
 		refill := config.RefillPerSecond[operation]
-		if refill <= 0 {
+		if refill <= 0 || math.IsNaN(refill) || math.IsInf(refill, 0) {
 			refill = defaultRefill[operation]
 		}
 		limiter.capacity[operation] = float64(capacity)
 		limiter.refill[operation] = refill
+		limiter.buckets[operation] = make(map[string]*limiterBucket)
 	}
 	return limiter
 }
@@ -102,19 +105,19 @@ func (limiter *Limiter) Allow(
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
 
-	operations, exists := limiter.subjects[subject]
-	if !exists {
-		limiter.removeIdleLocked(now)
-		if len(limiter.subjects) >= limiter.maxSubjects {
-			return Decision{RetryAfter: limiter.idleTTL}
-		}
-		operations = make(map[Operation]*limiterBucket)
-		limiter.subjects[subject] = operations
+	if last := limiter.lastNow[operation]; !last.IsZero() && now.Before(last) {
+		return Decision{RetryAfter: last.Sub(now)}
 	}
-	bucket, exists := operations[operation]
+	limiter.lastNow[operation] = now
+	subjects := limiter.buckets[operation]
+	bucket, exists := subjects[subject]
 	if !exists {
+		limiter.removeIdleLocked(operation, now)
+		if len(subjects) >= limiter.maxSubjects {
+			limiter.evictOldestLocked(operation)
+		}
 		bucket = &limiterBucket{tokens: capacity, last: now, lastSeen: now}
-		operations[operation] = bucket
+		subjects[subject] = bucket
 	}
 	if now.Before(bucket.last) {
 		return Decision{RetryAfter: bucket.last.Sub(now)}
@@ -141,19 +144,42 @@ func (limiter *Limiter) SubjectCount() int {
 	}
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
-	return len(limiter.subjects)
+	count := 0
+	for _, subjects := range limiter.buckets {
+		count += len(subjects)
+	}
+	return count
 }
 
-func (limiter *Limiter) removeIdleLocked(now time.Time) {
-	for subject, operations := range limiter.subjects {
-		latest := time.Time{}
-		for _, bucket := range operations {
-			if bucket.lastSeen.After(latest) {
-				latest = bucket.lastSeen
-			}
+func (limiter *Limiter) SubjectCountFor(operation Operation) int {
+	if limiter == nil {
+		return 0
+	}
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	return len(limiter.buckets[operation])
+}
+
+func (limiter *Limiter) removeIdleLocked(operation Operation, now time.Time) {
+	for subject, bucket := range limiter.buckets[operation] {
+		if bucket.lastSeen.IsZero() ||
+			now.Sub(bucket.lastSeen) >= limiter.idleTTL {
+			delete(limiter.buckets[operation], subject)
 		}
-		if latest.IsZero() || now.Sub(latest) >= limiter.idleTTL {
-			delete(limiter.subjects, subject)
+	}
+}
+
+func (limiter *Limiter) evictOldestLocked(operation Operation) {
+	var oldestSubject string
+	var oldest time.Time
+	for subject, bucket := range limiter.buckets[operation] {
+		if oldestSubject == "" || bucket.lastSeen.Before(oldest) ||
+			(bucket.lastSeen.Equal(oldest) && subject < oldestSubject) {
+			oldestSubject = subject
+			oldest = bucket.lastSeen
 		}
+	}
+	if oldestSubject != "" {
+		delete(limiter.buckets[operation], oldestSubject)
 	}
 }
