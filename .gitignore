@@ -1,0 +1,15 @@
+.superpowers/
+.env
+
+# Runtime data and sensitive material
+data/
+backups/
+master.key
+*.db
+*.db-shm
+*.db-wal
+
+# Build output
+dist/
+coverage/
+bin/
