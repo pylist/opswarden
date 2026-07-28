@@ -1000,23 +1000,67 @@ func (s *Service) PurgeExpired(
 func (s *Service) PurgeExpiredMaintenance(
 	ctx context.Context,
 	cutoff time.Time,
+	requestID string,
 ) (int64, error) {
 	if s == nil || s.repository == nil || cutoff.IsZero() ||
-		cutoff.Location() != time.UTC {
+		cutoff.Location() != time.UTC || requestID == "" {
 		return 0, ErrInvalidInput
 	}
 	var purged int64
 	err := s.repository.withTx(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `
-			DELETE FROM credentials
+		rows, err := tx.QueryContext(ctx, `
+			SELECT id, space_id, name, type, current_version, deleted_at
+			FROM credentials
 			WHERE deleted_at IS NOT NULL AND deleted_at <= ?
+			ORDER BY id
 		`, formatCredentialTime(cutoff))
 		if err != nil {
-			return fmt.Errorf("purge expired credentials: %w", err)
+			return fmt.Errorf("find expired credentials: %w", err)
 		}
-		purged, err = result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("count expired credentials: %w", err)
+		var expired []Metadata
+		for rows.Next() {
+			metadata, err := scanMetadataRow(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			expired = append(expired, metadata)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, metadata := range expired {
+			eventID, err := randomCredentialID("aud_")
+			if err != nil {
+				return ErrAuditUnavailable
+			}
+			event := audit.Event{
+				ID: eventID, RequestID: requestID, CreatedAt: s.clock.Now().UTC(),
+				Actor: audit.Actor{
+					Type: audit.ActorSystem, ID: audit.SystemMaintenanceActorID,
+					Fingerprint: audit.SystemMaintenanceFingerprint,
+				},
+				Action: "credential.purge", SpaceID: metadata.SpaceID,
+				ResourceType: "credential", ResourceID: metadata.ID,
+				SourceIP: "0.0.0.0", Success: true,
+				ChangeFields: audit.ChangeFields{audit.FieldDeletedAt},
+			}
+			if err := s.audit.AppendTx(ctx, tx, event); err != nil {
+				return ErrAuditUnavailable
+			}
+			result, err := tx.ExecContext(ctx, `
+				DELETE FROM credentials
+				WHERE id = ? AND current_version = ?
+				  AND deleted_at IS NOT NULL AND deleted_at <= ?
+			`, metadata.ID, metadata.Version, formatCredentialTime(cutoff))
+			if err != nil {
+				return fmt.Errorf("purge expired credential: %w", err)
+			}
+			affected, err := result.RowsAffected()
+			if err != nil || affected != 1 {
+				return fmt.Errorf("purge expired credential changed")
+			}
+			purged++
 		}
 		return nil
 	})

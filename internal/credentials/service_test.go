@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -796,6 +797,61 @@ func TestRestoreAndPurgeExpiredRecycleBin(t *testing.T) {
 	}
 	if h.countCredentials() != 0 {
 		t.Fatal("expired credential remains")
+	}
+}
+
+func TestMaintenancePurgeAuditsEachCredentialInSameTransaction(t *testing.T) {
+	h := newCredentialHarness(t)
+	first := h.create(h.editor)
+	second := h.create(h.editor)
+	for index, item := range []MutationResult{first, second} {
+		if err := h.service.Delete(
+			h.ctx, h.editor, item.ID, item.Version,
+			h.writeContext(fmt.Sprintf("maintenance-delete-%d", index), h.editor.Actor),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.clock.Advance(30 * 24 * time.Hour)
+	count, err := h.service.PurgeExpiredMaintenance(
+		h.ctx, h.clock.Now().UTC(), "mnt_20260729T120000000000000Z",
+	)
+	if err != nil || count != 2 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	var events int
+	if err := h.db.Reader.QueryRow(`
+		SELECT count(*) FROM audit_events
+		WHERE action = 'credential.purge'
+		  AND json_extract(metadata_json, '$.actor_type') = 'system'
+		  AND json_extract(metadata_json, '$.request_id') =
+		      'mnt_20260729T120000000000000Z'
+	`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 2 || h.countCredentials() != 0 {
+		t.Fatalf("events=%d credentials=%d", events, h.countCredentials())
+	}
+}
+
+func TestMaintenancePurgeAuditFailureRollsBackBatch(t *testing.T) {
+	h := newCredentialHarness(t)
+	created := h.create(h.editor)
+	if err := h.service.Delete(
+		h.ctx, h.editor, created.ID, created.Version,
+		h.writeContext("maintenance-rollback-delete", h.editor.Actor),
+	); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(30 * 24 * time.Hour)
+	h.audit.FailNextInsert(errors.New("audit unavailable"))
+	if _, err := h.service.PurgeExpiredMaintenance(
+		h.ctx, h.clock.Now().UTC(), "mnt_rollback",
+	); !errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("err=%v", err)
+	}
+	if h.countCredentials() != 1 {
+		t.Fatal("audit failure did not roll back maintenance purge")
 	}
 }
 

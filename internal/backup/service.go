@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,17 +17,20 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
+	sqlitevfs "modernc.org/sqlite/vfs"
 
 	"opswarden/internal/platform"
 	"opswarden/internal/storage"
-
-	sqlite "modernc.org/sqlite"
 )
 
 const (
-	filePrefix = "opswarden-"
-	fileSuffix = ".sqlite3"
+	filePrefix       = "opswarden-"
+	fileSuffix       = ".sqlite3"
+	maxSnapshotBytes = int64(128 << 20)
 )
 
 var (
@@ -40,15 +44,18 @@ var (
 )
 
 type RunRecord struct {
-	ID          string    `json:"id"`
-	Status      string    `json:"status"`
-	Filename    string    `json:"filename,omitempty"`
-	Checksum    string    `json:"checksum,omitempty"`
-	SizeBytes   int64     `json:"sizeBytes,omitempty"`
-	StartedAt   time.Time `json:"startedAt"`
-	CompletedAt time.Time `json:"completedAt,omitempty,omitzero"`
-	ErrorCode   string    `json:"errorCode,omitempty"`
-	Retained    bool      `json:"retained"`
+	ID                    string    `json:"id"`
+	Status                string    `json:"status"`
+	Filename              string    `json:"filename,omitempty"`
+	Checksum              string    `json:"checksum,omitempty"`
+	SizeBytes             int64     `json:"sizeBytes,omitempty"`
+	StartedAt             time.Time `json:"startedAt"`
+	CompletedAt           time.Time `json:"completedAt,omitempty,omitzero"`
+	ErrorCode             string    `json:"errorCode,omitempty"`
+	Retained              bool      `json:"retained"`
+	VerificationStatus    string    `json:"verificationStatus"`
+	VerifiedAt            time.Time `json:"verifiedAt,omitempty,omitzero"`
+	VerificationErrorCode string    `json:"verificationErrorCode,omitempty"`
 }
 
 type Verification struct {
@@ -57,10 +64,14 @@ type Verification struct {
 }
 
 type Service struct {
-	db    *storage.DB
-	dir   string
-	clock platform.Clock
-	runMu sync.Mutex
+	db      *storage.DB
+	dir     string
+	root    *os.Root
+	dirInfo os.FileInfo
+	clock   platform.Clock
+	runMu   sync.Mutex
+
+	beforeOnlineCopy func()
 }
 
 func NewService(db *storage.DB, directory string, clock platform.Clock) (*Service, error) {
@@ -72,11 +83,19 @@ func NewService(db *storage.DB, directory string, clock platform.Clock) (*Servic
 	if err != nil || filepath.Clean(absolute) != absolute {
 		return nil, ErrUnavailable
 	}
-	if err := ensurePrivateDirectory(absolute); err != nil {
+	info, err := ensurePrivateDirectory(absolute, db.Path)
+	if err != nil {
 		return nil, ErrUnavailable
 	}
-	service := &Service{db: db, dir: absolute, clock: clock}
-	if err := service.reconcile(context.Background()); err != nil {
+	root, err := os.OpenRoot(absolute)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	service := &Service{
+		db: db, dir: absolute, root: root, dirInfo: info, clock: clock,
+	}
+	if err := service.reconcileLocked(context.Background()); err != nil {
+		_ = root.Close()
 		return nil, ErrUnavailable
 	}
 	return service, nil
@@ -87,6 +106,13 @@ func (s *Service) Directory() string {
 		return ""
 	}
 	return s.dir
+}
+
+func (s *Service) Close() error {
+	if s == nil || s.root == nil {
+		return nil
+	}
+	return s.root.Close()
 }
 
 func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
@@ -100,7 +126,7 @@ func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if err := ensurePrivateDirectory(s.dir); err != nil {
+	if err := s.validateDirectory(); err != nil {
 		return "", ErrUnavailable
 	}
 
@@ -118,16 +144,15 @@ func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
 		return "", ErrUnavailable
 	}
 	tempName := "." + filename + ".partial"
-	tempPath, ok := s.confinedPath(tempName)
-	if !ok {
+	if _, ok := s.confinedPath(tempName); !ok {
 		return "", ErrUnavailable
 	}
-	if err := reserveTemp(tempPath); err != nil {
+	if err := s.reserveTemp(tempName); err != nil {
 		return "", ErrUnavailable
 	}
 	defer func() {
 		if resultErr != nil {
-			_ = os.Remove(tempPath)
+			_ = s.root.Remove(tempName)
 		}
 	}()
 	if err := s.recordStart(ctx, id, now); err != nil {
@@ -137,36 +162,55 @@ func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
 		_ = s.recordFailure(context.Background(), id, s.clock.Now().UTC(), code)
 	}
 
-	if err := s.onlineCopy(ctx, tempPath); err != nil {
+	if s.beforeOnlineCopy != nil {
+		s.beforeOnlineCopy()
+	}
+	if err := s.onlineCopy(ctx, tempName); err != nil {
 		fail(classifyError(err))
 		return "", publicError(err)
 	}
-	if err := os.Chmod(tempPath, 0o600); err != nil {
+	if err := s.chmodFile(tempName, 0o600); err != nil {
 		fail("FILESYSTEM_ERROR")
 		return "", ErrUnavailable
 	}
-	verification, err := verifyFile(ctx, tempPath, "")
+	verification, err := s.verifyRelative(ctx, tempName, "")
 	if err != nil {
 		fail(classifyError(err))
 		return "", publicError(err)
 	}
-	if err := syncFile(tempPath); err != nil {
+	if err := s.syncFile(tempName); err != nil {
 		fail("FILESYSTEM_ERROR")
 		return "", ErrUnavailable
 	}
 	// Link publishes without replacing an existing name. The random run id makes
 	// collisions practically impossible, while link(2) still fails closed.
-	if err := os.Link(tempPath, finalPath); err != nil {
+	if err := s.publishLink(tempName, filename); err != nil {
 		fail("PUBLISH_ERROR")
 		return "", ErrUnavailable
 	}
-	if err := os.Remove(tempPath); err != nil {
-		_ = os.Remove(finalPath)
+	if err := s.root.Remove(tempName); err != nil {
+		_ = s.root.Remove(filename)
 		fail("FILESYSTEM_ERROR")
 		return "", ErrUnavailable
 	}
-	if err := syncDirectory(s.dir); err != nil {
-		_ = os.Remove(finalPath)
+	publishedVerification, err := s.verifyRelative(
+		ctx, filename, verification.Checksum,
+	)
+	if err != nil || publishedVerification.Size != verification.Size {
+		_ = s.root.Remove(filename)
+		if err == nil {
+			err = ErrInvalidBackup
+		}
+		fail(classifyError(err))
+		return "", publicError(err)
+	}
+	if err := s.syncDirectory(); err != nil {
+		_ = s.root.Remove(filename)
+		fail("FILESYSTEM_ERROR")
+		return "", ErrUnavailable
+	}
+	if err := s.validateDirectory(); err != nil {
+		_ = s.root.Remove(filename)
 		fail("FILESYSTEM_ERROR")
 		return "", ErrUnavailable
 	}
@@ -184,47 +228,92 @@ func (s *Service) Run(ctx context.Context) (path string, resultErr error) {
 	return finalPath, nil
 }
 
-func (s *Service) onlineCopy(ctx context.Context, destination string) error {
+func (s *Service) onlineCopy(ctx context.Context, destinationName string) error {
+	file, err := s.root.OpenFile(destinationName, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() ||
+		info.Mode().Perm() != 0o600 || linkCount(info) != 1 {
+		return ErrUnavailable
+	}
 	conn, err := s.db.Reader.Conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	destinationURI := (&url.URL{Scheme: "file", Path: destination}).String()
-	return conn.Raw(func(driverConn any) error {
-		backuper, ok := driverConn.(interface {
-			NewBackup(string) (*sqlite.Backup, error)
+	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var pageCount, pageSize int64
+	if err := tx.QueryRowContext(ctx, `PRAGMA page_count`).Scan(
+		&pageCount,
+	); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `PRAGMA page_size`).Scan(
+		&pageSize,
+	); err != nil {
+		return err
+	}
+	if err := validateSnapshotSize(pageCount, pageSize); err != nil {
+		return err
+	}
+	var snapshot []byte
+	err = conn.Raw(func(driverConn any) error {
+		serializer, ok := driverConn.(interface {
+			Serialize() ([]byte, error)
 		})
 		if !ok {
-			return errors.New("online backup unsupported")
+			return errors.New("online serialization unsupported")
 		}
-		operation, err := backuper.NewBackup(destinationURI)
+		var serializeErr error
+		snapshot, serializeErr = serializer.Serialize()
+		return serializeErr
+	})
+	if err != nil {
+		return err
+	}
+	defer clear(snapshot)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(snapshot) == 0 || int64(len(snapshot)) > maxSnapshotBytes {
+		return ErrInvalidBackup
+	}
+	if len(snapshot) < 100 ||
+		string(snapshot[:16]) != "SQLite format 3\x00" {
+		return ErrInvalidBackup
+	}
+	// Serialize preserves the source journal-mode header. A standalone backup
+	// has no WAL sidecars, so normalize the serialized image to rollback mode.
+	// Bytes 18 and 19 are the SQLite file read/write format versions.
+	snapshot[18], snapshot[19] = 1, 1
+	if err := file.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	for offset := 0; offset < len(snapshot); {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		end := min(offset+(1<<20), len(snapshot))
+		written, err := file.Write(snapshot[offset:end])
 		if err != nil {
 			return err
 		}
-		finished := false
-		defer func() {
-			if !finished {
-				_ = operation.Finish()
-			}
-		}()
-		for {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			more, err := operation.Step(256)
-			if err != nil {
-				return err
-			}
-			if !more {
-				if err := operation.Finish(); err != nil {
-					return err
-				}
-				finished = true
-				return nil
-			}
+		if written <= 0 {
+			return io.ErrShortWrite
 		}
-	})
+		offset += written
+	}
+	return nil
 }
 
 func (s *Service) Verify(
@@ -239,7 +328,7 @@ func (s *Service) Verify(
 	if !ok {
 		return Verification{}, ErrInvalidBackup
 	}
-	return verifyFile(ctx, safePath, expectedChecksum)
+	return s.verifyRelative(ctx, filepath.Base(safePath), expectedChecksum)
 }
 
 func (s *Service) ListRuns(
@@ -249,19 +338,29 @@ func (s *Service) ListRuns(
 	if s == nil || ctx == nil {
 		return nil, ErrUnavailable
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if limit == 0 {
 		limit = 50
 	}
 	if limit < 1 || limit > 200 {
 		return nil, ErrInvalidBackup
 	}
-	if err := s.reconcile(ctx); err != nil {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if err := s.reconcileLocked(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, ErrUnavailable
 	}
 	rows, err := s.db.Reader.QueryContext(ctx, `
 		SELECT id, status, COALESCE(destination, ''), COALESCE(checksum, ''),
 		       COALESCE(size_bytes, 0), started_at, COALESCE(completed_at, ''),
-		       COALESCE(error_code, ''), retained
+		       COALESCE(error_code, ''), retained, verification_status,
+		       COALESCE(verified_at, ''),
+		       COALESCE(verification_error_code, '')
 		FROM backup_runs
 		ORDER BY started_at DESC, id DESC
 		LIMIT ?
@@ -273,18 +372,22 @@ func (s *Service) ListRuns(
 	records := make([]RunRecord, 0, limit)
 	for rows.Next() {
 		var record RunRecord
-		var started, completed string
+		var started, completed, verified string
 		var retained int
 		if err := rows.Scan(
 			&record.ID, &record.Status, &record.Filename, &record.Checksum,
 			&record.SizeBytes, &started, &completed, &record.ErrorCode,
-			&retained,
+			&retained, &record.VerificationStatus, &verified,
+			&record.VerificationErrorCode,
 		); err != nil {
 			return nil, ErrUnavailable
 		}
 		if !validRunID(record.ID) || !validStatus(record.Status) ||
+			!validVerificationStatus(record.VerificationStatus) ||
 			(record.Filename != "" && !canonicalFilenameForID(record.Filename, record.ID)) ||
-			(record.Checksum != "" && !validChecksum(record.Checksum)) {
+			(record.Checksum != "" && !validChecksum(record.Checksum)) ||
+			(record.VerificationErrorCode != "" &&
+				!validErrorCode(record.VerificationErrorCode)) {
 			return nil, ErrUnavailable
 		}
 		record.StartedAt, err = parseTime(started)
@@ -293,6 +396,12 @@ func (s *Service) ListRuns(
 		}
 		if completed != "" {
 			record.CompletedAt, err = parseTime(completed)
+			if err != nil {
+				return nil, ErrUnavailable
+			}
+		}
+		if verified != "" {
+			record.VerifiedAt, err = parseTime(verified)
 			if err != nil {
 				return nil, ErrUnavailable
 			}
@@ -307,27 +416,48 @@ func (s *Service) ListRuns(
 }
 
 func (s *Service) LatestSuccessful(ctx context.Context) (*RunRecord, error) {
-	if s == nil {
+	if s == nil || ctx == nil {
+		return nil, ErrUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	if err := s.reconcileLocked(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, ErrUnavailable
 	}
 	var record RunRecord
-	var started, completed string
+	var started, completed, verified string
 	err := s.db.Reader.QueryRowContext(ctx, `
 		SELECT id, status, destination, checksum, size_bytes, started_at,
-		       completed_at, retained
+		       completed_at, retained, verification_status,
+		       COALESCE(verified_at, ''),
+		       COALESCE(verification_error_code, '')
 		FROM backup_runs
-		WHERE status = 'succeeded'
+		WHERE status = 'succeeded' AND retained = 1
 		ORDER BY completed_at DESC, id DESC
 		LIMIT 1
 	`).Scan(
 		&record.ID, &record.Status, &record.Filename, &record.Checksum,
 		&record.SizeBytes, &started, &completed, &record.Retained,
+		&record.VerificationStatus, &verified,
+		&record.VerificationErrorCode,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
+	if err != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	if err != nil || !canonicalFilenameForID(record.Filename, record.ID) ||
-		!validChecksum(record.Checksum) {
+		!validChecksum(record.Checksum) ||
+		!validVerificationStatus(record.VerificationStatus) ||
+		(record.VerificationErrorCode != "" &&
+			!validErrorCode(record.VerificationErrorCode)) {
 		return nil, ErrUnavailable
 	}
 	record.StartedAt, err = parseTime(started)
@@ -338,6 +468,50 @@ func (s *Service) LatestSuccessful(ctx context.Context) (*RunRecord, error) {
 	if err != nil {
 		return nil, ErrUnavailable
 	}
+	if verified != "" {
+		record.VerifiedAt, err = parseTime(verified)
+		if err != nil {
+			return nil, ErrUnavailable
+		}
+	}
+	verifiedAt := s.clock.Now().UTC()
+	if verifiedAt.IsZero() {
+		return nil, ErrUnavailable
+	}
+	verification, verifyErr := s.verifyRelative(
+		ctx, record.Filename, record.Checksum,
+	)
+	if verifyErr != nil {
+		if errors.Is(verifyErr, context.Canceled) ||
+			errors.Is(verifyErr, context.DeadlineExceeded) {
+			return nil, verifyErr
+		}
+		code := s.verificationFailureCode(record.Filename)
+		if err := s.persistVerification(ctx, record.ID, "failed", verifiedAt, code); err != nil {
+			return nil, ErrUnavailable
+		}
+		record.VerificationStatus = "failed"
+		record.VerifiedAt = verifiedAt
+		record.VerificationErrorCode = code
+		return &record, nil
+	}
+	if verification.Size != record.SizeBytes {
+		if err := s.persistVerification(
+			ctx, record.ID, "failed", verifiedAt, "BACKUP_CORRUPT",
+		); err != nil {
+			return nil, ErrUnavailable
+		}
+		record.VerificationStatus = "failed"
+		record.VerifiedAt = verifiedAt
+		record.VerificationErrorCode = "BACKUP_CORRUPT"
+		return &record, nil
+	}
+	if err := s.persistVerification(ctx, record.ID, "passed", verifiedAt, ""); err != nil {
+		return nil, ErrUnavailable
+	}
+	record.VerificationStatus = "passed"
+	record.VerifiedAt = verifiedAt
+	record.VerificationErrorCode = ""
 	return &record, nil
 }
 
@@ -347,10 +521,16 @@ func (s *Service) ApplyRetention(ctx context.Context) ([]RunRecord, error) {
 	if s == nil || ctx == nil {
 		return nil, ErrUnavailable
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !s.runMu.TryLock() {
 		return nil, ErrBackupInProgress
 	}
 	defer s.runMu.Unlock()
+	if err := s.validateDirectory(); err != nil {
+		return nil, ErrUnavailable
+	}
 	records, err := s.successfulRetained(ctx)
 	if err != nil {
 		return nil, ErrUnavailable
@@ -365,6 +545,21 @@ func (s *Service) ApplyRetention(ctx context.Context) ([]RunRecord, error) {
 			continue
 		}
 		if _, err := s.Verify(ctx, path, record.Checksum); err != nil {
+			if errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded) {
+				return retained, err
+			}
+			_ = s.persistVerification(
+				ctx, record.ID, "failed", s.clock.Now().UTC(),
+				s.verificationFailureCode(record.Filename),
+			)
+			partial = true
+			retained = append(retained, record)
+			continue
+		}
+		if err := s.persistVerification(
+			ctx, record.ID, "passed", s.clock.Now().UTC(), "",
+		); err != nil {
 			partial = true
 			retained = append(retained, record)
 			continue
@@ -373,12 +568,11 @@ func (s *Service) ApplyRetention(ctx context.Context) ([]RunRecord, error) {
 	}
 	keep := retentionSet(verified)
 	for _, record := range verified {
-		path, _ := s.confinedPath(record.Filename)
 		if _, selected := keep[record.ID]; selected {
 			retained = append(retained, record)
 			continue
 		}
-		info, err := os.Lstat(path)
+		info, err := s.root.Lstat(record.Filename)
 		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			partial = true
 			retained = append(retained, record)
@@ -387,9 +581,10 @@ func (s *Service) ApplyRetention(ctx context.Context) ([]RunRecord, error) {
 		deletedAt := formatTime(s.clock.Now().UTC())
 		result, err := s.db.Writer.ExecContext(ctx, `
 			UPDATE backup_runs
-			SET retained = 0, deleted_at = ?
+			SET retained = 0, deleted_at = ?, verification_status = 'retired',
+			    verified_at = ?, verification_error_code = NULL
 			WHERE id = ? AND retained = 1 AND status = 'succeeded'
-		`, deletedAt, record.ID)
+		`, deletedAt, deletedAt, record.ID)
 		if err != nil {
 			partial = true
 			retained = append(retained, record)
@@ -401,18 +596,20 @@ func (s *Service) ApplyRetention(ctx context.Context) ([]RunRecord, error) {
 			retained = append(retained, record)
 			continue
 		}
-		if err := os.Remove(path); err != nil {
+		if err := s.root.Remove(record.Filename); err != nil {
 			_, _ = s.db.Writer.ExecContext(context.Background(), `
 			UPDATE backup_runs
-			SET retained = 1, deleted_at = NULL
+			SET retained = 1, deleted_at = NULL,
+			    verification_status = 'passed', verified_at = ?,
+			    verification_error_code = NULL
 			WHERE id = ? AND retained = 0 AND status = 'succeeded'
-		`, record.ID)
+		`, formatTime(s.clock.Now().UTC()), record.ID)
 			partial = true
 			retained = append(retained, record)
 			continue
 		}
 	}
-	if err := syncDirectory(s.dir); err != nil {
+	if err := s.syncDirectory(); err != nil {
 		partial = true
 	}
 	if partial {
@@ -498,8 +695,17 @@ func (s *Service) successfulRetained(ctx context.Context) ([]RunRecord, error) {
 	return records, rows.Err()
 }
 
-func (s *Service) reconcile(ctx context.Context) error {
-	entries, err := os.ReadDir(s.dir)
+func (s *Service) reconcileLocked(ctx context.Context) error {
+	if err := s.validateDirectory(); err != nil {
+		return err
+	}
+	if err := s.reconcileRunningRows(ctx); err != nil {
+		return err
+	}
+	if err := s.reconcileRetiredRows(ctx); err != nil {
+		return err
+	}
+	entries, err := fs.ReadDir(s.root.FS(), ".")
 	if err != nil {
 		return err
 	}
@@ -525,11 +731,11 @@ func (s *Service) reconcile(ctx context.Context) error {
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		path, ok := s.confinedPath(entry.Name())
+		_, ok := s.confinedPath(entry.Name())
 		if !ok {
 			continue
 		}
-		verification, err := verifyFile(ctx, path, "")
+		verification, err := s.verifyRelative(ctx, entry.Name(), "")
 		if err != nil {
 			if status == "running" {
 				_ = s.recordFailure(
@@ -550,12 +756,163 @@ func (s *Service) reconcile(ctx context.Context) error {
 			_, err = s.db.Writer.ExecContext(ctx, `
 				INSERT OR IGNORE INTO backup_runs (
 					id, status, destination, checksum, size_bytes, started_at,
-					completed_at, retained
-				) VALUES (?, 'succeeded', ?, ?, ?, ?, ?, 1)
+					completed_at, retained, verification_status, verified_at
+				) VALUES (?, 'succeeded', ?, ?, ?, ?, ?, 1, 'passed', ?)
 			`, id, entry.Name(), verification.Checksum, verification.Size,
-				formatTime(started), formatTime(started))
+				formatTime(started), formatTime(started), formatTime(started))
 		}
 		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) reconcileRetiredRows(ctx context.Context) error {
+	rows, err := s.db.Reader.QueryContext(ctx, `
+		SELECT id, destination, checksum, size_bytes
+		FROM backup_runs
+		WHERE status = 'succeeded' AND retained = 0
+		  AND verification_status = 'retired'
+		ORDER BY id
+	`)
+	if err != nil {
+		return err
+	}
+	type retired struct {
+		id, filename, checksum string
+		size                   int64
+	}
+	var records []retired
+	for rows.Next() {
+		var record retired
+		if err := rows.Scan(
+			&record.id, &record.filename, &record.checksum, &record.size,
+		); err != nil {
+			rows.Close()
+			return err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, record := range records {
+		if !validRunID(record.id) ||
+			!canonicalFilenameForID(record.filename, record.id) ||
+			!validChecksum(record.checksum) || record.size <= 0 {
+			return ErrUnavailable
+		}
+		if _, err := s.root.Lstat(record.filename); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		status, code := "passed", ""
+		verification, err := s.verifyRelative(
+			ctx, record.filename, record.checksum,
+		)
+		if err != nil || verification.Size != record.size {
+			if errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			status, code = "failed", "BACKUP_CORRUPT"
+		}
+		verifiedAt := s.clock.Now().UTC()
+		if verifiedAt.IsZero() {
+			return ErrUnavailable
+		}
+		result, err := s.db.Writer.ExecContext(ctx, `
+			UPDATE backup_runs
+			SET retained = 1, deleted_at = NULL,
+			    verification_status = ?, verified_at = ?,
+			    verification_error_code = NULLIF(?, '')
+			WHERE id = ? AND status = 'succeeded' AND retained = 0
+			  AND verification_status = 'retired'
+		`, status, formatTime(verifiedAt), code, record.id)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil || affected != 1 {
+			return ErrUnavailable
+		}
+	}
+	return nil
+}
+
+func (s *Service) reconcileRunningRows(ctx context.Context) error {
+	rows, err := s.db.Reader.QueryContext(ctx, `
+		SELECT id, started_at FROM backup_runs
+		WHERE status = 'running'
+		ORDER BY started_at, id
+	`)
+	if err != nil {
+		return err
+	}
+	type running struct{ id, started string }
+	var runs []running
+	for rows.Next() {
+		var run running
+		if err := rows.Scan(&run.id, &run.started); err != nil {
+			rows.Close()
+			return err
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, run := range runs {
+		started, err := parseTime(run.started)
+		if err != nil || !validRunID(run.id) {
+			if err := s.recordFailure(
+				ctx, run.id, s.clock.Now().UTC(), "INTERRUPTED",
+			); err != nil {
+				return err
+			}
+			continue
+		}
+		name := canonicalFilename(started, run.id)
+		temp := "." + name + ".partial"
+		if _, err := s.root.Lstat(name); err == nil {
+			if _, tempErr := s.root.Lstat(temp); tempErr == nil {
+				if err := s.root.Remove(temp); err != nil {
+					return err
+				}
+				if err := s.syncDirectory(); err != nil {
+					return err
+				}
+			} else if !errors.Is(tempErr, os.ErrNotExist) {
+				return tempErr
+			}
+			verification, verifyErr := s.verifyRelative(ctx, name, "")
+			if verifyErr != nil {
+				if err := s.recordFailure(
+					ctx, run.id, s.clock.Now().UTC(), "RECOVERY_VERIFY_FAILED",
+				); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := s.recordSuccess(
+				ctx, run.id, name, verification, s.clock.Now().UTC(),
+			); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := s.root.Lstat(temp); err == nil {
+			if err := s.root.Remove(temp); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := s.recordFailure(
+			ctx, run.id, s.clock.Now().UTC(), "INTERRUPTED",
+		); err != nil {
 			return err
 		}
 	}
@@ -580,10 +937,12 @@ func (s *Service) recordSuccess(
 		UPDATE backup_runs
 		SET status = 'succeeded', destination = ?, checksum = ?,
 		    size_bytes = ?, completed_at = ?, error_message = NULL,
-		    error_code = NULL, retained = 1
+		    error_code = NULL, retained = 1,
+		    verification_status = 'passed', verified_at = ?,
+		    verification_error_code = NULL
 		WHERE id = ? AND status = 'running'
 	`, filename, verification.Checksum, verification.Size,
-		formatTime(completed), id)
+		formatTime(completed), formatTime(completed), id)
 	if err != nil {
 		return err
 	}
@@ -606,85 +965,243 @@ func (s *Service) recordFailure(
 	_, err := s.db.Writer.ExecContext(ctx, `
 		UPDATE backup_runs
 		SET status = 'failed', completed_at = ?, error_code = ?,
-		    error_message = 'backup operation failed', retained = 0
+		    error_message = 'backup operation failed', retained = 0,
+		    verification_status = 'failed', verified_at = ?,
+		    verification_error_code = ?
 		WHERE id = ? AND status = 'running'
-	`, formatTime(completed), code, id)
+	`, formatTime(completed), code, formatTime(completed), code, id)
 	return err
 }
 
-func verifyFile(
+func (s *Service) persistVerification(
 	ctx context.Context,
-	path string,
+	id, status string,
+	verifiedAt time.Time,
+	errorCode string,
+) error {
+	if (status != "passed" && status != "failed") ||
+		verifiedAt.IsZero() ||
+		(errorCode != "" && !validErrorCode(errorCode)) ||
+		(status == "passed" && errorCode != "") ||
+		(status == "failed" && errorCode == "") {
+		return ErrUnavailable
+	}
+	result, err := s.db.Writer.ExecContext(ctx, `
+		UPDATE backup_runs
+		SET verification_status = ?, verified_at = ?,
+		    verification_error_code = NULLIF(?, '')
+		WHERE id = ? AND status = 'succeeded' AND retained = 1
+	`, status, formatTime(verifiedAt), errorCode, id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func (s *Service) verificationFailureCode(filename string) string {
+	if _, err := s.root.Lstat(filename); errors.Is(err, os.ErrNotExist) {
+		return "BACKUP_MISSING"
+	}
+	return "BACKUP_CORRUPT"
+}
+
+func (s *Service) verifyRelative(
+	ctx context.Context,
+	name string,
 	expectedChecksum string,
 ) (Verification, error) {
 	if err := ctx.Err(); err != nil {
 		return Verification{}, err
 	}
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
-		info.Mode().Perm()&0o077 != 0 || info.Size() <= 0 {
+	if filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
 		return Verification{}, ErrInvalidBackup
 	}
-	file, err := os.Open(path)
+	if err := s.validateDirectory(); err != nil {
+		return Verification{}, ErrInvalidBackup
+	}
+	info, err := s.root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm() != 0o600 || info.Size() <= 0 || linkCount(info) != 1 {
+		return Verification{}, ErrInvalidBackup
+	}
+	file, err := s.root.Open(name)
 	if err != nil {
 		return Verification{}, ErrInvalidBackup
 	}
-	sum := sha256.New()
-	size, copyErr := io.Copy(sum, file)
-	closeErr := file.Close()
-	if copyErr != nil || closeErr != nil || size != info.Size() {
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() ||
+		openedInfo.Mode().Perm() != 0o600 || openedInfo.Size() <= 0 ||
+		openedInfo.Size() > maxSnapshotBytes || linkCount(openedInfo) != 1 {
 		return Verification{}, ErrInvalidBackup
 	}
-	checksum := hex.EncodeToString(sum.Sum(nil))
+	if !os.SameFile(info, openedInfo) {
+		return Verification{}, ErrInvalidBackup
+	}
+	digest := sha256.New()
+	copied, err := io.Copy(digest, file)
+	if err != nil || copied != openedInfo.Size() {
+		return Verification{}, ErrInvalidBackup
+	}
+	checksum := hex.EncodeToString(digest.Sum(nil))
 	if expectedChecksum != "" &&
 		(!validChecksum(expectedChecksum) ||
 			!constantStringEqual(checksum, expectedChecksum)) {
 		return Verification{}, ErrInvalidBackup
 	}
-	location := url.URL{Scheme: "file", Path: path}
+	if err := verifyOpenedFileIntegrity(
+		ctx, s.root, name, openedInfo,
+	); err != nil {
+		return Verification{}, ErrInvalidBackup
+	}
+	finalInfo, err := s.root.Lstat(name)
+	if err != nil || !finalInfo.Mode().IsRegular() ||
+		finalInfo.Mode().Perm() != 0o600 || finalInfo.Size() != openedInfo.Size() ||
+		linkCount(finalInfo) != 1 || !os.SameFile(openedInfo, finalInfo) {
+		return Verification{}, ErrInvalidBackup
+	}
+	if err := s.validateDirectory(); err != nil {
+		return Verification{}, ErrInvalidBackup
+	}
+	return Verification{Checksum: checksum, Size: copied}, nil
+}
+
+func verifyOpenedFileIntegrity(
+	ctx context.Context,
+	root *os.Root,
+	sourceName string,
+	expectedInfo os.FileInfo,
+) error {
+	const databaseName = "snapshot.sqlite3"
+	vfsName, filesystem, err := sqlitevfs.New(singleFileFS{
+		root:         root,
+		sourceName:   sourceName,
+		databaseName: databaseName,
+		expectedInfo: expectedInfo,
+	})
+	if err != nil {
+		return err
+	}
+	defer filesystem.Close()
+
+	location := url.URL{Scheme: "file", Opaque: databaseName}
 	query := url.Values{}
-	query.Set("mode", "ro")
 	query.Set("immutable", "1")
-	query.Add("_pragma", "query_only(1)")
+	query.Set("mode", "ro")
+	query.Set("vfs", vfsName)
 	location.RawQuery = query.Encode()
 	db, err := sql.Open("sqlite", location.String())
 	if err != nil {
-		return Verification{}, ErrInvalidBackup
+		return err
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
 	var integrity string
-	if err := db.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil ||
-		integrity != "ok" {
-		return Verification{}, ErrInvalidBackup
-	}
-	return Verification{Checksum: checksum, Size: size}, nil
-}
-
-func ensurePrivateDirectory(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
+	if err := db.QueryRowContext(
+		ctx, `PRAGMA integrity_check`,
+	).Scan(&integrity); err != nil {
 		return err
 	}
-	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return ErrUnavailable
-	}
-	return os.Chmod(path, 0o700)
-}
-
-func reserveTemp(path string) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return err
+	if integrity != "ok" {
+		return ErrInvalidBackup
 	}
 	return nil
 }
 
-func syncFile(path string) error {
-	file, err := os.Open(path)
+type singleFileFS struct {
+	root         *os.Root
+	sourceName   string
+	databaseName string
+	expectedInfo os.FileInfo
+}
+
+func (filesystem singleFileFS) Open(name string) (fs.File, error) {
+	if filesystem.root == nil || filesystem.expectedInfo == nil ||
+		name != filesystem.databaseName {
+		return nil, fs.ErrNotExist
+	}
+	file, err := filesystem.root.Open(filesystem.sourceName)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() ||
+		info.Mode().Perm() != 0o600 ||
+		info.Size() != filesystem.expectedInfo.Size() ||
+		linkCount(info) != 1 || !os.SameFile(filesystem.expectedInfo, info) {
+		_ = file.Close()
+		return nil, fs.ErrInvalid
+	}
+	return file, nil
+}
+
+func validateSnapshotSize(pageCount, pageSize int64) error {
+	if pageCount <= 0 || pageSize <= 0 ||
+		pageCount > maxSnapshotBytes/pageSize {
+		return ErrInvalidBackup
+	}
+	return nil
+}
+
+func ensurePrivateDirectory(path, databasePath string) (os.FileInfo, error) {
+	volumeRoot := filepath.VolumeName(path) + string(filepath.Separator)
+	if path == volumeRoot || (databasePath != "" &&
+		path == filepath.Dir(filepath.Clean(databasePath))) {
+		return nil, ErrUnavailable
+	}
+	relative, err := filepath.Rel(volumeRoot, path)
+	if err != nil || relative == "." || strings.HasPrefix(relative, "..") {
+		return nil, ErrUnavailable
+	}
+	current := volumeRoot
+	parts := strings.Split(relative, string(filepath.Separator))
+	for index, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, ErrUnavailable
+		}
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if errors.Is(statErr, os.ErrNotExist) {
+			if err := os.Mkdir(current, 0o700); err != nil {
+				return nil, err
+			}
+			info, statErr = os.Lstat(current)
+		}
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return nil, ErrUnavailable
+		}
+		if index == len(parts)-1 &&
+			(info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info)) {
+			return nil, ErrUnavailable
+		}
+	}
+	return os.Lstat(path)
+}
+
+func (s *Service) reserveTemp(name string) error {
+	file, err := s.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		_ = s.root.Remove(name)
+		return err
+	}
+	info, err := s.root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 ||
+		linkCount(info) != 1 {
+		_ = s.root.Remove(name)
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func (s *Service) syncFile(name string) error {
+	file, err := s.root.Open(name)
 	if err != nil {
 		return err
 	}
@@ -692,8 +1209,51 @@ func syncFile(path string) error {
 	return file.Sync()
 }
 
-func syncDirectory(path string) error {
-	dir, err := os.Open(path)
+func (s *Service) chmodFile(name string, mode os.FileMode) error {
+	file, err := s.root.OpenFile(name, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Chmod(mode)
+}
+
+func (s *Service) publishLink(oldName, newName string) error {
+	dir, err := s.root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return unix.Linkat(
+		int(dir.Fd()), oldName, int(dir.Fd()), newName, 0,
+	)
+}
+
+func (s *Service) validateDirectory() error {
+	info, err := os.Lstat(s.dir)
+	if err != nil || !os.SameFile(info, s.dirInfo) ||
+		!info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm() != 0o700 || !ownedByCurrentUser(info) {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func ownedByCurrentUser(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(stat.Uid) == os.Geteuid()
+}
+
+func linkCount(info os.FileInfo) uint64 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+	return uint64(stat.Nlink)
+}
+
+func (s *Service) syncDirectory() error {
+	dir, err := s.root.Open(".")
 	if err != nil {
 		return err
 	}
@@ -770,6 +1330,11 @@ func allLowerHex(value string) bool {
 
 func validStatus(value string) bool {
 	return value == "running" || value == "succeeded" || value == "failed"
+}
+
+func validVerificationStatus(value string) bool {
+	return value == "unknown" || value == "passed" ||
+		value == "failed" || value == "retired"
 }
 
 func validErrorCode(value string) bool {

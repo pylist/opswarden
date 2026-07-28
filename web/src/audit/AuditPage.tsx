@@ -221,6 +221,7 @@ export function AuditPage({
               <option value="user">成员</option>
               <option value="agent">Agent</option>
               <option value="anonymous">匿名</option>
+              <option value="system">系统维护</option>
             </select>
           </div>
           <div>
@@ -378,7 +379,9 @@ function actorLabel(item: AuditRow) {
     ? "成员"
     : item.actorType === "agent"
       ? "Agent"
-      : "匿名";
+      : item.actorType === "system"
+        ? "系统维护"
+        : "匿名";
   return item.actorId ? `${type} · ${item.actorId}` : type;
 }
 

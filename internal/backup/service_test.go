@@ -28,14 +28,16 @@ func TestRunCreatesVerifiedOnlineSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	dir := filepath.Join(t.TempDir(), "backups")
+	dir := backupDir(t)
 	service, err := NewService(db, dir, fixedClock{now: time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	path, err := service.Run(context.Background())
 	if err != nil {
-		t.Fatal(err)
+		var code string
+		_ = db.Reader.QueryRow(`SELECT COALESCE(error_code, '') FROM backup_runs ORDER BY started_at DESC LIMIT 1`).Scan(&code)
+		t.Fatalf("%v code=%s", err, code)
 	}
 	if _, err := service.Verify(context.Background(), path, ""); err != nil {
 		t.Fatal(err)
@@ -113,7 +115,7 @@ func TestOnlineBackupIsTransactionallyConsistentUnderWALWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	service, err := NewService(
-		db, filepath.Join(t.TempDir(), "backups"),
+		db, backupDir(t),
 		fixedClock{now: time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC)},
 	)
 	if err != nil {
@@ -194,7 +196,7 @@ func TestRetentionTieBreakIsStableAndApplyNeverDeletesUnknownFiles(t *testing.T)
 	clock := &fixedClock{
 		now: time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC),
 	}
-	dir := filepath.Join(t.TempDir(), "backups")
+	dir := backupDir(t)
 	service, err := NewService(db, dir, clock)
 	if err != nil {
 		t.Fatal(err)
@@ -215,6 +217,17 @@ func TestRetentionTieBreakIsStableAndApplyNeverDeletesUnknownFiles(t *testing.T)
 	}
 	if len(retained) >= 9 {
 		t.Fatalf("retention did not retire any daily backups: %d", len(retained))
+	}
+	var retired int
+	if err := db.Reader.QueryRow(`
+		SELECT count(*) FROM backup_runs
+		WHERE retained = 0 AND verification_status = 'retired'
+		  AND verified_at IS NOT NULL AND verification_error_code IS NULL
+	`).Scan(&retired); err != nil {
+		t.Fatal(err)
+	}
+	if retired != 9-len(retained) {
+		t.Fatalf("retired metadata=%d want=%d", retired, 9-len(retained))
 	}
 	if _, err := os.Stat(unknown); err != nil {
 		t.Fatalf("unknown file was removed: %v", err)
@@ -250,6 +263,178 @@ func TestNewServiceRejectsSymlinkBackupDirectory(t *testing.T) {
 	}
 }
 
+func TestNewServiceRejectsRootSharedDirectoryAndDatabaseDirectoryWithoutChmod(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "data", "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	shared := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewService(db, shared, fixedClock{now: time.Now().UTC()}); err == nil {
+		t.Fatal("shared directory accepted")
+	}
+	info, _ := os.Stat(shared)
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("shared directory was chmodded: %o", info.Mode().Perm())
+	}
+	if _, err := NewService(db, string(filepath.Separator), fixedClock{now: time.Now().UTC()}); err == nil {
+		t.Fatal("filesystem root accepted")
+	}
+	if _, err := NewService(db, filepath.Dir(db.Path), fixedClock{now: time.Now().UTC()}); err == nil {
+		t.Fatal("database directory accepted")
+	}
+}
+
+func TestServiceRejectsReplacedOrPermissionChangedBackupDirectory(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "data", "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	dir := backupDir(t)
+	service, err := NewService(db, dir, fixedClock{now: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Run(context.Background()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("permission change err=%v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("directory mode changed: info=%v err=%v", info, err)
+	}
+
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	moved := dir + "-moved"
+	if err := os.Rename(dir, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Run(context.Background()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("directory replacement err=%v", err)
+	}
+}
+
+func TestRunNeverWritesThroughReplacedBackupDirectoryPath(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "data", "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	dir := backupDir(t)
+	service, err := NewService(db, dir, fixedClock{now: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := dir + "-moved"
+	service.beforeOnlineCopy = func() {
+		if err := os.Rename(dir, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := service.Run(context.Background()); err == nil {
+		t.Fatal("run succeeded after directory replacement")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("replacement directory received files: %v", entries)
+	}
+}
+
+func TestOnlineCopyUsesReservedRootBoundFile(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service, err := NewService(
+		db, backupDir(t), fixedClock{now: time.Now().UTC()},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const name = "descriptor-probe.partial"
+	if err := service.reserveTemp(name); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.onlineCopy(context.Background(), name); err != nil {
+		t.Fatalf("online copy: %T %v", err, err)
+	}
+	if _, err := service.verifyRelative(
+		context.Background(), name, "",
+	); err != nil {
+		t.Fatalf("root-bound integrity: %T %v", err, err)
+	}
+}
+
+func TestSnapshotSizeLimitIsBoundedBeforeAllocation(t *testing.T) {
+	if err := validateSnapshotSize(
+		maxSnapshotBytes/4096, 4096,
+	); err != nil {
+		t.Fatalf("boundary rejected: %v", err)
+	}
+	if err := validateSnapshotSize(
+		maxSnapshotBytes/4096+1, 4096,
+	); !errors.Is(err, ErrInvalidBackup) {
+		t.Fatalf("oversized snapshot err=%v", err)
+	}
+	if err := validateSnapshotSize(1<<62, 4096); !errors.Is(err, ErrInvalidBackup) {
+		t.Fatalf("overflowing snapshot err=%v", err)
+	}
+}
+
+func TestNewServiceRejectsSymlinkInBackupDirectoryAncestor(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "data", "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ancestor := filepath.Join(base, "linked-parent")
+	if err := os.Symlink(target, ancestor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewService(
+		db, filepath.Join(ancestor, "backups"), fixedClock{now: time.Now().UTC()},
+	); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ancestor symlink err=%v", err)
+	}
+}
+
+func TestVerifyRejectsMultiplyLinkedBackupFile(t *testing.T) {
+	service, path := runTestBackup(t)
+	link := filepath.Join(filepath.Dir(path), "operator-hard-link.sqlite3")
+	if err := os.Link(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Verify(
+		context.Background(), path, "",
+	); !errors.Is(err, ErrInvalidBackup) {
+		t.Fatalf("hard-linked backup err=%v", err)
+	}
+}
+
 func addExpectedBuckets(
 	records []RunRecord,
 	limit int,
@@ -276,7 +461,7 @@ func TestReconcileClosesPublishedFileRunRecordCrashWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	dir := filepath.Join(t.TempDir(), "backups")
+	dir := backupDir(t)
 	clock := fixedClock{
 		now: time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC),
 	}
@@ -311,6 +496,293 @@ func TestReconcileClosesPublishedFileRunRecordCrashWindow(t *testing.T) {
 	}
 }
 
+func TestReconcilePublishesRunAfterLinkBeforePartialRemovalCrashWindow(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	dir := backupDir(t)
+	clock := fixedClock{
+		now: time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC),
+	}
+	service, err := NewService(db, dir, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(path)
+	id := canonicalNamePattern.FindStringSubmatch(name)[2]
+	partial := "." + name + ".partial"
+	if err := os.Link(path, filepath.Join(dir, partial)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Writer.Exec(`
+		UPDATE backup_runs
+		SET status = 'running', destination = NULL, checksum = NULL,
+		    size_bytes = NULL, completed_at = NULL,
+		    verification_status = 'unknown', verified_at = NULL
+		WHERE id = ?
+	`, id); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := NewService(db, dir, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := recovered.ListRuns(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != "succeeded" ||
+		runs[0].VerificationStatus != "passed" {
+		t.Fatalf("runs=%+v", runs)
+	}
+	if _, err := recovered.root.Lstat(partial); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial link remains: %v", err)
+	}
+}
+
+func TestLatestSuccessfulPersistsCurrentFileVerificationState(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	clock := &fixedClock{
+		now: time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC),
+	}
+	service, err := NewService(db, backupDir(t), clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, err := service.LatestSuccessful(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.VerificationStatus != "passed" ||
+		latest.VerifiedAt.IsZero() || latest.VerificationErrorCode != "" {
+		t.Fatalf("verified latest=%+v", latest)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = clock.now.Add(time.Minute)
+	latest, err = service.LatestSuccessful(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.VerificationStatus != "failed" ||
+		latest.VerificationErrorCode != "BACKUP_MISSING" ||
+		latest.VerifiedAt.IsZero() {
+		t.Fatalf("missing latest=%+v", latest)
+	}
+
+	clock.now = clock.now.Add(time.Minute)
+	newPath, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, err = service.LatestSuccessful(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.Filename != filepath.Base(newPath) ||
+		latest.VerificationStatus != "passed" ||
+		latest.VerificationErrorCode != "" {
+		t.Fatalf("recovered latest=%+v", latest)
+	}
+}
+
+func TestLatestSuccessfulPersistsCorruptFileVerificationState(t *testing.T) {
+	service, path := runTestBackup(t)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)/2] ^= 0xff
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := service.LatestSuccessful(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.VerificationStatus != "failed" ||
+		latest.VerificationErrorCode != "BACKUP_CORRUPT" {
+		t.Fatalf("latest=%+v", latest)
+	}
+}
+
+func TestLatestSuccessfulCancellationDoesNotMarkValidBackupCorrupt(t *testing.T) {
+	service, _ := runTestBackup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := service.LatestSuccessful(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	var status, code string
+	if err := service.db.Reader.QueryRow(`
+		SELECT verification_status, COALESCE(verification_error_code, '')
+		FROM backup_runs
+		ORDER BY completed_at DESC LIMIT 1
+	`).Scan(&status, &code); err != nil {
+		t.Fatal(err)
+	}
+	if status != "passed" || code != "" {
+		t.Fatalf("verification status=%q code=%q", status, code)
+	}
+}
+
+func TestReconcileRestoresRetiredMetadataWhenCanonicalFileStillExists(t *testing.T) {
+	service, path := runTestBackup(t)
+	name := filepath.Base(path)
+	id := canonicalNamePattern.FindStringSubmatch(name)[2]
+	if _, err := service.db.Writer.Exec(`
+		UPDATE backup_runs
+		SET retained = 0, deleted_at = ?,
+		    verification_status = 'retired', verified_at = ?
+		WHERE id = ?
+	`, formatTime(time.Now().UTC()), formatTime(time.Now().UTC()), id); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := NewService(service.db, service.dir, service.clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := recovered.ListRuns(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || !runs[0].Retained ||
+		runs[0].VerificationStatus != "passed" ||
+		runs[0].VerificationErrorCode != "" {
+		t.Fatalf("runs=%+v", runs)
+	}
+}
+
+func TestReconcileClosesPrePublishRunAndRemovesPartialFile(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	clock := fixedClock{
+		now: time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC),
+	}
+	service, err := NewService(db, backupDir(t), clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "bkp_22222222222222222222222222222222"
+	if err := service.recordStart(context.Background(), id, clock.now); err != nil {
+		t.Fatal(err)
+	}
+	temp := "." + canonicalFilename(clock.now, id) + ".partial"
+	if err := service.reserveTemp(temp); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := service.ListRuns(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != "failed" ||
+		runs[0].ErrorCode != "INTERRUPTED" ||
+		runs[0].VerificationStatus != "failed" {
+		t.Fatalf("runs=%+v", runs)
+	}
+	if _, err := service.root.Lstat(temp); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial file remains: %v", err)
+	}
+}
+
+func TestReconcileWaitsForActiveRunLockBeforeClosingRunningRow(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	clock := fixedClock{
+		now: time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC),
+	}
+	service, err := NewService(db, backupDir(t), clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "bkp_33333333333333333333333333333333"
+	if err := service.recordStart(context.Background(), id, clock.now); err != nil {
+		t.Fatal(err)
+	}
+	service.runMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.ListRuns(context.Background(), 10)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		service.runMu.Unlock()
+		t.Fatalf("reconcile bypassed active run lock: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	var status string
+	if err := db.Reader.QueryRow(
+		`SELECT status FROM backup_runs WHERE id = ?`, id,
+	).Scan(&status); err != nil {
+		service.runMu.Unlock()
+		t.Fatal(err)
+	}
+	if status != "running" {
+		service.runMu.Unlock()
+		t.Fatalf("active row status=%q", status)
+	}
+	service.runMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestoredSnapshotClosesRunningRowInDifferentBackupDirectory(t *testing.T) {
+	service, snapshotPath := runTestBackup(t)
+	_ = service
+	raw, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredPath := filepath.Join(t.TempDir(), "restored.db")
+	if err := os.WriteFile(restoredPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := storage.Open(restoredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restored.Close() })
+	recovered, err := NewService(
+		restored, backupDir(t),
+		fixedClock{now: time.Date(2026, 7, 30, 0, 0, 0, 0, time.UTC)},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := recovered.ListRuns(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != "failed" ||
+		runs[0].ErrorCode != "INTERRUPTED" {
+		t.Fatalf("restored runs=%+v", runs)
+	}
+}
+
 func TestBackupBytesExcludeExternalMasterKeyMaterial(t *testing.T) {
 	service, path := runTestBackup(t)
 	if _, err := service.Verify(context.Background(), path, ""); err != nil {
@@ -334,7 +806,7 @@ func runTestBackup(t *testing.T) (*Service, string) {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	service, err := NewService(
-		db, filepath.Join(t.TempDir(), "backups"),
+		db, backupDir(t),
 		fixedClock{now: time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC)},
 	)
 	if err != nil {
@@ -345,4 +817,13 @@ func runTestBackup(t *testing.T) (*Service, string) {
 		t.Fatal(err)
 	}
 	return service, path
+}
+
+func backupDir(t *testing.T) string {
+	t.Helper()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(base, "backups")
 }

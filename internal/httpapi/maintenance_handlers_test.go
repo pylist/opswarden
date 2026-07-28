@@ -94,7 +94,8 @@ func TestAdministrativeHealthAndBackupResponsesAreAuthorizedAndPathFree(t *testi
 		Spaces:   fakeSpaceService{systemRole: identity.SystemRoleAdmin},
 		Health: fakeHealthService{detail: health.Detail{
 			Status: "ok", Version: "test", Database: "ok",
-			JournalMode: "wal", DiskFreeBytes: 1024, MigrationVersion: 10,
+			JournalMode: "wal", DatabaseDiskFreeBytes: 1024,
+			BackupDiskFreeBytes: 2048, MigrationVersion: 11,
 		}},
 		Backups:   fakeBackupService{runs: []backup.RunRecord{run}},
 		AuthAudit: recorder, Clock: &fixedClock{now: now},

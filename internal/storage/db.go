@@ -17,6 +17,7 @@ const driverName = "sqlite"
 type DB struct {
 	Writer *sql.DB
 	Reader *sql.DB
+	Path   string
 }
 
 func Open(path string) (_ *DB, err error) {
@@ -31,6 +32,11 @@ func Open(path string) (_ *DB, err error) {
 	if err := os.MkdirAll(filepath.Dir(absolutePath), 0o700); err != nil {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
+	resolvedDirectory, err := filepath.EvalSymlinks(filepath.Dir(absolutePath))
+	if err != nil {
+		return nil, fmt.Errorf("resolve database directory: %w", err)
+	}
+	absolutePath = filepath.Join(resolvedDirectory, filepath.Base(absolutePath))
 
 	writer, err := sql.Open(driverName, sqliteDSN(absolutePath))
 	if err != nil {
@@ -66,7 +72,7 @@ func Open(path string) (_ *DB, err error) {
 		return nil, fmt.Errorf("connect reader: %w", err)
 	}
 
-	return &DB{Writer: writer, Reader: reader}, nil
+	return &DB{Writer: writer, Reader: reader, Path: absolutePath}, nil
 }
 
 func (db *DB) Close() error {

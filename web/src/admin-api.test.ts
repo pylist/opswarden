@@ -134,6 +134,26 @@ describe("strict administration contracts", () => {
       success: false,
       errorCode: "",
     })).toBeNull();
+    expect(parseAuditRow({
+      ...valid,
+      actorType: "system",
+      actorId: "maintenance",
+      fingerprint: "e4818b3eb3949901",
+      sourceIp: "0.0.0.0",
+    })).not.toBeNull();
+    for (const mutation of [
+      { actorId: "operator" },
+      { fingerprint: "0123456789abcdef" },
+    ]) {
+      expect(parseAuditRow({
+        ...valid,
+        actorType: "system",
+        actorId: "maintenance",
+        fingerprint: "e4818b3eb3949901",
+        sourceIp: "0.0.0.0",
+        ...mutation,
+      })).toBeNull();
+    }
   });
 
   it("matches netip canonical IPv4-mapped IPv6 rendering", () => {

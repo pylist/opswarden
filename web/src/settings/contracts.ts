@@ -4,9 +4,10 @@ export type HealthDetail = {
   status: "ok" | "degraded";
   version: string;
   uptimeSeconds: number;
-  database: "ok" | "degraded";
+  database: "ok" | "degraded" | "busy" | "readonly" | "unavailable";
   journalMode: "wal" | string;
-  diskFreeBytes: number;
+  databaseDiskFreeBytes: number;
+  backupDiskFreeBytes: number;
   migrationVersion: number;
   lastBackup?: {
     id: string;
@@ -14,6 +15,9 @@ export type HealthDetail = {
     sizeBytes: number;
     completedAt: string;
     retained: boolean;
+    verificationStatus: "passed" | "failed";
+    verifiedAt?: string;
+    verificationErrorCode?: string;
   };
   maintenance?: {
     running: boolean;
@@ -36,6 +40,9 @@ export type BackupRun = {
   completedAt?: string;
   errorCode?: string;
   retained: boolean;
+  verificationStatus: "unknown" | "passed" | "failed" | "retired";
+  verifiedAt?: string;
+  verificationErrorCode?: string;
 };
 
 export function parseHealthDetail(value: unknown): HealthDetail | null {
@@ -43,14 +50,18 @@ export function parseHealthDetail(value: unknown): HealthDetail | null {
     !record(value) ||
     !only(value, [
       "status", "version", "uptimeSeconds", "database", "journalMode",
-      "diskFreeBytes", "migrationVersion", "lastBackup", "maintenance",
+      "databaseDiskFreeBytes", "backupDiskFreeBytes", "migrationVersion",
+      "lastBackup", "maintenance",
     ]) ||
     !["ok", "degraded"].includes(String(value.status)) ||
     !safeText(value.version, 64) ||
     !nonNegative(value.uptimeSeconds) ||
-    !["ok", "degraded"].includes(String(value.database)) ||
+    !["ok", "degraded", "busy", "readonly", "unavailable"].includes(
+      String(value.database),
+    ) ||
     !safeText(value.journalMode, 32) ||
-    !nonNegative(value.diskFreeBytes) ||
+    !nonNegative(value.databaseDiskFreeBytes) ||
+    !nonNegative(value.backupDiskFreeBytes) ||
     !nonNegative(value.migrationVersion)
   ) {
     return null;
@@ -73,7 +84,8 @@ export function parseHealthDetail(value: unknown): HealthDetail | null {
     uptimeSeconds: value.uptimeSeconds,
     database: value.database as HealthDetail["database"],
     journalMode: value.journalMode,
-    diskFreeBytes: value.diskFreeBytes,
+    databaseDiskFreeBytes: value.databaseDiskFreeBytes,
+    backupDiskFreeBytes: value.backupDiskFreeBytes,
     migrationVersion: value.migrationVersion,
     ...(lastBackup ? { lastBackup } : {}),
     ...(maintenance ? { maintenance } : {}),
@@ -100,7 +112,8 @@ function parseBackupRun(value: unknown): BackupRun | null {
     !record(value) ||
     !only(value, [
       "id", "status", "filename", "checksum", "sizeBytes", "startedAt",
-      "completedAt", "errorCode", "retained",
+      "completedAt", "errorCode", "retained", "verificationStatus",
+      "verifiedAt", "verificationErrorCode",
     ]) ||
     !backupID(value.id) ||
     !["running", "succeeded", "failed"].includes(String(value.status)) ||
@@ -113,7 +126,13 @@ function parseBackupRun(value: unknown): BackupRun | null {
     (value.completedAt !== undefined &&
       !canonicalRFC3339NanoUTC(value.completedAt)) ||
     (value.errorCode !== undefined && !errorCode(value.errorCode)) ||
-    typeof value.retained !== "boolean"
+    typeof value.retained !== "boolean" ||
+    !["unknown", "passed", "failed", "retired"].includes(
+      String(value.verificationStatus),
+    ) ||
+    !optionalDate(value.verifiedAt) ||
+    (value.verificationErrorCode !== undefined &&
+      !errorCode(value.verificationErrorCode))
   ) {
     return null;
   }
@@ -129,18 +148,33 @@ function parseBackupRun(value: unknown): BackupRun | null {
       : {}),
     ...(typeof value.errorCode === "string" ? { errorCode: value.errorCode } : {}),
     retained: value.retained,
+    verificationStatus:
+      value.verificationStatus as BackupRun["verificationStatus"],
+    ...(typeof value.verifiedAt === "string"
+      ? { verifiedAt: value.verifiedAt }
+      : {}),
+    ...(typeof value.verificationErrorCode === "string"
+      ? { verificationErrorCode: value.verificationErrorCode }
+      : {}),
   };
 }
 
 function parseLastBackup(value: unknown): HealthDetail["lastBackup"] | null {
   if (
     !record(value) ||
-    !only(value, ["id", "status", "sizeBytes", "completedAt", "retained"]) ||
+    !only(value, [
+      "id", "status", "sizeBytes", "completedAt", "retained",
+      "verificationStatus", "verifiedAt", "verificationErrorCode",
+    ]) ||
     !backupID(value.id) ||
     value.status !== "succeeded" ||
     !nonNegative(value.sizeBytes) ||
     !canonicalRFC3339NanoUTC(value.completedAt) ||
-    typeof value.retained !== "boolean"
+    typeof value.retained !== "boolean" ||
+    !["passed", "failed"].includes(String(value.verificationStatus)) ||
+    !optionalDate(value.verifiedAt) ||
+    (value.verificationErrorCode !== undefined &&
+      !errorCode(value.verificationErrorCode))
   ) {
     return null;
   }
@@ -150,6 +184,14 @@ function parseLastBackup(value: unknown): HealthDetail["lastBackup"] | null {
     sizeBytes: value.sizeBytes,
     completedAt: value.completedAt,
     retained: value.retained,
+    verificationStatus:
+      value.verificationStatus as "passed" | "failed",
+    ...(typeof value.verifiedAt === "string"
+      ? { verifiedAt: value.verifiedAt }
+      : {}),
+    ...(typeof value.verificationErrorCode === "string"
+      ? { verificationErrorCode: value.verificationErrorCode }
+      : {}),
   };
 }
 

@@ -12,14 +12,17 @@ describe("settings contracts", () => {
       uptimeSeconds: 3600,
       database: "ok",
       journalMode: "wal",
-      diskFreeBytes: 1024,
-      migrationVersion: 10,
+      databaseDiskFreeBytes: 1024,
+      backupDiskFreeBytes: 2048,
+      migrationVersion: 11,
       lastBackup: {
         id: runId,
         status: "succeeded",
         sizeBytes: 4096,
         completedAt: "2026-07-29T01:02:03Z",
         retained: true,
+        verificationStatus: "passed",
+        verifiedAt: "2026-07-29T01:02:04Z",
       },
       maintenance: {
         running: false,
@@ -39,6 +42,8 @@ describe("settings contracts", () => {
         startedAt: "2026-07-29T01:02:02Z",
         completedAt: "2026-07-29T01:02:03Z",
         retained: true,
+        verificationStatus: "passed",
+        verifiedAt: "2026-07-29T01:02:04Z",
       }],
     })?.items).toHaveLength(1);
   });
@@ -59,8 +64,9 @@ describe("settings contracts", () => {
       uptimeSeconds: 1,
       database: "ok",
       journalMode: "wal",
-      diskFreeBytes: 1,
-      migrationVersion: 10,
+      databaseDiskFreeBytes: 1,
+      backupDiskFreeBytes: 1,
+      migrationVersion: 11,
       keyFingerprint: "forbidden",
     })).toBeNull();
   });

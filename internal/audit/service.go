@@ -103,15 +103,24 @@ func (s *Service) List(ctx context.Context, filter Filter) ([]Event, Cursor, err
 	case ActorAgent:
 		query.WriteString(` AND actor_agent_id IS NOT NULL`)
 	case ActorAnonymous:
-		query.WriteString(` AND actor_user_id IS NULL AND actor_agent_id IS NULL`)
+		query.WriteString(` AND actor_user_id IS NULL AND actor_agent_id IS NULL
+			AND json_extract(metadata_json, '$.actor_type') = 'anonymous'`)
+	case ActorSystem:
+		query.WriteString(` AND actor_user_id IS NULL AND actor_agent_id IS NULL
+			AND json_extract(metadata_json, '$.actor_type') = 'system'`)
 	}
 	if filter.ActorID != "" {
 		if filter.ActorType == ActorUser {
 			query.WriteString(` AND actor_user_id = ?`)
-		} else {
+			args = append(args, filter.ActorID)
+		} else if filter.ActorType == ActorAgent {
 			query.WriteString(` AND actor_agent_id = ?`)
+			args = append(args, filter.ActorID)
+		} else if (filter.ActorType == ActorSystem &&
+			filter.ActorID != SystemMaintenanceActorID) ||
+			(filter.ActorType == ActorAnonymous && filter.ActorID != "anonymous") {
+			query.WriteString(` AND 1 = 0`)
 		}
-		args = append(args, filter.ActorID)
 	}
 	if filter.Action != "" {
 		query.WriteString(` AND action = ?`)
@@ -232,8 +241,12 @@ func scanEvent(row rowScanner) (Event, error) {
 	case actorAgentID.Valid && !actorUserID.Valid && metadata.ActorType == ActorAgent:
 		event.Actor.ID = actorAgentID.String
 	case !actorUserID.Valid && !actorAgentID.Valid &&
-		metadata.ActorType == ActorAnonymous:
-		event.Actor.ID = "anonymous"
+		(metadata.ActorType == ActorAnonymous || metadata.ActorType == ActorSystem):
+		if metadata.ActorType == ActorSystem {
+			event.Actor.ID = SystemMaintenanceActorID
+		} else {
+			event.Actor.ID = "anonymous"
+		}
 	default:
 		return Event{}, ErrAuditUnavailable
 	}
@@ -261,14 +274,12 @@ func validateFilter(filter Filter) (int, error) {
 		return 0, ErrInvalidFilter
 	}
 	if filter.ActorType != "" && filter.ActorType != ActorUser &&
-		filter.ActorType != ActorAgent && filter.ActorType != ActorAnonymous {
+		filter.ActorType != ActorAgent && filter.ActorType != ActorAnonymous &&
+		filter.ActorType != ActorSystem {
 		return 0, ErrInvalidFilter
 	}
 	if filter.ActorID != "" &&
 		(filter.ActorType == "" || !validIdentifier(filter.ActorID, 256)) {
-		return 0, ErrInvalidFilter
-	}
-	if filter.ActorType == ActorAnonymous && filter.ActorID != "" {
 		return 0, ErrInvalidFilter
 	}
 	if filter.Action != "" && !validAction(filter.Action) {

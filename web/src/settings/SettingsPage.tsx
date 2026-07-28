@@ -171,12 +171,21 @@ function HealthCard({
         <dl className="detail-list">
           <Detail label="总体状态" value={state.data.status === "ok" ? "正常" : "降级"} />
           <Detail label="数据库" value={`${state.data.database} / ${state.data.journalMode}`} />
-          <Detail label="可用磁盘" value={formatBytes(state.data.diskFreeBytes)} />
+          <Detail
+            label="数据库可用磁盘"
+            value={formatBytes(state.data.databaseDiskFreeBytes)}
+          />
+          <Detail
+            label="备份可用磁盘"
+            value={formatBytes(state.data.backupDiskFreeBytes)}
+          />
           <Detail label="迁移版本" value={String(state.data.migrationVersion)} />
           <Detail
             label="最近备份"
             value={state.data.lastBackup
-              ? formatDate(state.data.lastBackup.completedAt)
+              ? `${formatDate(state.data.lastBackup.completedAt)} / ${
+                verificationStatus(state.data.lastBackup.verificationStatus)
+              }`
               : "尚无成功备份"}
           />
           <Detail
@@ -215,7 +224,11 @@ function BackupsCard({ state }: { state: EndpointState<BackupRun[]> }) {
               <div key={run.id} className="settings-backup-row">
                 <span>{backupStatus(run.status)}</span>
                 <strong>{run.completedAt ? formatDate(run.completedAt) : "进行中"}</strong>
-                <small>{run.sizeBytes ? formatBytes(run.sizeBytes) : run.errorCode ?? ""}</small>
+                <small>
+                  {run.sizeBytes ? formatBytes(run.sizeBytes) : run.errorCode ?? ""}
+                  {" / "}
+                  {verificationStatus(run.verificationStatus)}
+                </small>
               </div>
             ))}
           </div>
@@ -263,4 +276,13 @@ function backupStatus(status: BackupRun["status"]) {
   if (status === "succeeded") return "成功";
   if (status === "failed") return "失败";
   return "进行中";
+}
+
+function verificationStatus(
+  status: BackupRun["verificationStatus"] | "passed" | "failed",
+) {
+  if (status === "passed") return "验证通过";
+  if (status === "failed") return "验证失败";
+  if (status === "retired") return "已清理";
+  return "待验证";
 }

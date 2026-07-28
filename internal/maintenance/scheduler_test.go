@@ -57,6 +57,7 @@ type fakeCredentialPurger struct {
 func (fake *fakeCredentialPurger) PurgeExpiredMaintenance(
 	ctx context.Context,
 	cutoff time.Time,
+	_ string,
 ) (int64, error) {
 	fake.calls.Add(1)
 	if fake.err != nil {

@@ -30,8 +30,8 @@ func TestNewCreatesDatabaseInConfiguredDataDir(t *testing.T) {
 		t.Fatal("application database is nil")
 	}
 	t.Cleanup(func() {
-		if err := application.db.Close(); err != nil {
-			t.Errorf("close database: %v", err)
+		if err := application.Close(); err != nil {
+			t.Errorf("close application: %v", err)
 		}
 	})
 

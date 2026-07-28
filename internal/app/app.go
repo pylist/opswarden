@@ -26,11 +26,12 @@ import (
 )
 
 type App struct {
-	handler     http.Handler
-	server      *http.Server
-	db          *storage.DB
-	apiCloser   interface{ Close() error }
-	maintenance *maintenance.Scheduler
+	handler      http.Handler
+	server       *http.Server
+	db           *storage.DB
+	apiCloser    interface{ Close() error }
+	backupCloser interface{ Close() error }
+	maintenance  *maintenance.Scheduler
 }
 
 var Version = "dev"
@@ -90,13 +91,19 @@ func New(cfg config.Config) (_ *App, err error) {
 		return nil, err
 	}
 	backupDir := cfg.BackupDir
-	if backupDir == "" {
-		backupDir = filepath.Join(cfg.DataDir, "backups")
+	defaultBackupDir := filepath.Join(cfg.DataDir, "backups")
+	if backupDir == "" || backupDir == defaultBackupDir {
+		backupDir = filepath.Join(filepath.Dir(db.Path), "backups")
 	}
 	backupService, err := backup.NewService(db, backupDir, clock)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, backupService.Close())
+		}
+	}()
 	maintenanceScheduler, err := maintenance.NewScheduler(
 		db, backupService, auditService, credentialService, clock, nil,
 		!cfg.DisableAuditRetention,
@@ -138,9 +145,10 @@ func New(cfg config.Config) (_ *App, err error) {
 	mux.Handle("/", apiHandler)
 	handler := http.Handler(mux)
 	application := &App{
-		handler:     handler,
-		db:          db,
-		maintenance: maintenanceScheduler,
+		handler:      handler,
+		db:           db,
+		backupCloser: backupService,
+		maintenance:  maintenanceScheduler,
 		server: &http.Server{
 			Addr:              cfg.ListenAddr,
 			Handler:           handler,
@@ -197,6 +205,9 @@ func (a *App) Close() error {
 	}
 	if a.apiCloser != nil {
 		errs = append(errs, a.apiCloser.Close())
+	}
+	if a.backupCloser != nil {
+		errs = append(errs, a.backupCloser.Close())
 	}
 	if a.db != nil {
 		errs = append(errs, a.db.Close())

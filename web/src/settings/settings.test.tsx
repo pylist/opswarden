@@ -29,8 +29,9 @@ describe("settings", () => {
             uptimeSeconds: 120,
             database: "ok",
             journalMode: "wal",
-            diskFreeBytes: 1024 * 1024,
-            migrationVersion: 10,
+            databaseDiskFreeBytes: 1024 * 1024,
+            backupDiskFreeBytes: 2 * 1024 * 1024,
+            migrationVersion: 11,
             maintenance: {
               running: false,
               errorCodes: [],
@@ -49,6 +50,8 @@ describe("settings", () => {
             startedAt: "2026-07-29T01:02:02Z",
             completedAt: "2026-07-29T01:02:03Z",
             retained: true,
+            verificationStatus: "passed",
+            verifiedAt: "2026-07-29T01:02:04Z",
           }],
         };
       }),
@@ -65,7 +68,8 @@ describe("settings", () => {
     expect(await screen.findByText("ok / wal")).toBeVisible();
     expect(screen.getByText("1.0 MB")).toBeVisible();
     expect(screen.getByText("成功")).toBeVisible();
-    expect(screen.getByText("4.0 KB")).toBeVisible();
+    expect(screen.getByText(/4\.0 KB/)).toBeVisible();
+    expect(screen.getByText(/验证通过/)).toBeVisible();
   });
 
   it("shows precise unavailable states for Task 15 endpoints without fake metrics", async () => {

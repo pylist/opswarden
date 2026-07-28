@@ -25,7 +25,7 @@ type AuditPurger interface {
 }
 
 type CredentialPurger interface {
-	PurgeExpiredMaintenance(context.Context, time.Time) (int64, error)
+	PurgeExpiredMaintenance(context.Context, time.Time, string) (int64, error)
 }
 
 type Ticker interface {
@@ -176,6 +176,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	}
 	if _, err := s.credentials.PurgeExpiredMaintenance(
 		ctx, started.Add(-30*24*time.Hour),
+		"mnt_"+started.Format("20060102T150405000000000Z"),
 	); err != nil {
 		codes = append(codes, "CREDENTIAL_PURGE_FAILED")
 	}

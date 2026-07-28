@@ -51,6 +51,36 @@ const event = {
 };
 
 describe("audit page", () => {
+  it("filters and labels the dedicated system maintenance actor", async () => {
+    const api = apiFor(async () => ({
+      items: [{
+        ...event,
+        actorType: "system",
+        actorId: "maintenance",
+        fingerprint: "e4818b3eb3949901",
+        sourceIp: "0.0.0.0",
+      }],
+    }));
+    render(
+      <AuditPage
+        api={api}
+        space={space}
+        systemRole="member"
+        sessionActive
+      />,
+    );
+    expect(await screen.findByText("系统维护 · maintenance")).toBeVisible();
+    fireEvent.change(screen.getByLabelText("主体类型"), {
+      target: { value: "system" },
+    });
+    await waitFor(() => {
+      expect(api.request).toHaveBeenLastCalledWith(
+        "/api/v1/audit-events?spaceId=spc_prod&actorType=system&limit=100",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+  });
+
   it("sends supported actor/action/resource filters and renders only safe columns", async () => {
     const api = apiFor(async () => ({ items: [event] }));
     render(

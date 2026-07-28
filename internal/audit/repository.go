@@ -55,7 +55,7 @@ func (r *Repository) AppendTx(ctx context.Context, tx *sql.Tx, event Event) erro
 		actorUserID = event.Actor.ID
 	case ActorAgent:
 		actorAgentID = event.Actor.ID
-	case ActorAnonymous:
+	case ActorAnonymous, ActorSystem:
 		// Anonymous authentication events intentionally have no owner FK.
 	default:
 		return ErrInvalidActor

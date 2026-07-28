@@ -21,7 +21,7 @@ export type AuditRow = {
   id: string;
   requestId: string;
   createdAt: string;
-  actorType: "user" | "agent" | "anonymous";
+  actorType: "user" | "agent" | "anonymous" | "system";
   actorId: string;
   action: string;
   resourceType: string;
@@ -123,10 +123,13 @@ export function parseAuditRow(value: unknown): AuditRow | null {
     !validAuditIdentifier(value.id) ||
     !validAuditIdentifier(value.requestId) ||
     !canonicalRFC3339NanoUTC(value.createdAt) ||
-    !["user", "agent", "anonymous"].includes(String(value.actorType)) ||
+    !["user", "agent", "anonymous", "system"].includes(String(value.actorType)) ||
     !validAuditIdentifier(value.actorId) ||
     typeof value.fingerprint !== "string" ||
     !/^[0-9a-f]{16}$/u.test(value.fingerprint) ||
+    (value.actorType === "system" &&
+      (value.actorId !== "maintenance" ||
+        value.fingerprint !== "e4818b3eb3949901")) ||
     !validAuditAction(value.action) ||
     !optionalAuditIdentifier(value.spaceId) ||
     !validAuditResourceType(value.resourceType) ||

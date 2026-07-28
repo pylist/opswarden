@@ -16,6 +16,15 @@ const (
 	ActorUser      ActorType = "user"
 	ActorAgent     ActorType = "agent"
 	ActorAnonymous ActorType = "anonymous"
+	ActorSystem    ActorType = "system"
+)
+
+const (
+	SystemMaintenanceActorID = "maintenance"
+	// SystemMaintenanceFingerprint is the first 8 bytes of SHA-256 over
+	// "opswarden:system:maintenance:v1". It identifies the fixed internal
+	// principal without containing credential or host material.
+	SystemMaintenanceFingerprint = "e4818b3eb3949901"
 )
 
 const (
@@ -141,10 +150,15 @@ func Validate(event Event) error {
 
 func validateActor(actor Actor) error {
 	if actor.Type != ActorUser && actor.Type != ActorAgent &&
-		actor.Type != ActorAnonymous {
+		actor.Type != ActorAnonymous && actor.Type != ActorSystem {
 		return ErrInvalidActor
 	}
 	if !validIdentifier(actor.ID, 256) {
+		return ErrInvalidActor
+	}
+	if actor.Type == ActorSystem &&
+		(actor.ID != SystemMaintenanceActorID ||
+			actor.Fingerprint != SystemMaintenanceFingerprint) {
 		return ErrInvalidActor
 	}
 	if len(actor.Fingerprint) != 16 {
