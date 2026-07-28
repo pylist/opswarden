@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
@@ -111,6 +112,126 @@ func TestBeginLoginUsesUnifiedCredentialError(t *testing.T) {
 	}
 	if challenge.ID == "" || !challenge.ExpiresAt.Equal(h.clock.Now().Add(LoginChallengeLifetime)) {
 		t.Fatalf("challenge = %+v", challenge)
+	}
+}
+
+func TestBeginLoginUsesOnlyApprovedBoundedPasswordKDFWork(t *testing.T) {
+	tests := map[string]struct {
+		email      string
+		password   string
+		storedHash func(*recordingPasswordKDF) []byte
+		outputLen  uint32
+	}{
+		"unknown account": {
+			email: "missing@example.com", password: "wrong password",
+			outputLen: argonOutputLength,
+		},
+		"current wrong password": {
+			email: testEmail, password: "wrong password",
+			outputLen: argonOutputLength,
+		},
+		"malformed PHC": {
+			email: testEmail, password: testPassword,
+			storedHash: func(*recordingPasswordKDF) []byte { return []byte("not-a-phc") },
+			outputLen:  argonOutputLength,
+		},
+		"unapproved high-cost PHC": {
+			email: testEmail, password: testPassword,
+			storedHash: func(*recordingPasswordKDF) []byte {
+				return []byte("$argon2id$v=19$m=262144,t=10,p=8$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY")
+			},
+			outputLen: argonOutputLength,
+		},
+		"noncanonical leading zeros": {
+			email: testEmail, password: testPassword,
+			storedHash: func(*recordingPasswordKDF) []byte {
+				return []byte("$argon2id$v=19$m=065536,t=03,p=02$MDEyMzQ1Njc4OWFiY2RlZg$MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY")
+			},
+			outputLen: argonOutputLength,
+		},
+		"legacy wrong password": {
+			email: testEmail, password: "wrong password",
+			storedHash: func(kdf *recordingPasswordKDF) []byte {
+				return testPasswordHash(
+					t, kdf.derive, testPassword,
+					passwordParameters{
+						memory: argonMemory, iterations: argonIterations,
+						parallelism: argonParallelism, outputLength: legacyArgonOutputLength,
+					},
+				)
+			},
+			outputLen: legacyArgonOutputLength,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			kdf := &recordingPasswordKDF{}
+			h := newIdentityHarnessWithKDF(t, kdf.derive)
+			if test.storedHash != nil {
+				hash := test.storedHash(kdf)
+				if _, err := h.db.Writer.ExecContext(h.ctx,
+					`UPDATE users SET password_hash = ? WHERE id = ?`,
+					hash, h.owner.UserID,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			kdf.reset()
+
+			if _, err := h.service.BeginLogin(h.ctx, test.email, test.password); err != ErrInvalidCredentials {
+				t.Fatalf("error = %v", err)
+			}
+			if len(kdf.calls) != 1 {
+				t.Fatalf("KDF calls = %+v, want exactly one", kdf.calls)
+			}
+			call := kdf.calls[0]
+			if call.memory != argonMemory || call.iterations != argonIterations ||
+				call.parallelism != argonParallelism || call.outputLength != test.outputLen ||
+				call.saltLength != argonSaltLength {
+				t.Fatalf("KDF call = %+v", call)
+			}
+		})
+	}
+}
+
+func TestSuccessfulLegacyPasswordLoginUpgradesToCurrentPHC(t *testing.T) {
+	kdf := &recordingPasswordKDF{}
+	h := newIdentityHarnessWithKDF(t, kdf.derive)
+	legacy := testPasswordHash(
+		t, kdf.derive, testPassword,
+		passwordParameters{
+			memory: argonMemory, iterations: argonIterations,
+			parallelism: argonParallelism, outputLength: legacyArgonOutputLength,
+		},
+	)
+	if _, err := h.db.Writer.ExecContext(h.ctx,
+		`UPDATE users SET password_hash = ? WHERE id = ?`, legacy, h.owner.UserID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	kdf.reset()
+
+	challenge := h.beginLogin(t, testPassword)
+	if len(kdf.calls) != 2 ||
+		kdf.calls[0].outputLength != legacyArgonOutputLength ||
+		kdf.calls[1].outputLength != argonOutputLength {
+		t.Fatalf("legacy/current KDF calls = %+v", kdf.calls)
+	}
+	if _, err := h.service.CompleteLogin(
+		h.ctx, challenge.ID, h.totpAt(h.clock.Now()),
+	); err != nil {
+		t.Fatal(err)
+	}
+	var encoded []byte
+	if err := h.db.Reader.QueryRowContext(h.ctx,
+		`SELECT password_hash FROM users WHERE id = ?`, h.owner.UserID,
+	).Scan(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	params, _, _, kind := parsePasswordHash(encoded)
+	if kind != passwordHashCurrent || params.outputLength != argonOutputLength {
+		t.Fatalf("upgraded password kind/params = %v/%+v", kind, params)
 	}
 }
 
@@ -314,6 +435,19 @@ func TestSessionIdleAbsoluteRecentTOTPAndRevocation(t *testing.T) {
 		}
 	})
 
+	t.Run("recent TOTP expires at exact boundary", func(t *testing.T) {
+		h := newIdentityHarness(t)
+		session := h.login(t)
+		h.clock.Advance(RecentTOTPLifetime)
+		principal, err := h.service.ResolveSession(h.ctx, session.RawToken)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if principal.HasRecentTOTP(h.clock.Now()) {
+			t.Fatal("login TOTP remained recent at the exact five-minute boundary")
+		}
+	})
+
 	t.Run("logout", func(t *testing.T) {
 		h := newIdentityHarness(t)
 		session := h.login(t)
@@ -361,30 +495,26 @@ func TestResetPasswordInvalidatesOutstandingLoginChallenge(t *testing.T) {
 	}
 }
 
-func TestPasswordHashParserRejectsNonCanonicalAndUnsafeParameters(t *testing.T) {
-	valid, err := hashPassword("fixture password")
-	if err != nil {
+func TestChangeSystemRoleUpdatesRoleAndRevokesSessionsAtomically(t *testing.T) {
+	h := newIdentityHarness(t)
+	session := h.login(t)
+
+	if err := h.service.ChangeSystemRole(
+		h.ctx, h.owner.UserID, h.owner.UserID, SystemRoleMember,
+	); err != nil {
 		t.Fatal(err)
 	}
-	parts := strings.Split(string(valid), "$")
-	if len(parts) != 6 {
-		t.Fatalf("hash parts = %d", len(parts))
+	var role string
+	if err := h.db.Reader.QueryRowContext(h.ctx,
+		`SELECT system_role FROM users WHERE id = ?`, h.owner.UserID,
+	).Scan(&role); err != nil {
+		t.Fatal(err)
 	}
-	tests := map[string]string{
-		"trailing parameter data": "m=65536,t=3,p=2junk",
-		"memory below lanes":      "m=8,t=3,p=8",
-		"extra parameter":         "m=65536,t=3,p=2,x=1",
+	if role != SystemRoleMember {
+		t.Fatalf("system role = %q", role)
 	}
-	for name, parameters := range tests {
-		t.Run(name, func(t *testing.T) {
-			malformed := strings.Join(
-				[]string{"", parts[1], parts[2], parameters, parts[4], parts[5]},
-				"$",
-			)
-			if _, _, _, ok := parsePasswordHash([]byte(malformed)); ok {
-				t.Fatalf("accepted parameters %q", parameters)
-			}
-		})
+	if _, err := h.service.ResolveSession(h.ctx, session.RawToken); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("role-change session error = %v", err)
 	}
 }
 
@@ -439,7 +569,28 @@ func newIdentityHarness(t *testing.T) *identityHarness {
 	return h
 }
 
+func newIdentityHarnessWithKDF(t *testing.T, kdf passwordKDF) *identityHarness {
+	t.Helper()
+	h := newIdentityHarnessWithoutOwnerWithKDF(t, kdf)
+	owner, err := h.service.CreateInitialOwner(h.ctx, CreateOwnerInput{
+		Email: testEmail, Password: testPassword, TOTPSeed: testTOTPSeed,
+		SourceIP: netip.MustParseAddr("127.0.0.1"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.owner = owner
+	return h
+}
+
 func newIdentityHarnessWithoutOwner(t *testing.T) *identityHarness {
+	return newIdentityHarnessWithoutOwnerWithKDF(t, nil)
+}
+
+func newIdentityHarnessWithoutOwnerWithKDF(
+	t *testing.T,
+	kdf passwordKDF,
+) *identityHarness {
 	t.Helper()
 	ctx := context.Background()
 	databasePath := filepath.Join(t.TempDir(), "opswarden.db")
@@ -454,15 +605,68 @@ func newIdentityHarnessWithoutOwner(t *testing.T) *identityHarness {
 	})
 	clock := &fakeClock{now: time.Date(2026, 7, 28, 9, 30, 0, 0, time.UTC)}
 	box := cryptobox.New([32]byte{1, 2, 3, 4})
-	service, err := NewService(db, box, clock, Config{
-		InternalCIDRs: []netip.Prefix{netip.MustParsePrefix("10.23.0.0/16")},
-	})
+	config := Config{InternalCIDRs: []netip.Prefix{netip.MustParsePrefix("10.23.0.0/16")}}
+	var service *Service
+	if kdf == nil {
+		service, err = NewService(db, box, clock, config)
+	} else {
+		service, err = newServiceWithKDF(db, box, clock, config, kdf)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	return &identityHarness{
 		ctx: ctx, databasePath: databasePath, db: db, clock: clock, service: service,
 	}
+}
+
+type passwordKDFCall struct {
+	passwordParameters
+	saltLength int
+}
+
+type recordingPasswordKDF struct {
+	calls []passwordKDFCall
+}
+
+func (k *recordingPasswordKDF) derive(
+	password, salt []byte,
+	params passwordParameters,
+) []byte {
+	k.calls = append(k.calls, passwordKDFCall{
+		passwordParameters: params,
+		saltLength:         len(salt),
+	})
+	input := make([]byte, 0, len(password)+len(salt))
+	input = append(input, password...)
+	input = append(input, salt...)
+	sum := sha256.Sum256(input)
+	output := make([]byte, params.outputLength)
+	for index := range output {
+		output[index] = sum[index%len(sum)]
+	}
+	return output
+}
+
+func (k *recordingPasswordKDF) reset() {
+	k.calls = nil
+}
+
+func testPasswordHash(
+	t *testing.T,
+	kdf passwordKDF,
+	password string,
+	params passwordParameters,
+) []byte {
+	t.Helper()
+	salt := []byte("0123456789abcdef")
+	sum := kdf([]byte(password), salt, params)
+	return []byte(fmt.Sprintf(
+		"$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s",
+		params.memory, params.iterations, params.parallelism,
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(sum),
+	))
 }
 
 func (h *identityHarness) beginLogin(t *testing.T, password string) LoginChallenge {

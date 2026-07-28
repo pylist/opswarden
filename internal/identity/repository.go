@@ -341,6 +341,42 @@ func (r *repository) revokeUserSessions(ctx context.Context, userID string, now 
 	})
 }
 
+func (r *repository) changeSystemRole(
+	ctx context.Context,
+	actorUserID, targetUserID, role string,
+	now time.Time,
+) error {
+	return storage.WithTx(ctx, r.db, func(tx *sql.Tx) error {
+		var actorRole string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT system_role FROM users WHERE id = ? AND deleted_at IS NULL
+		`, actorUserID).Scan(&actorRole); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrForbidden
+			}
+			return fmt.Errorf("read system-role actor: %w", err)
+		}
+		if actorRole != SystemRoleOwner {
+			return ErrForbidden
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE users SET system_role = ?, updated_at = ?
+			WHERE id = ? AND deleted_at IS NULL
+		`, role, formatTime(now), targetUserID)
+		if err != nil {
+			return fmt.Errorf("change system role: %w", err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read system-role change result: %w", err)
+		}
+		if changed != 1 {
+			return ErrUserNotFound
+		}
+		return revokeUserSessionsTx(ctx, tx, targetUserID, now)
+	})
+}
+
 func revokeUserSessionsTx(ctx context.Context, tx *sql.Tx, userID string, now time.Time) error {
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ?

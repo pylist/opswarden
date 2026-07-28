@@ -40,8 +40,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := db.Writer.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	if before != 2 || after != before {
-		t.Fatalf("migration counts before/after = %d/%d, want 2/2", before, after)
+	if before != 3 || after != before {
+		t.Fatalf("migration counts before/after = %d/%d, want 3/3", before, after)
 	}
 }
 
@@ -87,8 +87,8 @@ func TestConcurrentMigrateOnIndependentDatabases(t *testing.T) {
 			if err := databases[0].QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&versions); err != nil {
 				t.Fatal(err)
 			}
-			if versions != 2 {
-				t.Fatalf("schema migration count = %d, want 2", versions)
+			if versions != 3 {
+				t.Fatalf("schema migration count = %d, want 3", versions)
 			}
 		})
 	}
@@ -250,6 +250,97 @@ func TestIdentityStateMigrationAddsRoleReplayAndSessionExpiryColumns(t *testing.
 		(id, user_id, token_hash, expires_at, idle_expires_at, recent_totp_at)
 		VALUES ('identity-session', 'identity-user', X'02',
 			'2026-07-29T09:30:00Z', '2026-07-28T17:30:00Z', '2026-07-28T09:30:00Z')`)
+}
+
+func TestSessionIdleMigrationBackfillsOldRowsAndEnforcesNotNull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identity-upgrade.db")
+	db, err := sql.Open(driverName, sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	available, err := loadMigrations(migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initial migration
+	for _, candidate := range available {
+		if candidate.version == 1 {
+			initial = candidate
+			break
+		}
+	}
+	if initial.version == 0 {
+		t.Fatal("initial migration not found")
+	}
+	mustExec(t, db, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+			applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	mustExec(t, db, string(initial.contents))
+	mustExec(t, db, `
+		INSERT INTO schema_migrations (version, name, checksum) VALUES (?, ?, ?)
+	`, initial.version, initial.name, initial.checksum)
+	mustExec(t, db, `INSERT INTO users
+		(id, email, normalized_email, password_hash)
+		VALUES ('legacy-user', 'legacy@example.com', 'legacy@example.com', X'01')`)
+	mustExec(t, db, `INSERT INTO sessions
+		(id, user_id, token_hash, created_at, expires_at)
+		VALUES ('legacy-session', 'legacy-user', X'02',
+			'2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z')`)
+
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	var idleExpiresAt string
+	if err := db.QueryRow(`
+		SELECT idle_expires_at FROM sessions WHERE id = 'legacy-session'
+	`).Scan(&idleExpiresAt); err != nil {
+		t.Fatalf("scan migrated idle expiry: %v", err)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, idleExpiresAt)
+	if err != nil {
+		t.Fatalf("parse migrated idle expiry: %v", err)
+	}
+	if !parsed.Equal(time.Unix(0, 0).UTC()) {
+		t.Fatalf("legacy session idle expiry = %s, want explicit epoch expiry", idleExpiresAt)
+	}
+
+	rows, err := db.Query(`PRAGMA table_info(sessions)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	foundNotNull := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(
+			&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if name == "idle_expires_at" {
+			foundNotNull = notNull == 1
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !foundNotNull {
+		t.Fatal("sessions.idle_expires_at is not enforced NOT NULL")
+	}
+	if _, err := db.Exec(`INSERT INTO sessions
+		(id, user_id, token_hash, expires_at, idle_expires_at)
+		VALUES ('null-idle', 'legacy-user', X'03', '2099-01-01T00:00:00Z', NULL)`); err == nil {
+		t.Fatal("NULL session idle expiry succeeded")
+	}
 }
 
 func TestInitialSchemaContainsHashSoftDeleteAndLookupColumns(t *testing.T) {

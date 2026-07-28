@@ -46,8 +46,10 @@ recent-TOTP verification, logout, user-wide revocation, and password reset.
 
 ## Self-review
 
-- Argon2id is exactly 64 MiB / 3 iterations / parallelism 2 / 16-byte salt /
-  32-byte output, with canonical parameter parsing and transparent upgrade.
+- Argon2id current hashes are exactly 64 MiB / 3 iterations / parallelism 2 /
+  16-byte salt / 32-byte output. The only accepted legacy form keeps the same
+  memory, iterations, parallelism, and salt with a 16-byte output; it is
+  transparently upgraded after the complete login succeeds.
 - Unknown email and wrong password return the same `ErrInvalidCredentials` and
   both execute Argon2id verification using a dummy hash where needed.
 - TOTP accepts only current ±1 30-second window; the persisted counter and
@@ -67,3 +69,46 @@ recent-TOTP verification, logout, user-wide revocation, and password reset.
   single-instance boundary.
 - Session resolution refreshes idle expiry in the single SQLite writer; this is
   correct for v1 but may warrant coalesced refresh writes at larger scale.
+
+## Review remediation
+
+### RED / GREEN
+
+- RED: the new bounded-KDF and role-change identity tests initially failed to
+  compile because `passwordKDF`, the exact legacy class, and
+  `ChangeSystemRole` did not exist. GREEN: focused identity tests passed after
+  adding the seam, the two-entry PHC allowlist, and the transactional role path.
+- The KDF seam records calls without recording passwords. Unknown accounts,
+  malformed PHCs, noncanonical leading-zero PHCs, unapproved high-cost PHCs,
+  current wrong passwords, and legacy wrong passwords each make exactly one
+  KDF call. Every call is fixed at 64 MiB / 3 iterations / parallelism 2 with a
+  16-byte salt; output is 32 bytes except the single approved 16-byte legacy
+  verifier.
+- RED: `TestSessionIdleMigrationBackfillsOldRowsAndEnforcesNotNull` failed with
+  `converting NULL to string is unsupported` against an old-schema session.
+  GREEN: migration `0003_sessions_idle_not_null.sql` backfills old rows to the
+  Unix epoch and rebuilds `sessions.idle_expires_at` with `NOT NULL`.
+- The exact-five-minute recent-TOTP test was added before changing the predicate
+  from `<=` to `<`. The role-change test performs a real `users.system_role`
+  update and then observes `ErrSessionRevoked` for the prior session.
+
+### Review verification
+
+- `go test ./internal/identity ./internal/storage ./internal/cryptobox` passed.
+- `go test -race ./internal/identity ./internal/storage ./internal/cryptobox`
+  passed in the final run: identity cached, storage `4.972s`, cryptobox cached.
+- `go test ./...`, `go vet ./...`, and `git diff --check` all passed.
+
+### Review files and self-check
+
+- Updated `internal/identity/model.go`, `repository.go`, `service.go`, and
+  `service_test.go`.
+- Updated `internal/storage/migrate_test.go` and added
+  `internal/storage/migrations/0003_sessions_idle_not_null.sql`.
+- `ChangeSystemRole` checks the actor's System Owner role, updates the target,
+  and revokes target sessions in one writer transaction.
+- `RevokeUserSessionsTx` is exposed as the narrow outer-transaction contract
+  needed by later membership work; no Space behavior was added.
+- PHC numeric fields must match the exact canonical parameter string, so leading
+  zeros and every non-allowlisted cost are rejected without allocating their
+  requested Argon2 resources.

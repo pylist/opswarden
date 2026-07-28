@@ -28,13 +28,24 @@ import (
 )
 
 const (
-	argonMemory       = 64 * 1024
-	argonIterations   = 3
-	argonParallelism  = 2
-	argonSaltLength   = 16
-	argonOutputLength = 32
+	argonMemory             = 64 * 1024
+	argonIterations         = 3
+	argonParallelism        = 2
+	argonSaltLength         = 16
+	argonOutputLength       = 32
+	legacyArgonOutputLength = 16
 
 	loginTOTPPurpose = "login-totp"
+)
+
+type passwordKDF func(password, salt []byte, params passwordParameters) []byte
+
+type passwordHashKind uint8
+
+const (
+	passwordHashInvalid passwordHashKind = iota
+	passwordHashCurrent
+	passwordHashLegacy
 )
 
 type loginChallengeState struct {
@@ -50,6 +61,7 @@ type Service struct {
 	clock         platform.Clock
 	internalCIDRs []netip.Prefix
 	dummyHash     []byte
+	kdf           passwordKDF
 
 	challengesMu sync.Mutex
 	challenges   map[string]loginChallengeState
@@ -61,6 +73,16 @@ func NewService(
 	clock platform.Clock,
 	config Config,
 ) (*Service, error) {
+	return newServiceWithKDF(db, box, clock, config, argonPasswordKDF)
+}
+
+func newServiceWithKDF(
+	db *storage.DB,
+	box *cryptobox.Box,
+	clock platform.Clock,
+	config Config,
+	kdf passwordKDF,
+) (*Service, error) {
 	if db == nil || db.Writer == nil || db.Reader == nil {
 		return nil, errors.New("identity database is required")
 	}
@@ -70,7 +92,10 @@ func NewService(
 	if clock == nil {
 		return nil, errors.New("identity clock is required")
 	}
-	dummyHash, err := hashPassword("opswarden-dummy-password")
+	if kdf == nil {
+		return nil, errors.New("identity password KDF is required")
+	}
+	dummyHash, err := hashPasswordWithKDF(kdf, "opswarden-dummy-password")
 	if err != nil {
 		return nil, err
 	}
@@ -80,6 +105,7 @@ func NewService(
 		clock:         clock,
 		internalCIDRs: append([]netip.Prefix(nil), config.InternalCIDRs...),
 		dummyHash:     dummyHash,
+		kdf:           kdf,
 		challenges:    make(map[string]loginChallengeState),
 	}, nil
 }
@@ -104,7 +130,7 @@ func (s *Service) CreateInitialOwner(
 	if err != nil {
 		return CreateOwnerResult{}, err
 	}
-	passwordHash, err := hashPassword(input.Password)
+	passwordHash, err := s.hashPassword(input.Password)
 	if err != nil {
 		return CreateOwnerResult{}, err
 	}
@@ -158,7 +184,7 @@ func (s *Service) BeginLogin(
 	} else if !errors.Is(findErr, ErrUserNotFound) {
 		return LoginChallenge{}, findErr
 	}
-	valid, paramsCurrent := verifyPassword(hash, password)
+	valid, paramsCurrent := s.verifyPassword(hash, password)
 	if findErr != nil || !valid {
 		return LoginChallenge{}, ErrInvalidCredentials
 	}
@@ -166,7 +192,7 @@ func (s *Service) BeginLogin(
 	var upgraded []byte
 	var err error
 	if !paramsCurrent {
-		upgraded, err = hashPassword(password)
+		upgraded, err = s.hashPassword(password)
 		if err != nil {
 			return LoginChallenge{}, err
 		}
@@ -277,6 +303,37 @@ func (s *Service) RevokeUserSessions(ctx context.Context, userID string) error {
 	return s.repository.revokeUserSessions(ctx, userID, s.now())
 }
 
+func (s *Service) RevokeUserSessionsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	userID string,
+) error {
+	if tx == nil {
+		return errors.New("identity transaction is required")
+	}
+	if userID == "" {
+		return ErrUserNotFound
+	}
+	return revokeUserSessionsTx(ctx, tx, userID, s.now())
+}
+
+func (s *Service) ChangeSystemRole(
+	ctx context.Context,
+	actorUserID, targetUserID, newRole string,
+) error {
+	if actorUserID == "" || targetUserID == "" {
+		return ErrUserNotFound
+	}
+	switch newRole {
+	case SystemRoleOwner, SystemRoleAdmin, SystemRoleMember:
+	default:
+		return ErrInvalidSystemRole
+	}
+	return s.repository.changeSystemRole(
+		ctx, actorUserID, targetUserID, newRole, s.now(),
+	)
+}
+
 func (s *Service) ResetPassword(
 	ctx context.Context,
 	userID, newPassword string,
@@ -287,7 +344,7 @@ func (s *Service) ResetPassword(
 	if newPassword == "" {
 		return ErrInvalidCredentials
 	}
-	hash, err := hashPassword(newPassword)
+	hash, err := s.hashPassword(newPassword)
 	if err != nil {
 		return err
 	}
@@ -390,16 +447,18 @@ type passwordParameters struct {
 	outputLength uint32
 }
 
-func hashPassword(password string) ([]byte, error) {
+func (s *Service) hashPassword(password string) ([]byte, error) {
+	return hashPasswordWithKDF(s.kdf, password)
+}
+
+func hashPasswordWithKDF(kdf passwordKDF, password string) ([]byte, error) {
 	salt := make([]byte, argonSaltLength)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return nil, fmt.Errorf("generate password salt: %w", err)
 	}
 	defer clear(salt)
-	sum := argon2.IDKey(
-		[]byte(password), salt, argonIterations, argonMemory,
-		argonParallelism, argonOutputLength,
-	)
+	params := currentPasswordParameters()
+	sum := kdf([]byte(password), salt, params)
 	defer clear(sum)
 	encoded := fmt.Sprintf(
 		"$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
@@ -410,80 +469,80 @@ func hashPassword(password string) ([]byte, error) {
 	return []byte(encoded), nil
 }
 
-func verifyPassword(encoded []byte, password string) (valid, paramsCurrent bool) {
-	params, salt, expected, ok := parsePasswordHash(encoded)
-	if !ok {
+func (s *Service) verifyPassword(encoded []byte, password string) (valid, paramsCurrent bool) {
+	params, salt, expected, kind := parsePasswordHash(encoded)
+	if kind == passwordHashInvalid {
+		params, salt, expected, kind = parsePasswordHash(s.dummyHash)
+		if kind != passwordHashCurrent {
+			panic("identity dummy password hash is not current")
+		}
+		actual := s.kdf([]byte(password), salt, params)
+		clear(actual)
+		clear(salt)
+		clear(expected)
 		return false, false
 	}
 	defer clear(salt)
 	defer clear(expected)
-	actual := argon2.IDKey(
-		[]byte(password), salt, params.iterations, params.memory,
-		params.parallelism, params.outputLength,
-	)
+	actual := s.kdf([]byte(password), salt, params)
 	defer clear(actual)
 	valid = subtle.ConstantTimeCompare(actual, expected) == 1
-	paramsCurrent = params.memory == argonMemory &&
-		params.iterations == argonIterations &&
-		params.parallelism == argonParallelism &&
-		params.outputLength == argonOutputLength &&
-		len(salt) == argonSaltLength
+	paramsCurrent = kind == passwordHashCurrent
 	return valid, paramsCurrent
 }
 
-func parsePasswordHash(encoded []byte) (passwordParameters, []byte, []byte, bool) {
+func parsePasswordHash(encoded []byte) (
+	passwordParameters,
+	[]byte,
+	[]byte,
+	passwordHashKind,
+) {
 	parts := strings.Split(string(encoded), "$")
 	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" ||
 		parts[2] != "v="+strconv.Itoa(argon2.Version) {
-		return passwordParameters{}, nil, nil, false
+		return passwordParameters{}, nil, nil, passwordHashInvalid
 	}
-	parameters := strings.Split(parts[3], ",")
-	if len(parameters) != 3 {
-		return passwordParameters{}, nil, nil, false
-	}
-	memory64, ok := parseUintParameter(parameters[0], "m=", 32)
-	if !ok {
-		return passwordParameters{}, nil, nil, false
-	}
-	iterations64, ok := parseUintParameter(parameters[1], "t=", 32)
-	if !ok {
-		return passwordParameters{}, nil, nil, false
-	}
-	parallelism64, ok := parseUintParameter(parameters[2], "p=", 8)
-	if !ok {
-		return passwordParameters{}, nil, nil, false
-	}
-	memory := uint32(memory64)
-	iterations := uint32(iterations64)
-	parallelism := uint8(parallelism64)
-	if memory < uint32(parallelism)*8 || memory > 256*1024 ||
-		iterations == 0 || iterations > 10 ||
-		parallelism == 0 || parallelism > 8 {
-		return passwordParameters{}, nil, nil, false
+	if parts[3] != fmt.Sprintf(
+		"m=%d,t=%d,p=%d", argonMemory, argonIterations, argonParallelism,
+	) {
+		return passwordParameters{}, nil, nil, passwordHashInvalid
 	}
 	salt, err := base64.RawStdEncoding.Strict().DecodeString(parts[4])
-	if err != nil || len(salt) < 8 || len(salt) > 64 {
+	if err != nil || len(salt) != argonSaltLength ||
+		base64.RawStdEncoding.EncodeToString(salt) != parts[4] {
 		clear(salt)
-		return passwordParameters{}, nil, nil, false
+		return passwordParameters{}, nil, nil, passwordHashInvalid
 	}
 	sum, err := base64.RawStdEncoding.Strict().DecodeString(parts[5])
-	if err != nil || len(sum) < 16 || len(sum) > 64 {
+	if err != nil ||
+		(len(sum) != argonOutputLength && len(sum) != legacyArgonOutputLength) ||
+		base64.RawStdEncoding.EncodeToString(sum) != parts[5] {
 		clear(salt)
 		clear(sum)
-		return passwordParameters{}, nil, nil, false
+		return passwordParameters{}, nil, nil, passwordHashInvalid
+	}
+	kind := passwordHashCurrent
+	if len(sum) == legacyArgonOutputLength {
+		kind = passwordHashLegacy
 	}
 	return passwordParameters{
-		memory: memory, iterations: iterations, parallelism: parallelism,
+		memory: argonMemory, iterations: argonIterations, parallelism: argonParallelism,
 		outputLength: uint32(len(sum)),
-	}, salt, sum, true
+	}, salt, sum, kind
 }
 
-func parseUintParameter(value, prefix string, bitSize int) (uint64, bool) {
-	if !strings.HasPrefix(value, prefix) || len(value) == len(prefix) {
-		return 0, false
+func currentPasswordParameters() passwordParameters {
+	return passwordParameters{
+		memory: argonMemory, iterations: argonIterations,
+		parallelism: argonParallelism, outputLength: argonOutputLength,
 	}
-	parsed, err := strconv.ParseUint(value[len(prefix):], 10, bitSize)
-	return parsed, err == nil
+}
+
+func argonPasswordKDF(password, salt []byte, params passwordParameters) []byte {
+	return argon2.IDKey(
+		password, salt, params.iterations, params.memory,
+		params.parallelism, params.outputLength,
+	)
 }
 
 func normalizeTOTPSecret(secret string) string {

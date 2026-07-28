@@ -7,7 +7,9 @@ import (
 )
 
 const (
-	SystemRoleOwner = "system_owner"
+	SystemRoleOwner  = "system_owner"
+	SystemRoleAdmin  = "system_admin"
+	SystemRoleMember = "member"
 
 	RecoveryCodeCount       = 10
 	TOTPPeriod              = 30 * time.Second
@@ -30,6 +32,8 @@ var (
 	ErrSessionExpired           = errors.New("session expired")
 	ErrSessionRevoked           = errors.New("session revoked")
 	ErrUserNotFound             = errors.New("user not found")
+	ErrForbidden                = errors.New("identity operation forbidden")
+	ErrInvalidSystemRole        = errors.New("invalid system role")
 )
 
 type Config struct {
@@ -70,5 +74,5 @@ func (p SessionPrincipal) HasRecentTOTP(now time.Time) bool {
 	if p.RecentTOTPAt.IsZero() || now.Before(p.RecentTOTPAt) {
 		return false
 	}
-	return now.Sub(p.RecentTOTPAt) <= RecentTOTPLifetime
+	return now.Sub(p.RecentTOTPAt) < RecentTOTPLifetime
 }
