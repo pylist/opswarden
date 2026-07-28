@@ -16,3 +16,5 @@ dist/
 !internal/webui/dist/**
 coverage/
 bin/
+node_modules/
+*.tsbuildinfo
