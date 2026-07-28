@@ -12,6 +12,8 @@ import (
 	"opswarden/internal/identity"
 )
 
+const maxGrantJSONBytes = 16 * 1024
+
 var (
 	ErrInvalidInput              = errors.New("invalid agent input")
 	ErrInvalidScope              = errors.New("invalid agent scope")

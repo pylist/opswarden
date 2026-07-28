@@ -1,9 +1,11 @@
 package agents
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -540,4 +542,143 @@ func TestConcurrentRevocationNeverAuthenticatesAfterCommit(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestMaximumCanonicalGrantSizeWritesAndAuthenticates(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	issued, err := h.service.IssueToken(
+		h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maximum, _ := grantJSONBoundary(t, h.spaceID)
+	encoded, err := json.Marshal(maximum.RequiredLabels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > maxGrantJSONBytes ||
+		maxGrantJSONBytes-len(encoded) > 1 {
+		t.Fatalf("labels size=%d limit=%d", len(encoded), maxGrantJSONBytes)
+	}
+	if err := h.service.SetGrant(
+		h.ctx, h.member, agent.ID, maximum,
+	); err != nil {
+		t.Fatal(err)
+	}
+	principal, err := h.service.Authenticate(h.ctx, issued.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(principal.Grants) != 1 ||
+		len(principal.Grants[0].RequiredLabels) !=
+			len(maximum.RequiredLabels) {
+		t.Fatalf("grant=%+v", principal.Grants)
+	}
+}
+
+func TestOversizeCanonicalGrantRejectedWithoutReplacingOriginal(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	issued, err := h.service.IssueToken(
+		h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := Grant{
+		SpaceID: h.spaceID,
+		Scopes:  []authorization.Scope{authorization.ScopeCredentialRead},
+		RequiredLabels: map[string]string{
+			"environment": "dev",
+		},
+	}
+	if err := h.service.SetGrant(
+		h.ctx, h.member, agent.ID, original,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var scopesBefore, labelsBefore []byte
+	if err := h.db.Reader.QueryRow(`
+		SELECT scopes_json, labels_json
+		FROM agent_space_grants
+		WHERE agent_id = ? AND space_id = ?
+	`, agent.ID, h.spaceID).Scan(&scopesBefore, &labelsBefore); err != nil {
+		t.Fatal(err)
+	}
+	auditsBefore := len(h.audit.seen)
+	_, oversize := grantJSONBoundary(t, h.spaceID)
+	encoded, err := json.Marshal(oversize.RequiredLabels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) <= maxGrantJSONBytes {
+		t.Fatalf("oversize labels=%d", len(encoded))
+	}
+	if err := h.service.SetGrant(
+		h.ctx, h.member, agent.ID, oversize,
+	); !errors.Is(err, ErrInvalidGrant) {
+		t.Fatalf("got %v", err)
+	}
+	if len(h.audit.seen) != auditsBefore {
+		t.Fatal("oversize grant emitted an audit event")
+	}
+	var scopesAfter, labelsAfter []byte
+	if err := h.db.Reader.QueryRow(`
+		SELECT scopes_json, labels_json
+		FROM agent_space_grants
+		WHERE agent_id = ? AND space_id = ?
+	`, agent.ID, h.spaceID).Scan(&scopesAfter, &labelsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(scopesBefore, scopesAfter) ||
+		!bytes.Equal(labelsBefore, labelsAfter) {
+		t.Fatal("oversize grant replaced the original")
+	}
+	principal, err := h.service.Authenticate(h.ctx, issued.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(principal.Grants) != 1 ||
+		principal.Grants[0].RequiredLabels["environment"] != "dev" {
+		t.Fatalf("original grant changed: %+v", principal.Grants)
+	}
+}
+
+func grantJSONBoundary(t *testing.T, spaceID string) (Grant, Grant) {
+	t.Helper()
+	labels := make(map[string]string, maxGrantLabels)
+	for index := 0; index < maxGrantLabels; index++ {
+		labels["label-"+strconv.Itoa(index)] = ""
+	}
+	for index := 0; index < maxGrantLabels; index++ {
+		key := "label-" + strconv.Itoa(index)
+		for len(labels[key]) < 512 {
+			labels[key] += `\`
+			encoded, err := json.Marshal(labels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(encoded) > maxGrantJSONBytes {
+				oversizeLabels := cloneLabels(labels)
+				labels[key] = strings.TrimSuffix(labels[key], `\`)
+				return Grant{
+						SpaceID: spaceID,
+						Scopes: []authorization.Scope{
+							authorization.ScopeCredentialRead,
+						},
+						RequiredLabels: cloneLabels(labels),
+					}, Grant{
+						SpaceID: spaceID,
+						Scopes: []authorization.Scope{
+							authorization.ScopeCredentialRead,
+						},
+						RequiredLabels: oversizeLabels,
+					}
+			}
+		}
+	}
+	t.Fatal("could not construct grant JSON boundary")
+	return Grant{}, Grant{}
 }

@@ -252,7 +252,7 @@ func decodeGrant(
 }
 
 func decodeJSON(encoded []byte, destination any) error {
-	if len(encoded) == 0 || len(encoded) > 16*1024 {
+	if len(encoded) == 0 || len(encoded) > maxGrantJSONBytes {
 		return ErrInvalidGrant
 	}
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
@@ -274,6 +274,9 @@ func encodeGrant(grant Grant) ([]byte, []byte, error) {
 	}
 	labels, err := json.Marshal(grant.RequiredLabels)
 	if err != nil {
+		return nil, nil, ErrInvalidGrant
+	}
+	if len(scopes) > maxGrantJSONBytes || len(labels) > maxGrantJSONBytes {
 		return nil, nil, ErrInvalidGrant
 	}
 	return scopes, labels, nil
