@@ -6,15 +6,17 @@ import (
 )
 
 const (
-	anonymousFailureWindow     = time.Minute
-	anonymousFailureAuditLimit = 5
-	anonymousFailureMaxKeys    = 4096
+	anonymousFailureWindow         = time.Minute
+	anonymousFailurePerKeyLimit    = 5
+	anonymousFailureDurableLimit   = 32
+	anonymousFailureMaxKeys        = 4096
+	anonymousFailureOtherOperation = "auth.other"
 )
 
-type anonymousFailureState struct {
+type anonymousFailureOperationState struct {
 	windowStart time.Time
-	lastSeen    time.Time
-	recorded    int
+	entries     map[string]uint8
+	durableRows int
 	suppressed  uint64
 }
 
@@ -24,76 +26,135 @@ type anonymousFailureObservation struct {
 	retryAfter       time.Duration
 	aggregateCount   uint64
 	aggregateStart   time.Time
+	workUnits        int
 }
 
 type anonymousFailureGate struct {
-	mu      sync.Mutex
-	entries map[string]*anonymousFailureState
+	mu         sync.Mutex
+	operations map[string]*anonymousFailureOperationState
 }
 
 func newAnonymousFailureGate() *anonymousFailureGate {
 	return &anonymousFailureGate{
-		entries: make(map[string]*anonymousFailureState),
+		operations: make(map[string]*anonymousFailureOperationState, 8),
 	}
 }
 
 func (gate *anonymousFailureGate) observe(
+	operation string,
 	key string,
 	now time.Time,
 ) anonymousFailureObservation {
+	return gate.observeMode(operation, key, now, false)
+}
+
+func (gate *anonymousFailureGate) suppress(
+	operation string,
+	key string,
+	now time.Time,
+) anonymousFailureObservation {
+	return gate.observeMode(operation, key, now, true)
+}
+
+func (gate *anonymousFailureGate) observeMode(
+	operation string,
+	key string,
+	now time.Time,
+	forceSuppressed bool,
+) anonymousFailureObservation {
 	if gate == nil || key == "" || now.IsZero() {
-		return anonymousFailureObservation{rateLimited: true}
+		return anonymousFailureObservation{rateLimited: true, workUnits: 1}
 	}
+	operation = boundedAuthenticationFailureOperation(operation)
 	now = now.UTC()
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
-	state := gate.entries[key]
+
+	state := gate.operations[operation]
 	if state == nil {
-		if len(gate.entries) >= anonymousFailureMaxKeys {
-			gate.evictOldestLocked()
+		state = &anonymousFailureOperationState{
+			windowStart: now,
+			entries:     make(map[string]uint8),
 		}
-		state = &anonymousFailureState{windowStart: now}
-		gate.entries[key] = state
+		gate.operations[operation] = state
 	}
+	observation := anonymousFailureObservation{workUnits: 1}
 	if now.Before(state.windowStart) {
-		return anonymousFailureObservation{
-			rateLimited: true, retryAfter: state.windowStart.Sub(now),
-		}
+		observation.rateLimited = true
+		observation.retryAfter = state.windowStart.Sub(now)
+		return observation
 	}
-	observation := anonymousFailureObservation{}
 	if now.Sub(state.windowStart) >= anonymousFailureWindow {
 		observation.aggregateCount = state.suppressed
 		observation.aggregateStart = state.windowStart
-		state.windowStart = now
-		state.recorded = 0
-		state.suppressed = 0
+		replacement := &anonymousFailureOperationState{
+			windowStart: now,
+			entries:     make(map[string]uint8),
+		}
+		if observation.aggregateCount > 0 {
+			replacement.durableRows = 1
+		}
+		gate.operations[operation] = replacement
+		state = replacement
+		observation.workUnits++
 	}
-	state.lastSeen = now
-	if state.recorded < anonymousFailureAuditLimit {
-		state.recorded++
-		observation.recordIndividual = true
+	if forceSuppressed {
+		state.suppressed++
+		observation.rateLimited = true
+		observation.retryAfter = failureRetryAfter(state.windowStart, now)
 		return observation
 	}
-	state.suppressed++
-	observation.rateLimited = true
-	observation.retryAfter = anonymousFailureWindow - now.Sub(state.windowStart)
-	if observation.retryAfter <= 0 {
-		observation.retryAfter = time.Second
+
+	recorded, exists := state.entries[key]
+	if !exists {
+		if len(state.entries) >= anonymousFailureMaxKeys {
+			state.suppressed++
+			observation.rateLimited = true
+			observation.retryAfter = failureRetryAfter(state.windowStart, now)
+			return observation
+		}
+		state.entries[key] = 0
 	}
+	if int(recorded) >= anonymousFailurePerKeyLimit ||
+		state.durableRows >= anonymousFailureDurableLimit {
+		state.suppressed++
+		observation.rateLimited = true
+		observation.retryAfter = failureRetryAfter(state.windowStart, now)
+		return observation
+	}
+	state.entries[key] = recorded + 1
+	state.durableRows++
+	observation.recordIndividual = true
 	return observation
 }
 
-func (gate *anonymousFailureGate) evictOldestLocked() {
-	var oldestKey string
-	var oldest time.Time
-	for key, state := range gate.entries {
-		if oldestKey == "" || state.lastSeen.Before(oldest) ||
-			(state.lastSeen.Equal(oldest) && key < oldestKey) {
-			oldestKey = key
-			oldest = state.lastSeen
-		}
+func (gate *anonymousFailureGate) entryCount(operation string) int {
+	if gate == nil {
+		return 0
 	}
-	if oldestKey != "" {
-		delete(gate.entries, oldestKey)
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	state := gate.operations[boundedAuthenticationFailureOperation(operation)]
+	if state == nil {
+		return 0
 	}
+	return len(state.entries)
+}
+
+func boundedAuthenticationFailureOperation(operation string) string {
+	switch operation {
+	case "auth.jwt", "auth.agent", "auth.password", "auth.totp",
+		"auth.refresh", "auth.logout", "auth.totp.reverify":
+		return operation
+	default:
+		return anonymousFailureOtherOperation
+	}
+}
+
+func failureRetryAfter(windowStart, now time.Time) time.Duration {
+	retryAfter := anonymousFailureWindow - now.Sub(windowStart)
+	if retryAfter <= 0 {
+		return time.Second
+	}
+	return retryAfter
 }

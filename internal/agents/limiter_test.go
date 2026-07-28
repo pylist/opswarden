@@ -72,6 +72,101 @@ func TestLimiterReservationPreventsConcurrentBurstAndCanBeRefunded(t *testing.T)
 	}
 }
 
+func TestLimiterAtomicReservationConsumesAndRefundsEveryBucket(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{
+			OperationAuthFailure: 1,
+			OperationBootstrap:   1,
+		},
+		RefillPerSecond: map[Operation]float64{
+			OperationAuthFailure: 0.000001,
+			OperationBootstrap:   0.000001,
+		},
+	})
+	requests := []LimitRequest{
+		{Subject: "source", Operation: OperationBootstrap},
+		{Subject: "account", Operation: OperationAuthFailure},
+	}
+	reservation, decision := limiter.Reserve(requests, now)
+	if !decision.Allowed || reservation == nil {
+		t.Fatalf("initial reservation=%v decision=%+v", reservation, decision)
+	}
+	if _, second := limiter.Reserve(requests, now); second.Allowed {
+		t.Fatal("exhausted atomic reservation was allowed")
+	}
+	reservation.Refund(now)
+	if _, refunded := limiter.Reserve(requests, now); !refunded.Allowed {
+		t.Fatalf("refund did not restore both buckets: %+v", refunded)
+	}
+}
+
+func TestLimiterAtomicReservationDenialConsumesNoOtherBucket(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{
+			OperationAuthFailure: 1,
+			OperationBootstrap:   1,
+		},
+		RefillPerSecond: map[Operation]float64{
+			OperationAuthFailure: 0.000001,
+			OperationBootstrap:   0.000001,
+		},
+	})
+	if !limiter.Allow("blocked", OperationAuthFailure, now).Allowed {
+		t.Fatal("failed to exhaust strict bucket")
+	}
+	_, denied := limiter.Reserve([]LimitRequest{
+		{Subject: "fresh-source", Operation: OperationBootstrap},
+		{Subject: "blocked", Operation: OperationAuthFailure},
+	}, now)
+	if denied.Allowed {
+		t.Fatal("reservation ignored exhausted strict bucket")
+	}
+	if !limiter.Allow("fresh-source", OperationBootstrap, now).Allowed {
+		t.Fatal("denied reservation consumed the wider source bucket")
+	}
+}
+
+func TestLimiterAtomicReservationIsConcurrent(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{
+			OperationAuthFailure: 3,
+			OperationBootstrap:   5,
+		},
+		RefillPerSecond: map[Operation]float64{
+			OperationAuthFailure: 0.000001,
+			OperationBootstrap:   0.000001,
+		},
+	})
+	const attempts = 64
+	results := make(chan bool, attempts)
+	var workers sync.WaitGroup
+	for range attempts {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			_, decision := limiter.Reserve([]LimitRequest{
+				{Subject: "source", Operation: OperationBootstrap},
+				{Subject: "account", Operation: OperationAuthFailure},
+			}, now)
+			results <- decision.Allowed
+		}()
+	}
+	workers.Wait()
+	close(results)
+	allowed := 0
+	for result := range results {
+		if result {
+			allowed++
+		}
+	}
+	if allowed != 3 {
+		t.Fatalf("allowed=%d want strict capacity 3", allowed)
+	}
+}
+
 func TestLimiterIsBoundedRaceSafeAndTimeRollbackFailsSafe(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	limiter := NewLimiter(LimiterConfig{

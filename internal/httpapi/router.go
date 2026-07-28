@@ -23,6 +23,7 @@ import (
 )
 
 type IdentityService interface {
+	InitialOwnerSourceAllowed(netip.Addr) bool
 	HasInitialOwner(context.Context) (bool, error)
 	CreateInitialOwner(context.Context, identity.CreateOwnerInput) (identity.CreateOwnerResult, error)
 	BeginLogin(context.Context, string, string) (identity.LoginChallenge, error)
@@ -158,8 +159,10 @@ func (router *Router) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		router.recoveryMiddleware(
 			router.securityHeadersMiddleware(
 				router.loggingMiddleware(
-					router.rateLimitMiddleware(
-						router.authenticationMiddleware(http.HandlerFunc(router.dispatch)),
+					router.dependencyMiddleware(
+						router.rateLimitMiddleware(
+							router.authenticationMiddleware(http.HandlerFunc(router.dispatch)),
+						),
 					),
 				),
 			),
@@ -291,7 +294,7 @@ func (router *Router) recordAuthenticationOutcome(
 	errorCode string,
 ) error {
 	if router.deps.AuthAudit == nil {
-		return nil
+		return audit.ErrAuditUnavailable
 	}
 	metadata := requestMetadataFromContext(ctx)
 	event := audit.Event{
@@ -359,34 +362,16 @@ func (router *Router) rejectAnonymousAuthentication(
 	}
 	metadata := requestMetadataFromContext(request.Context())
 	observation := router.authFailureGate.observe(
-		metadata.sourceIP+"|"+action, router.deps.Clock.Now(),
+		action, metadata.sourceIP, router.deps.Clock.Now(),
 	)
-	if observation.aggregateCount > 0 {
-		event := audit.Event{
-			ID:        strings.Replace(newRequestID(), "req_", "aud_", 1),
-			RequestID: metadata.requestID, CreatedAt: router.deps.Clock.Now().UTC(),
-			Actor:  anonymousAuthenticationActor(),
-			Action: "auth.failure.aggregate", ResourceType: "authentication",
-			ResourceID: action, SourceIP: metadata.sourceIP,
-			UserAgent: metadata.userAgent, Success: false,
-			ErrorCode: "RATE_LIMITED",
-			Reason: "operation=" + action +
-				";suppressed_count=" + strconv.FormatUint(
-				observation.aggregateCount, 10,
-			) +
-				";window_start=" + observation.aggregateStart.UTC().Format(time.RFC3339),
-		}
-		if router.deps.AuthAudit != nil {
-			if err := router.deps.AuthAudit.RecordReadBeforeReturn(
-				request.Context(), event,
-			); err != nil {
-				writeAPIError(
-					writer, request, http.StatusServiceUnavailable,
-					"STORAGE_UNAVAILABLE", true, nil,
-				)
-				return
-			}
-		}
+	if err := router.recordAuthenticationFailureAggregate(
+		request, action, observation,
+	); err != nil {
+		writeAPIError(
+			writer, request, http.StatusServiceUnavailable,
+			"STORAGE_UNAVAILABLE", true, nil,
+		)
+		return
 	}
 	if observation.rateLimited {
 		writeRateLimitError(writer, request, agents.Decision{
@@ -408,5 +393,36 @@ func (router *Router) rejectAnonymousAuthentication(
 	writeAPIError(
 		writer, request, http.StatusUnauthorized,
 		"UNAUTHENTICATED", false, nil,
+	)
+}
+
+func (router *Router) recordAuthenticationFailureAggregate(
+	request *http.Request,
+	action string,
+	observation anonymousFailureObservation,
+) error {
+	if observation.aggregateCount == 0 {
+		return nil
+	}
+	if router.deps.AuthAudit == nil {
+		return audit.ErrAuditUnavailable
+	}
+	metadata := requestMetadataFromContext(request.Context())
+	return router.deps.AuthAudit.RecordReadBeforeReturn(
+		request.Context(), audit.Event{
+			ID:        strings.Replace(newRequestID(), "req_", "aud_", 1),
+			RequestID: metadata.requestID,
+			CreatedAt: router.deps.Clock.Now().UTC(),
+			Actor:     anonymousAuthenticationActor(),
+			Action:    "auth.failure.aggregate", ResourceType: "authentication",
+			ResourceID: action, SourceIP: "0.0.0.0",
+			Success: false, ErrorCode: "RATE_LIMITED",
+			Reason: "operation=" + action +
+				";suppressed_count=" + strconv.FormatUint(
+				observation.aggregateCount, 10,
+			) +
+				";window_start=" +
+				observation.aggregateStart.UTC().Format(time.RFC3339),
+		},
 	)
 }

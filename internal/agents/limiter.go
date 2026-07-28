@@ -9,16 +9,28 @@ import (
 type Operation string
 
 const (
-	OperationAuthFailure     Operation = "auth_failure"
-	OperationBootstrap       Operation = "bootstrap"
-	OperationCredentialList  Operation = "credential_list"
-	OperationCredentialRead  Operation = "credential_read"
-	OperationCredentialWrite Operation = "credential_write"
+	OperationAuthFailure       Operation = "auth_failure"
+	OperationBootstrap         Operation = "bootstrap"
+	OperationLoginSource       Operation = "login_source"
+	OperationReverifySource    Operation = "reverify_source"
+	OperationReverifyPrincipal Operation = "reverify_principal"
+	OperationRequestSource     Operation = "request_source"
+	OperationRequestRead       Operation = "request_read"
+	OperationRequestWrite      Operation = "request_write"
+	OperationCredentialList    Operation = "credential_list"
+	OperationCredentialRead    Operation = "credential_read"
+	OperationCredentialWrite   Operation = "credential_write"
 )
 
 var allOperations = []Operation{
 	OperationAuthFailure,
 	OperationBootstrap,
+	OperationLoginSource,
+	OperationReverifySource,
+	OperationReverifyPrincipal,
+	OperationRequestSource,
+	OperationRequestRead,
+	OperationRequestWrite,
 	OperationCredentialList,
 	OperationCredentialRead,
 	OperationCredentialWrite,
@@ -34,6 +46,41 @@ type LimiterConfig struct {
 type Decision struct {
 	Allowed    bool
 	RetryAfter time.Duration
+}
+
+type LimitRequest struct {
+	Subject   string
+	Operation Operation
+}
+
+type Reservation struct {
+	mu       sync.Mutex
+	limiter  *Limiter
+	requests []LimitRequest
+	resolved bool
+}
+
+func (reservation *Reservation) Commit() {
+	if reservation == nil {
+		return
+	}
+	reservation.mu.Lock()
+	reservation.resolved = true
+	reservation.mu.Unlock()
+}
+
+func (reservation *Reservation) Refund(now time.Time) {
+	if reservation == nil {
+		return
+	}
+	reservation.mu.Lock()
+	if reservation.resolved {
+		reservation.mu.Unlock()
+		return
+	}
+	reservation.resolved = true
+	reservation.mu.Unlock()
+	reservation.limiter.refundMany(reservation.requests, now)
 }
 
 type limiterBucket struct {
@@ -69,13 +116,25 @@ func NewLimiter(config LimiterConfig) *Limiter {
 	}
 	defaultCapacity := map[Operation]int{
 		OperationAuthFailure: 5, OperationCredentialList: 60,
-		OperationBootstrap:      2,
-		OperationCredentialRead: 30, OperationCredentialWrite: 20,
+		OperationBootstrap:         2,
+		OperationLoginSource:       20,
+		OperationReverifySource:    10,
+		OperationReverifyPrincipal: 5,
+		OperationRequestSource:     200,
+		OperationRequestRead:       120,
+		OperationRequestWrite:      60,
+		OperationCredentialRead:    30, OperationCredentialWrite: 20,
 	}
 	defaultRefill := map[Operation]float64{
 		OperationAuthFailure: 1.0 / 60, OperationCredentialList: 1,
-		OperationBootstrap:      1.0 / 60,
-		OperationCredentialRead: 0.5, OperationCredentialWrite: 1.0 / 3,
+		OperationBootstrap:         1.0 / 60,
+		OperationLoginSource:       1.0 / 6,
+		OperationReverifySource:    1.0 / 30,
+		OperationReverifyPrincipal: 1.0 / 60,
+		OperationRequestSource:     10,
+		OperationRequestRead:       2,
+		OperationRequestWrite:      1,
+		OperationCredentialRead:    0.5, OperationCredentialWrite: 1.0 / 3,
 	}
 	for _, operation := range allOperations {
 		capacity := config.Capacity[operation]
@@ -111,6 +170,97 @@ func (limiter *Limiter) Check(
 	return limiter.decide(subject, operation, now, false)
 }
 
+func (limiter *Limiter) Reserve(
+	requests []LimitRequest,
+	now time.Time,
+) (*Reservation, Decision) {
+	if limiter == nil || len(requests) == 0 || now.IsZero() {
+		return nil, Decision{}
+	}
+	now = now.UTC()
+	unique := make([]LimitRequest, 0, len(requests))
+	seen := make(map[LimitRequest]struct{}, len(requests))
+	for _, request := range requests {
+		if request.Subject == "" {
+			return nil, Decision{}
+		}
+		if _, known := limiter.capacity[request.Operation]; !known {
+			return nil, Decision{}
+		}
+		if _, duplicate := seen[request]; duplicate {
+			continue
+		}
+		seen[request] = struct{}{}
+		unique = append(unique, request)
+	}
+
+	type stagedBucket struct {
+		request LimitRequest
+		bucket  *limiterBucket
+		tokens  float64
+	}
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	for _, request := range unique {
+		if last := limiter.lastNow[request.Operation]; !last.IsZero() &&
+			now.Before(last) {
+			return nil, Decision{RetryAfter: last.Sub(now)}
+		}
+	}
+	staged := make([]stagedBucket, 0, len(unique))
+	var retryAfter time.Duration
+	for _, request := range unique {
+		capacity := limiter.capacity[request.Operation]
+		bucket := limiter.buckets[request.Operation][request.Subject]
+		tokens := capacity
+		if bucket != nil {
+			if now.Before(bucket.last) {
+				return nil, Decision{RetryAfter: bucket.last.Sub(now)}
+			}
+			tokens = math.Min(
+				capacity,
+				bucket.tokens+
+					now.Sub(bucket.last).Seconds()*limiter.refill[request.Operation],
+			)
+		}
+		if tokens < 1 {
+			missing := 1 - tokens
+			wait := time.Duration(math.Ceil(
+				missing / limiter.refill[request.Operation] * float64(time.Second),
+			))
+			if wait > retryAfter {
+				retryAfter = wait
+			}
+		}
+		staged = append(staged, stagedBucket{
+			request: request, bucket: bucket, tokens: tokens,
+		})
+	}
+	for _, request := range unique {
+		limiter.lastNow[request.Operation] = now
+	}
+	if retryAfter > 0 {
+		return nil, Decision{RetryAfter: retryAfter}
+	}
+	for index := range staged {
+		item := &staged[index]
+		if item.bucket == nil {
+			limiter.removeIdleLocked(item.request.Operation, now)
+			if len(limiter.buckets[item.request.Operation]) >= limiter.maxSubjects {
+				limiter.evictOldestLocked(item.request.Operation)
+			}
+			item.bucket = &limiterBucket{}
+			limiter.buckets[item.request.Operation][item.request.Subject] = item.bucket
+		}
+		item.bucket.tokens = item.tokens - 1
+		item.bucket.last = now
+		item.bucket.lastSeen = now
+	}
+	return &Reservation{
+		limiter: limiter, requests: unique,
+	}, Decision{Allowed: true}
+}
+
 // Refund returns one previously reserved token. It is used when a request was
 // admitted pessimistically but did not end in the failure being limited.
 func (limiter *Limiter) Refund(
@@ -118,29 +268,41 @@ func (limiter *Limiter) Refund(
 	operation Operation,
 	now time.Time,
 ) {
-	if limiter == nil || subject == "" || now.IsZero() {
-		return
-	}
-	capacity, known := limiter.capacity[operation]
-	if !known {
+	limiter.refundMany([]LimitRequest{{
+		Subject: subject, Operation: operation,
+	}}, now)
+}
+
+func (limiter *Limiter) refundMany(
+	requests []LimitRequest,
+	now time.Time,
+) {
+	if limiter == nil || len(requests) == 0 || now.IsZero() {
 		return
 	}
 	now = now.UTC()
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
-	bucket := limiter.buckets[operation][subject]
-	if bucket == nil {
-		return
+	for _, request := range requests {
+		capacity, known := limiter.capacity[request.Operation]
+		if !known || request.Subject == "" {
+			continue
+		}
+		bucket := limiter.buckets[request.Operation][request.Subject]
+		if bucket == nil {
+			continue
+		}
+		if !now.Before(bucket.last) {
+			elapsed := now.Sub(bucket.last).Seconds()
+			bucket.tokens = math.Min(
+				capacity,
+				bucket.tokens+elapsed*limiter.refill[request.Operation],
+			)
+			bucket.last = now
+			bucket.lastSeen = now
+		}
+		bucket.tokens = math.Min(capacity, bucket.tokens+1)
 	}
-	if !now.Before(bucket.last) {
-		elapsed := now.Sub(bucket.last).Seconds()
-		bucket.tokens = math.Min(
-			capacity, bucket.tokens+elapsed*limiter.refill[operation],
-		)
-		bucket.last = now
-		bucket.lastSeen = now
-	}
-	bucket.tokens = math.Min(capacity, bucket.tokens+1)
 }
 
 func (limiter *Limiter) decide(

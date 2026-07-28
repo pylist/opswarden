@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,7 +133,7 @@ func TestJWTRejectsAlgorithmClaimAndCanonicalizationConfusion(t *testing.T) {
 
 func TestNewClearsMasterKeyCopyAfterJWTDerivation(t *testing.T) {
 	key := [32]byte{1, 2, 3, 4, 5, 6, 7, 8}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Clock: &fixedClock{now: time.Now().UTC()}, MasterKey: key,
 	})
 	router := handler.(*Router)
@@ -154,20 +155,26 @@ func signRawJWTForTest(signer *jwtSigner, header, claims string) string {
 type fakeIdentityService struct {
 	session       identity.Session
 	principal     identity.SessionPrincipal
+	principals    map[string]identity.SessionPrincipal
 	ownerResult   identity.CreateOwnerResult
 	ownerInput    identity.CreateOwnerInput
 	hasOwner      bool
 	ownerCalls    int
+	ownerQueries  atomic.Int64
+	beginCalls    atomic.Int64
+	verifyCalls   atomic.Int64
 	beginError    error
 	completeError error
 	ownerError    error
 	verifyError   error
+	verifyErrors  map[string]error
 	logoutError   error
 	resolveError  error
-	resolveCalls  int
+	resolveCalls  atomic.Int64
 }
 
 type recordingAuthAudit struct {
+	mu         sync.Mutex
 	events     []audit.Event
 	failAction string
 }
@@ -176,6 +183,8 @@ func (recorder *recordingAuthAudit) RecordReadBeforeReturn(
 	_ context.Context,
 	event audit.Event,
 ) error {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
 	if event.Action == recorder.failAction {
 		return audit.ErrAuditUnavailable
 	}
@@ -183,11 +192,25 @@ func (recorder *recordingAuthAudit) RecordReadBeforeReturn(
 	return nil
 }
 
+func (recorder *recordingAuthAudit) eventCount() int {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	return len(recorder.events)
+}
+
+func newTestHandler(dependencies Dependencies) http.Handler {
+	if dependencies.AuthAudit == nil {
+		dependencies.AuthAudit = &recordingAuthAudit{}
+	}
+	return New(dependencies)
+}
+
 func (service *fakeIdentityService) BeginLogin(
 	context.Context,
 	string,
 	string,
 ) (identity.LoginChallenge, error) {
+	service.beginCalls.Add(1)
 	if service.beginError != nil {
 		return identity.LoginChallenge{}, service.beginError
 	}
@@ -211,7 +234,14 @@ func (service *fakeIdentityService) ResolveSession(
 	_ context.Context,
 	token string,
 ) (identity.SessionPrincipal, error) {
-	service.resolveCalls++
+	service.resolveCalls.Add(1)
+	if service.principals != nil {
+		principal, ok := service.principals[token]
+		if !ok {
+			return identity.SessionPrincipal{}, identity.ErrInvalidSession
+		}
+		return principal, service.resolveError
+	}
 	if token != service.session.RawToken {
 		return identity.SessionPrincipal{}, identity.ErrInvalidSession
 	}
@@ -245,19 +275,41 @@ func (service *fakeIdentityService) CreateInitialOwner(
 func (service *fakeIdentityService) HasInitialOwner(
 	context.Context,
 ) (bool, error) {
+	service.ownerQueries.Add(1)
 	return service.hasOwner, nil
+}
+
+func (service *fakeIdentityService) InitialOwnerSourceAllowed(
+	address netip.Addr,
+) bool {
+	return address.IsValid() && address.IsLoopback()
 }
 
 func (service *fakeIdentityService) VerifyRecentTOTPAudited(
 	_ context.Context,
-	rawToken, _ string,
+	rawToken, code string,
 	_ identity.AuthenticationContext,
 ) (identity.SessionPrincipal, error) {
+	service.verifyCalls.Add(1)
+	verifyError := service.verifyError
+	if service.verifyErrors != nil {
+		verifyError = service.verifyErrors[code]
+	}
+	if service.principals != nil {
+		principal, ok := service.principals[rawToken]
+		if !ok {
+			return identity.SessionPrincipal{}, identity.ErrInvalidSession
+		}
+		if verifyError != nil {
+			return identity.SessionPrincipal{}, verifyError
+		}
+		return principal, nil
+	}
 	if rawToken != service.session.RawToken {
 		return identity.SessionPrincipal{}, identity.ErrInvalidSession
 	}
-	if service.verifyError != nil {
-		return identity.SessionPrincipal{}, service.verifyError
+	if verifyError != nil {
+		return identity.SessionPrincipal{}, verifyError
 	}
 	if service.principal.RecentTOTPAt.IsZero() {
 		service.principal.RecentTOTPAt = service.principal.IssuedAt
@@ -271,7 +323,7 @@ func TestBootstrapCreatesInitialOwnerOnlyFromRequestSource(t *testing.T) {
 			UserID: "usr_owner", RecoveryCodes: []string{"recovery"},
 		},
 	}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: service, Clock: &fixedClock{now: time.Now().UTC()},
 		MasterKey: [32]byte{1},
 	})
@@ -300,7 +352,7 @@ func TestBootstrapCreatesInitialOwnerOnlyFromRequestSource(t *testing.T) {
 
 func TestBootstrapExistingOwnerSkipsExpensiveCreation(t *testing.T) {
 	service := &fakeIdentityService{hasOwner: true}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: service, Clock: &fixedClock{now: time.Now().UTC()},
 		MasterKey: [32]byte{1},
 	})
@@ -340,6 +392,78 @@ func TestBootstrapExistingOwnerSkipsExpensiveCreation(t *testing.T) {
 	}
 }
 
+func TestMissingAuthenticationAuditFailsClosedBeforeAPIDomainWork(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	service := &fakeIdentityService{
+		session: identity.Session{
+			RawToken: "session", ExpiresAt: now.Add(time.Hour),
+		},
+		principal: identity.SessionPrincipal{
+			UserID: "usr_test", SessionID: "ses_test", IssuedAt: now,
+		},
+	}
+	handler := New(Dependencies{
+		Identity: service, Spaces: fakeSpaceService{},
+		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
+	})
+	login := postLoginBegin(
+		handler,
+		`{"email":"owner@example.com","password":"password"}`,
+		"127.0.0.1:4242", "",
+	)
+	if login.Code != http.StatusServiceUnavailable {
+		t.Fatalf("nil-audit login status=%d body=%s", login.Code, login.Body.String())
+	}
+	bootstrap := postBootstrap(handler, "127.0.0.1:4242", 1)
+	if bootstrap.Code != http.StatusServiceUnavailable {
+		t.Fatalf(
+			"nil-audit bootstrap status=%d body=%s",
+			bootstrap.Code, bootstrap.Body.String(),
+		)
+	}
+	token, err := handler.(*Router).jwt.sign(
+		service.principal.UserID, service.session,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protected := serveAuthorized(
+		handler, token, http.MethodGet, "/api/v1/me", nil,
+	)
+	if protected.Code != http.StatusServiceUnavailable {
+		t.Fatalf(
+			"nil-audit protected status=%d body=%s",
+			protected.Code, protected.Body.String(),
+		)
+	}
+	if service.beginCalls.Load() != 0 || service.ownerCalls != 0 ||
+		service.ownerQueries.Load() != 0 || service.resolveCalls.Load() != 0 {
+		t.Fatalf(
+			"domain work escaped nil-audit guard: begin=%d owner=%d queries=%d resolve=%d",
+			service.beginCalls.Load(), service.ownerCalls,
+			service.ownerQueries.Load(), service.resolveCalls.Load(),
+		)
+	}
+}
+
+func TestExternalBootstrapSourceIsRejectedBeforeOwnerQuery(t *testing.T) {
+	service := &fakeIdentityService{hasOwner: true}
+	handler := newTestHandler(Dependencies{
+		Identity: service, AuthAudit: &recordingAuthAudit{},
+		Clock: &fixedClock{now: time.Now().UTC()}, MasterKey: [32]byte{1},
+	})
+	response := postBootstrap(handler, "198.51.100.80:4242", 1)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("external bootstrap status=%d body=%s", response.Code, response.Body.String())
+	}
+	if queries := service.ownerQueries.Load(); queries != 0 {
+		t.Fatalf("external source queried initialization state %d times", queries)
+	}
+	if service.ownerCalls != 0 {
+		t.Fatalf("external source reached owner creation %d times", service.ownerCalls)
+	}
+}
+
 func TestRecentTOTPVerificationReturnsRenewedJWT(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	service := &fakeIdentityService{
@@ -350,7 +474,7 @@ func TestRecentTOTPVerificationReturnsRenewedJWT(t *testing.T) {
 			UserID: "usr_test", SessionID: "ses_test", IssuedAt: now,
 		},
 	}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: service, Spaces: fakeSpaceService{},
 		AuthAudit: &recordingAuthAudit{},
 		Clock:     &fixedClock{now: now}, MasterKey: [32]byte{1},
@@ -387,12 +511,145 @@ func TestRecentTOTPVerificationReturnsRenewedJWT(t *testing.T) {
 		!strings.Contains(me.Body.String(), `"recentTotpAt"`) {
 		t.Fatalf("fresh /me status=%d body=%s", me.Code, me.Body.String())
 	}
-	if service.principal.RecentTOTPAt != now || service.resolveCalls < 2 {
+	if service.principal.RecentTOTPAt != now || service.resolveCalls.Load() < 2 {
 		t.Fatalf(
 			"server-side recent TOTP was not observed on renewal: principal=%+v calls=%d",
-			service.principal, service.resolveCalls,
+			service.principal, service.resolveCalls.Load(),
 		)
 	}
+}
+
+func TestReverifySessionQuotaSurvivesSourceRotation(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	service := &fakeIdentityService{
+		session: identity.Session{
+			RawToken: "stolen-session", ExpiresAt: now.Add(time.Hour),
+		},
+		principal: identity.SessionPrincipal{
+			UserID: "usr_target", SessionID: "ses_target", IssuedAt: now,
+		},
+		verifyError: identity.ErrInvalidTOTP,
+	}
+	recorder := &recordingAuthAudit{}
+	handler := newTestHandler(Dependencies{
+		Identity: service, Spaces: fakeSpaceService{}, AuthAudit: recorder,
+		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
+		Limiter: agents.NewLimiter(agents.LimiterConfig{
+			Capacity: map[agents.Operation]int{
+				agents.OperationReverifyPrincipal: 2,
+				agents.OperationReverifySource:    20,
+			},
+			RefillPerSecond: map[agents.Operation]float64{
+				agents.OperationReverifyPrincipal: 0.000001,
+				agents.OperationReverifySource:    0.000001,
+			},
+		}),
+	})
+	token, err := handler.(*Router).jwt.sign(
+		service.principal.UserID, service.session,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range 8 {
+		response := postReverify(
+			handler, token, "000000",
+			fmt.Sprintf("198.51.100.%d:4242", index+100),
+		)
+		if index < 2 && response.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d status=%d body=%s", index, response.Code, response.Body.String())
+		}
+		if index >= 2 && response.Code != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d escaped session quota: %d", index, response.Code)
+		}
+	}
+	if calls := service.verifyCalls.Load(); calls != 2 {
+		t.Fatalf("TOTP verification calls=%d want 2", calls)
+	}
+	if events := recorder.eventCount(); events != 4 {
+		t.Fatalf("rate-limited attempts wrote individual audits: %d", events)
+	}
+}
+
+func TestReverifySourceQuotaIsAtomicAndOtherSessionRemainsUsable(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	service := &fakeIdentityService{
+		principals: map[string]identity.SessionPrincipal{
+			"session-a": {UserID: "usr_a", SessionID: "ses_a", IssuedAt: now},
+			"session-b": {UserID: "usr_b", SessionID: "ses_b", IssuedAt: now},
+			"session-c": {UserID: "usr_c", SessionID: "ses_c", IssuedAt: now},
+		},
+		verifyErrors: map[string]error{"000000": identity.ErrInvalidTOTP},
+	}
+	handler := newTestHandler(Dependencies{
+		Identity: service, Spaces: fakeSpaceService{},
+		AuthAudit: &recordingAuthAudit{},
+		Clock:     &fixedClock{now: now}, MasterKey: [32]byte{1},
+		Limiter: agents.NewLimiter(agents.LimiterConfig{
+			Capacity: map[agents.Operation]int{
+				agents.OperationReverifyPrincipal: 2,
+				agents.OperationReverifySource:    2,
+			},
+			RefillPerSecond: map[agents.Operation]float64{
+				agents.OperationReverifyPrincipal: 0.000001,
+				agents.OperationReverifySource:    0.000001,
+			},
+		}),
+	})
+	tokens := make(map[string]string)
+	for raw, principal := range service.principals {
+		token, err := handler.(*Router).jwt.sign(principal.UserID, identity.Session{
+			RawToken: raw, ExpiresAt: now.Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens[raw] = token
+	}
+	for _, raw := range []string{"session-a", "session-b"} {
+		response := postReverify(
+			handler, tokens[raw], "000000", "198.51.100.200:4242",
+		)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("%s status=%d body=%s", raw, response.Code, response.Body.String())
+		}
+	}
+	blocked := postReverify(
+		handler, tokens["session-c"], "000000", "198.51.100.200:4242",
+	)
+	if blocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("rotating session escaped source quota: %d", blocked.Code)
+	}
+	success := postReverify(
+		handler, tokens["session-c"], "123456", "198.51.100.201:4242",
+	)
+	if success.Code != http.StatusOK {
+		t.Fatalf(
+			"unrelated source history blocked successful step-up: %d %s",
+			success.Code, success.Body.String(),
+		)
+	}
+	if calls := service.verifyCalls.Load(); calls != 3 {
+		t.Fatalf("TOTP verification calls=%d want 3", calls)
+	}
+}
+
+func postReverify(
+	handler http.Handler,
+	token string,
+	code string,
+	remoteAddr string,
+) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/v1/auth/reverify",
+		strings.NewReader(`{"code":"`+code+`"}`),
+	)
+	request.RemoteAddr = remoteAddr
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
 }
 
 func TestLoginReturnsJWTWithoutCookie(t *testing.T) {
@@ -406,7 +663,7 @@ func TestLoginReturnsJWTWithoutCookie(t *testing.T) {
 			UserID: "usr_test", SessionID: "ses_test", IssuedAt: now,
 		},
 	}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: identityService,
 		Clock:    &fixedClock{now: now},
 		MasterKey: [32]byte{
@@ -456,7 +713,7 @@ func TestLoginAuthenticationAuditUsesOnlyPrehashedFingerprint(t *testing.T) {
 		},
 	}
 	recorder := &recordingAuthAudit{}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: identityService, AuthAudit: recorder,
 		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
 	})
@@ -490,7 +747,7 @@ func TestFailedAuthenticationAuditNeverContainsSubmittedCredentials(t *testing.T
 	emailFixture := "sensitive-user@example.test"
 	passwordFixture := "fixture-password-must-not-appear"
 	recorder := &recordingAuthAudit{}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: &fakeIdentityService{
 			beginError: identity.ErrInvalidCredentials,
 		},
@@ -525,7 +782,7 @@ func TestFailedAuthenticationAuditNeverContainsSubmittedCredentials(t *testing.T
 
 func TestProtectedAuthRouteFailureHasOneRouteSpecificAudit(t *testing.T) {
 	recorder := &recordingAuthAudit{}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: &fakeIdentityService{}, AuthAudit: recorder,
 		Clock: &fixedClock{now: time.Now().UTC()}, MasterKey: [32]byte{1},
 	})
@@ -546,7 +803,7 @@ func TestProtectedAuthRouteFailureHasOneRouteSpecificAudit(t *testing.T) {
 
 func TestRequiredAuthenticationFailureAuditFailsClosed(t *testing.T) {
 	recorder := &recordingAuthAudit{failAction: "auth.jwt"}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: &fakeIdentityService{}, AuthAudit: recorder,
 		Clock: &fixedClock{now: time.Now().UTC()}, MasterKey: [32]byte{1},
 	})
@@ -595,7 +852,7 @@ func TestAnonymousAuthenticationFloodHasBoundedDurableAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock := &fixedClock{now: now}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: identityService, Spaces: fakeSpaceService{},
 		AuthAudit: auditService, Clock: clock,
 		MasterKey: [32]byte{1},
@@ -732,7 +989,7 @@ func TestKnownAuthenticationFailureAuditUnavailableReturns503(t *testing.T) {
 }
 
 func TestStateChangeRequiresAuthorizationHeaderEvenWithCookie(t *testing.T) {
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity:  &fakeIdentityService{},
 		Clock:     &fixedClock{now: time.Now().UTC()},
 		MasterKey: [32]byte{1},
@@ -953,6 +1210,19 @@ func (fakeAgentService) ListUsage(
 	return nil, nil
 }
 
+type countingAgentService struct {
+	fakeAgentService
+	authenticateCalls atomic.Int64
+}
+
+func (service *countingAgentService) Authenticate(
+	ctx context.Context,
+	raw string,
+) (agents.AuthenticatedPrincipal, error) {
+	service.authenticateCalls.Add(1)
+	return service.fakeAgentService.Authenticate(ctx, raw)
+}
+
 func TestCredentialListOmitsPayload(t *testing.T) {
 	fixture := "fixture-password-must-not-appear"
 	handler, token, _ := authenticatedTestHandler(
@@ -1047,7 +1317,7 @@ func TestCredentialPathSpaceMismatchIsConcealed(t *testing.T) {
 
 func TestAgentCredentialWriteRequiresIdempotencyHeader(t *testing.T) {
 	credentialService := &fakeCredentialService{actualSpaceID: "spc_test"}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: &fakeIdentityService{}, Spaces: fakeSpaceService{},
 		Credentials: credentialService, Agents: fakeAgentService{},
 		Clock:     &fixedClock{now: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)},
@@ -1091,7 +1361,7 @@ func TestCredentialLimiterSeparatesAgentAndHumanSubjects(t *testing.T) {
 			UserID: "usr_test", SessionID: "ses_test", IssuedAt: now,
 		},
 	}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: identityService, Spaces: fakeSpaceService{},
 		Credentials: credentialService, Agents: fakeAgentService{},
 		Limiter: limiter, Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
@@ -1138,7 +1408,7 @@ func TestSuccessfulAgentAuthenticationDoesNotSpendFailureBudget(t *testing.T) {
 			agents.OperationCredentialList: 1,
 		},
 	})
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: &fakeIdentityService{}, Spaces: fakeSpaceService{},
 		Credentials: &fakeCredentialService{}, Agents: fakeAgentService{},
 		Limiter: limiter, Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
@@ -1155,6 +1425,147 @@ func TestSuccessfulAgentAuthenticationDoesNotSpendFailureBudget(t *testing.T) {
 				index+1, response.Code, response.Body.String(),
 			)
 		}
+	}
+}
+
+func TestProtectedRequestQuotaRunsBeforeHumanSessionAndAuditWrites(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	service := &fakeIdentityService{
+		session: identity.Session{
+			RawToken: "session-a", ExpiresAt: now.Add(time.Hour),
+		},
+		principal: identity.SessionPrincipal{
+			UserID: "usr_a", SessionID: "ses_a", IssuedAt: now,
+		},
+	}
+	recorder := &recordingAuthAudit{}
+	handler := newTestHandler(Dependencies{
+		Identity: service, Spaces: fakeSpaceService{}, AuthAudit: recorder,
+		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
+		Limiter: agents.NewLimiter(agents.LimiterConfig{
+			Capacity: map[agents.Operation]int{
+				agents.OperationRequestSource: 10,
+				agents.OperationRequestRead:   2,
+			},
+			RefillPerSecond: map[agents.Operation]float64{
+				agents.OperationRequestSource: 0.000001,
+				agents.OperationRequestRead:   0.000001,
+			},
+		}),
+	})
+	token, err := handler.(*Router).jwt.sign(
+		service.principal.UserID, service.session,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range 7 {
+		response := serveAuthorized(
+			handler, token, http.MethodGet, "/api/v1/me", nil,
+		)
+		if index < 2 && response.Code != http.StatusOK {
+			t.Fatalf("request %d status=%d body=%s", index, response.Code, response.Body.String())
+		}
+		if index >= 2 && response.Code != http.StatusTooManyRequests {
+			t.Fatalf("request %d escaped pre-auth quota: %d", index, response.Code)
+		}
+	}
+	if service.resolveCalls.Load() != 2 {
+		t.Fatalf("session persistence calls=%d want 2", service.resolveCalls.Load())
+	}
+	if events := recorder.eventCount(); events != 2 {
+		t.Fatalf("success audit writes=%d want 2", events)
+	}
+}
+
+func TestProtectedSourceQuotaBoundsRotatingHumanTokens(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	service := &fakeIdentityService{principals: make(map[string]identity.SessionPrincipal)}
+	recorder := &recordingAuthAudit{}
+	handler := newTestHandler(Dependencies{
+		Identity: service, Spaces: fakeSpaceService{}, AuthAudit: recorder,
+		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
+		Limiter: agents.NewLimiter(agents.LimiterConfig{
+			Capacity: map[agents.Operation]int{
+				agents.OperationRequestSource: 3,
+				agents.OperationRequestRead:   10,
+			},
+			RefillPerSecond: map[agents.Operation]float64{
+				agents.OperationRequestSource: 0.000001,
+				agents.OperationRequestRead:   0.000001,
+			},
+		}),
+	})
+	for index := range 7 {
+		raw := fmt.Sprintf("rotating-session-%d", index)
+		principal := identity.SessionPrincipal{
+			UserID:    fmt.Sprintf("usr_%d", index),
+			SessionID: fmt.Sprintf("ses_%d", index), IssuedAt: now,
+		}
+		service.principals[raw] = principal
+		token, err := handler.(*Router).jwt.sign(principal.UserID, identity.Session{
+			RawToken: raw, ExpiresAt: now.Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+		request.RemoteAddr = "198.51.100.220:4242"
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if index < 3 && response.Code != http.StatusOK {
+			t.Fatalf("request %d status=%d", index, response.Code)
+		}
+		if index >= 3 && response.Code != http.StatusTooManyRequests {
+			t.Fatalf("rotating token %d escaped source quota: %d", index, response.Code)
+		}
+	}
+	if service.resolveCalls.Load() != 3 || recorder.eventCount() != 3 {
+		t.Fatalf(
+			"persistent writes resolve=%d audit=%d",
+			service.resolveCalls.Load(), recorder.eventCount(),
+		)
+	}
+}
+
+func TestProtectedAssetQuotaRunsBeforeAgentLastUsedAndIsNamespaced(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	agentService := &countingAgentService{}
+	recorder := &recordingAuthAudit{}
+	handler := newTestHandler(Dependencies{
+		Identity: &fakeIdentityService{}, Spaces: fakeSpaceService{},
+		Assets: &fakeAssetService{}, Agents: agentService, AuthAudit: recorder,
+		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
+		Limiter: agents.NewLimiter(agents.LimiterConfig{
+			Capacity: map[agents.Operation]int{
+				agents.OperationRequestSource: 10,
+				agents.OperationRequestRead:   1,
+			},
+			RefillPerSecond: map[agents.Operation]float64{
+				agents.OperationRequestSource: 0.000001,
+				agents.OperationRequestRead:   0.000001,
+			},
+		}),
+	})
+	agentToken := "owat_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+	for index := range 4 {
+		response := serveAuthorized(
+			handler, agentToken, http.MethodGet,
+			"/api/v1/spaces/spc_test/assets", nil,
+		)
+		if index == 0 && response.Code != http.StatusOK {
+			t.Fatalf("first agent request=%d body=%s", response.Code, response.Body.String())
+		}
+		if index > 0 && response.Code != http.StatusTooManyRequests {
+			t.Fatalf("agent request %d escaped quota: %d", index, response.Code)
+		}
+	}
+	if calls := agentService.authenticateCalls.Load(); calls != 1 {
+		t.Fatalf("Agent last-used writes=%d want 1", calls)
+	}
+	if recorder.eventCount() != 1 {
+		t.Fatalf("Agent success audit writes=%d want 1", recorder.eventCount())
 	}
 }
 
@@ -1310,6 +1721,117 @@ func TestLoginFailureQuotaSeparatesAccountsBehindOneNAT(t *testing.T) {
 			"NAT account statuses=(%d,%d) bodies=(%s,%s)",
 			first.Code, second.Code, first.Body.String(), second.Body.String(),
 		)
+	}
+}
+
+func TestLoginSourceQuotaBoundsRotatingAccounts(t *testing.T) {
+	service := &fakeIdentityService{beginError: identity.ErrInvalidCredentials}
+	handler := newTestHandler(Dependencies{
+		Identity: service, AuthAudit: &recordingAuthAudit{},
+		Clock:     &fixedClock{now: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)},
+		MasterKey: [32]byte{1},
+		Limiter: agents.NewLimiter(agents.LimiterConfig{
+			Capacity: map[agents.Operation]int{
+				agents.OperationLoginSource: 3,
+				agents.OperationAuthFailure: 10,
+			},
+			RefillPerSecond: map[agents.Operation]float64{
+				agents.OperationLoginSource: 0.000001,
+				agents.OperationAuthFailure: 0.000001,
+			},
+		}),
+	})
+	for index := range 8 {
+		response := postLoginBegin(
+			handler,
+			fmt.Sprintf(
+				`{"email":"rotating-%d@example.com","password":"bad"}`,
+				index,
+			),
+			"198.51.100.40:4242", "",
+		)
+		if index < 3 && response.Code != http.StatusUnauthorized {
+			t.Fatalf("request %d status=%d", index, response.Code)
+		}
+		if index >= 3 && response.Code != http.StatusTooManyRequests {
+			t.Fatalf("request %d escaped source quota: %d", index, response.Code)
+		}
+	}
+	if calls := service.beginCalls.Load(); calls != 3 {
+		t.Fatalf("password work calls=%d want source capacity 3", calls)
+	}
+}
+
+func TestLoginAccountQuotaSurvivesSourceRotation(t *testing.T) {
+	service := &fakeIdentityService{beginError: identity.ErrInvalidCredentials}
+	handler := newTestHandler(Dependencies{
+		Identity: service, AuthAudit: &recordingAuthAudit{},
+		Clock:     &fixedClock{now: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)},
+		MasterKey: [32]byte{1},
+		Limiter: agents.NewLimiter(agents.LimiterConfig{
+			Capacity: map[agents.Operation]int{
+				agents.OperationLoginSource: 10,
+				agents.OperationAuthFailure: 2,
+			},
+			RefillPerSecond: map[agents.Operation]float64{
+				agents.OperationLoginSource: 0.000001,
+				agents.OperationAuthFailure: 0.000001,
+			},
+		}),
+	})
+	for index := range 5 {
+		response := postLoginBegin(
+			handler,
+			`{"email":"target@example.com","password":"bad"}`,
+			fmt.Sprintf("198.51.100.%d:4242", index+50), "",
+		)
+		if index < 2 && response.Code != http.StatusUnauthorized {
+			t.Fatalf("request %d status=%d", index, response.Code)
+		}
+		if index >= 2 && response.Code != http.StatusTooManyRequests {
+			t.Fatalf("request %d escaped account quota: %d", index, response.Code)
+		}
+	}
+	if calls := service.beginCalls.Load(); calls != 2 {
+		t.Fatalf("password work calls=%d want account capacity 2", calls)
+	}
+}
+
+func TestLoginDualQuotaReservationIsAtomicUnderConcurrency(t *testing.T) {
+	service := &fakeIdentityService{beginError: identity.ErrInvalidCredentials}
+	handler := newTestHandler(Dependencies{
+		Identity: service, AuthAudit: &recordingAuthAudit{},
+		Clock:     &fixedClock{now: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)},
+		MasterKey: [32]byte{1},
+		Limiter: agents.NewLimiter(agents.LimiterConfig{
+			Capacity: map[agents.Operation]int{
+				agents.OperationLoginSource: 3,
+				agents.OperationAuthFailure: 20,
+			},
+			RefillPerSecond: map[agents.Operation]float64{
+				agents.OperationLoginSource: 0.000001,
+				agents.OperationAuthFailure: 0.000001,
+			},
+		}),
+	})
+	var workers sync.WaitGroup
+	for index := range 32 {
+		workers.Add(1)
+		go func(index int) {
+			defer workers.Done()
+			postLoginBegin(
+				handler,
+				fmt.Sprintf(
+					`{"email":"concurrent-%d@example.com","password":"bad"}`,
+					index,
+				),
+				"198.51.100.90:4242", "",
+			)
+		}(index)
+	}
+	workers.Wait()
+	if calls := service.beginCalls.Load(); calls > 3 {
+		t.Fatalf("concurrent password work calls=%d want <=3", calls)
 	}
 }
 
@@ -1470,9 +1992,12 @@ func TestTrustedProxySeparatesForwardedClientsButUntrustedSpoofDoesNot(t *testin
 	handler := loginLimitTestHandler(
 		t, &fakeIdentityService{beginError: identity.ErrInvalidCredentials}, trusted,
 	)
-	for _, forwarded := range []string{"198.51.100.10", "198.51.100.11"} {
+	for index, forwarded := range []string{"198.51.100.10", "198.51.100.11"} {
 		response := postLoginBegin(
-			handler, `{"email":"u@example.com","password":"bad"}`,
+			handler,
+			fmt.Sprintf(
+				`{"email":"u%d@example.com","password":"bad"}`, index,
+			),
 			"10.0.0.5:443", forwarded,
 		)
 		if response.Code != http.StatusUnauthorized {
@@ -1503,7 +2028,7 @@ func loginLimitTestHandler(
 ) http.Handler {
 	t.Helper()
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	return New(Dependencies{
+	return newTestHandler(Dependencies{
 		Identity: identityService, Clock: &fixedClock{now: now},
 		MasterKey: [32]byte{1}, TrustedProxyCIDRs: trusted,
 		Limiter: agents.NewLimiter(agents.LimiterConfig{
@@ -1590,7 +2115,7 @@ func TestMalformedQueryEncodingIsRejected(t *testing.T) {
 }
 
 func TestJSONFieldsAreCaseSensitiveAndCanonical(t *testing.T) {
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity:  &fakeIdentityService{},
 		Clock:     &fixedClock{now: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)},
 		MasterKey: [32]byte{1},
@@ -1605,7 +2130,7 @@ func TestJSONFieldsAreCaseSensitiveAndCanonical(t *testing.T) {
 }
 
 func TestNoQueryRoutesRejectEveryQuery(t *testing.T) {
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity:  &fakeIdentityService{},
 		Clock:     &fixedClock{now: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)},
 		MasterKey: [32]byte{1},
@@ -1633,7 +2158,7 @@ func TestRevokedServerSessionInvalidatesUnexpiredJWT(t *testing.T) {
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
-	if identityService.resolveCalls == 0 {
+	if identityService.resolveCalls.Load() == 0 {
 		t.Fatal("server-side session was not resolved")
 	}
 }
@@ -1729,7 +2254,7 @@ func authenticatedTestHandler(
 		},
 	}
 	key := [32]byte{1, 2, 3, 4, 5, 6, 7, 8}
-	handler := New(Dependencies{
+	handler := newTestHandler(Dependencies{
 		Identity: identityService, Spaces: fakeSpaceService{},
 		Credentials: credentialService, Clock: &fixedClock{now: now},
 		Logger: logger, MasterKey: key,

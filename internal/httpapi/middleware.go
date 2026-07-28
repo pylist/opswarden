@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
 	"net"
@@ -103,8 +104,110 @@ func (router *Router) loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func (router *Router) dependencyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if strings.HasPrefix(request.URL.Path, "/api/v1/") &&
+			router.deps.AuthAudit == nil {
+			writeAPIError(
+				writer, request, http.StatusServiceUnavailable,
+				"STORAGE_UNAVAILABLE", true, nil,
+			)
+			return
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
 func (router *Router) rateLimitMiddleware(next http.Handler) http.Handler {
-	return next
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		raw, hasBearer := bearerToken(request.Header.Values("Authorization"))
+		if !isPublicRoute(request) &&
+			strings.HasPrefix(request.URL.Path, "/api/v1/") &&
+			hasBearer {
+			tokenKind := "human"
+			if strings.HasPrefix(raw, "owat_") {
+				tokenKind = "agent"
+			}
+			operation := preAuthenticationOperation(request)
+			metadata := requestMetadataFromContext(request.Context())
+			reservation, decision := router.deps.Limiter.Reserve(
+				[]agents.LimitRequest{
+					{
+						Subject: "preauth-source:" + tokenKind + ":" +
+							string(operation) + ":" + metadata.sourceIP,
+						Operation: agents.OperationRequestSource,
+					},
+					{
+						Subject: "preauth-token:" + tokenKind + ":" +
+							inMemoryBearerFingerprint(raw),
+						Operation: operation,
+					},
+				},
+				router.deps.Clock.Now(),
+			)
+			if !decision.Allowed {
+				writeRateLimitError(writer, request, decision)
+				return
+			}
+			reservation.Commit()
+		}
+		if request.Method != http.MethodPost ||
+			request.URL.Path != "/api/v1/auth/reverify" {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		if !hasBearer || strings.HasPrefix(raw, "owat_") || router.jwt == nil {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		claims, err := router.jwt.verify(raw)
+		if err != nil {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		metadata := requestMetadataFromContext(request.Context())
+		fingerprint := inMemoryBearerFingerprint(
+			claims.Session + "\x00" + claims.Subject,
+		)
+		reservation, decision := router.deps.Limiter.Reserve(
+			[]agents.LimitRequest{
+				{
+					Subject:   "reverify-source:" + metadata.sourceIP,
+					Operation: agents.OperationReverifySource,
+				},
+				{
+					Subject:   "reverify-principal:" + fingerprint,
+					Operation: agents.OperationReverifyPrincipal,
+				},
+			},
+			router.deps.Clock.Now(),
+		)
+		if !decision.Allowed {
+			observation := router.authFailureGate.suppress(
+				"auth.totp.reverify", fingerprint, router.deps.Clock.Now(),
+			)
+			if err := router.recordAuthenticationFailureAggregate(
+				request, "auth.totp.reverify", observation,
+			); err != nil {
+				writeAPIError(
+					writer, request, http.StatusServiceUnavailable,
+					"STORAGE_UNAVAILABLE", true, nil,
+				)
+				return
+			}
+			writeRateLimitError(writer, request, decision)
+			return
+		}
+		failureReservation := &reverifyFailureReservation{
+			router: router, reservation: reservation, fingerprint: fingerprint,
+		}
+		defer failureReservation.Close()
+		ctx := context.WithValue(
+			request.Context(), reverifyReservationContextKey{},
+			failureReservation,
+		)
+		next.ServeHTTP(writer, request.WithContext(ctx))
+	})
 }
 
 func (router *Router) authenticationMiddleware(next http.Handler) http.Handler {
@@ -191,28 +294,30 @@ func (router *Router) authenticationMiddleware(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if operation, limited := credentialOperation(request); limited {
-			metadata := requestMetadataFromContext(request.Context())
-			subject := ""
-			if authenticated.human != nil {
-				subject = "human:" + authenticated.human.UserID
-			} else {
-				subject = "agent:" + authenticated.agent.AgentID
-			}
-			subject += "@ip:" + metadata.sourceIP
-			decision := router.deps.Limiter.Allow(
-				subject, operation, router.deps.Clock.Now(),
-			)
-			if !decision.Allowed {
-				writeRateLimitError(writer, request, decision)
-				return
-			}
-		}
 		ctx := context.WithValue(
 			request.Context(), authenticationKey, authenticated,
 		)
 		next.ServeHTTP(writer, request.WithContext(ctx))
 	})
+}
+
+func inMemoryBearerFingerprint(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	fingerprint := hex.EncodeToString(sum[:])
+	clear(sum[:])
+	return fingerprint
+}
+
+func preAuthenticationOperation(request *http.Request) agents.Operation {
+	if operation, limited := credentialOperation(request); limited {
+		return operation
+	}
+	switch request.Method {
+	case http.MethodGet, http.MethodHead:
+		return agents.OperationRequestRead
+	default:
+		return agents.OperationRequestWrite
+	}
 }
 
 func credentialOperation(request *http.Request) (agents.Operation, bool) {

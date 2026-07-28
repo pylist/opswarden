@@ -209,25 +209,42 @@ type reverifyRequest struct {
 }
 
 type loginFailureReservation struct {
-	router    *Router
-	subject   string
-	committed bool
+	router      *Router
+	reservation *agents.Reservation
+}
+
+type reverifyReservationContextKey struct{}
+
+type reverifyFailureReservation struct {
+	router      *Router
+	reservation *agents.Reservation
+	fingerprint string
+}
+
+func (reservation *reverifyFailureReservation) Commit() {
+	if reservation != nil && reservation.reservation != nil {
+		reservation.reservation.Commit()
+	}
+}
+
+func (reservation *reverifyFailureReservation) Close() {
+	if reservation == nil || reservation.reservation == nil {
+		return
+	}
+	reservation.reservation.Refund(reservation.router.deps.Clock.Now())
 }
 
 func (reservation *loginFailureReservation) Commit() {
-	if reservation != nil {
-		reservation.committed = true
+	if reservation != nil && reservation.reservation != nil {
+		reservation.reservation.Commit()
 	}
 }
 
 func (reservation *loginFailureReservation) Close() {
-	if reservation == nil || reservation.committed {
+	if reservation == nil || reservation.reservation == nil {
 		return
 	}
-	reservation.router.deps.Limiter.Refund(
-		reservation.subject, agents.OperationAuthFailure,
-		reservation.router.deps.Clock.Now(),
-	)
+	reservation.reservation.Refund(reservation.router.deps.Clock.Now())
 }
 
 func (router *Router) reserveLoginFailure(
@@ -236,18 +253,27 @@ func (router *Router) reserveLoginFailure(
 	stage string,
 	stableIdentity string,
 ) (*loginFailureReservation, bool) {
-	subject := "human-" + stage + "-ip:" +
-		requestMetadataFromContext(request.Context()).sourceIP +
-		"-principal:" + humanFingerprint(stage+":"+stableIdentity)
-	decision := router.deps.Limiter.Allow(
-		subject, agents.OperationAuthFailure, router.deps.Clock.Now(),
+	metadata := requestMetadataFromContext(request.Context())
+	reservation, decision := router.deps.Limiter.Reserve(
+		[]agents.LimitRequest{
+			{
+				Subject:   "human-" + stage + "-source:" + metadata.sourceIP,
+				Operation: agents.OperationLoginSource,
+			},
+			{
+				Subject: "human-" + stage + "-principal:" +
+					humanFingerprint(stage+":"+stableIdentity),
+				Operation: agents.OperationAuthFailure,
+			},
+		},
+		router.deps.Clock.Now(),
 	)
 	if !decision.Allowed {
 		writeRateLimitError(writer, request, decision)
 		return nil, false
 	}
 	return &loginFailureReservation{
-		router: router, subject: subject,
+		router: router, reservation: reservation,
 	}, true
 }
 
@@ -274,6 +300,12 @@ func (router *Router) handleBootstrap(
 		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
 		return
 	}
+	metadata := requestMetadataFromContext(request.Context())
+	sourceIP, err := netip.ParseAddr(metadata.sourceIP)
+	if err != nil || !router.deps.Identity.InitialOwnerSourceAllowed(sourceIP) {
+		writeAPIError(writer, request, http.StatusForbidden, "PERMISSION_DENIED", false, nil)
+		return
+	}
 	var input bootstrapRequest
 	if err := decodeJSONBody(
 		writer, request, defaultBodyLimit, &input,
@@ -289,12 +321,6 @@ func (router *Router) handleBootstrap(
 			writer, request, http.StatusBadRequest,
 			"INVALID_REQUEST", false, nil,
 		)
-		return
-	}
-	metadata := requestMetadataFromContext(request.Context())
-	sourceIP, err := netip.ParseAddr(metadata.sourceIP)
-	if err != nil {
-		writeAPIError(writer, request, http.StatusForbidden, "PERMISSION_DENIED", false, nil)
 		return
 	}
 	exists, err := router.deps.Identity.HasInitialOwner(request.Context())
@@ -358,6 +384,9 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			)
 			return
 		}
+		failureReservation, _ := request.Context().Value(
+			reverifyReservationContextKey{},
+		).(*reverifyFailureReservation)
 		var input reverifyRequest
 		if err := decodeJSONBody(
 			writer, request, defaultBodyLimit, &input,
@@ -377,6 +406,30 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			},
 		)
 		if err != nil {
+			authenticationFailure := errors.Is(err, identity.ErrInvalidTOTP) ||
+				errors.Is(err, identity.ErrTOTPReplay)
+			if authenticationFailure && failureReservation != nil {
+				failureReservation.Commit()
+				observation := router.authFailureGate.observe(
+					"auth.totp.reverify", failureReservation.fingerprint,
+					router.deps.Clock.Now(),
+				)
+				if aggregateErr := router.recordAuthenticationFailureAggregate(
+					request, "auth.totp.reverify", observation,
+				); aggregateErr != nil {
+					writeAPIError(
+						writer, request, http.StatusServiceUnavailable,
+						"STORAGE_UNAVAILABLE", true, nil,
+					)
+					return
+				}
+				if observation.rateLimited {
+					writeRateLimitError(writer, request, agents.Decision{
+						RetryAfter: observation.retryAfter,
+					})
+					return
+				}
+			}
 			if auditErr := router.recordKnownAuthenticationFailure(
 				request, auth.actor, "auth.totp.reverify",
 				auth.human.UserID, "REVERIFY_FAILED",

@@ -222,6 +222,10 @@ func (s *Service) HasInitialOwner(ctx context.Context) (bool, error) {
 	return s.repository.hasUsers(ctx)
 }
 
+func (s *Service) InitialOwnerSourceAllowed(address netip.Addr) bool {
+	return s.initialOwnerSourceAllowed(address)
+}
+
 func (s *Service) BeginLogin(
 	ctx context.Context,
 	email, password string,
