@@ -15,6 +15,7 @@ import (
 
 	"opswarden/internal/agents"
 	"opswarden/internal/assets"
+	"opswarden/internal/audit"
 	"opswarden/internal/authorization"
 	"opswarden/internal/credentials"
 )
@@ -97,6 +98,22 @@ type fakeAssetService struct {
 	items []assets.Asset
 	item  assets.Asset
 	err   error
+}
+
+type generationAuditRecorder struct {
+	events     []audit.Event
+	failAction string
+}
+
+func (recorder *generationAuditRecorder) RecordReadBeforeReturn(
+	_ context.Context,
+	event audit.Event,
+) error {
+	if event.Action == recorder.failAction {
+		return audit.ErrAuditUnavailable
+	}
+	recorder.events = append(recorder.events, event)
+	return nil
 }
 
 func (service *fakeAssetService) List(
@@ -433,7 +450,152 @@ func TestGenerateTOTPMatchesRFC6238SHA1Vector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code != "94287082" || !expiry.Equal(time.Unix(60, 0).UTC()) {
-		t.Fatalf("code=%s expiry=%s", code, expiry)
+	defer clear(code)
+	if string(code) != "94287082" || !expiry.Equal(time.Unix(60, 0).UTC()) {
+		t.Fatalf("code=%s expiry=%s", string(code), expiry)
+	}
+}
+
+func TestInvalidTOTPDoesNotWriteGenerationSuccessAudit(t *testing.T) {
+	recorder := &generationAuditRecorder{}
+	service := &fakeCredentialService{get: credentials.Decrypted{
+		Metadata: credentials.Metadata{
+			ID: "crd_totp", SpaceID: "spc_test",
+			DisplayName: "TOTP", Type: credentials.TypeTOTP, Version: 1,
+		},
+		Payload: json.RawMessage(
+			`{"issuer":"Example","account":"alice","seed":"not-base32!","algorithm":"SHA1","digits":6,"period":30}`,
+		),
+	}}
+	result, err := handleTOTPGenerate(
+		context.Background(),
+		Dependencies{
+			Credentials: service, AuthAudit: recorder,
+			Clock: fixedClock{now: time.Unix(59, 0).UTC()},
+		},
+		requestContext{
+			principal: agents.AuthenticatedPrincipal{
+				AgentID: "agt_test", TokenID: "tok_test",
+				TokenPrefix: "owat_fixture",
+			},
+			actor: audit.Actor{
+				Type: audit.ActorAgent, ID: "agt_test", Fingerprint: "fixture",
+			},
+			requestID: "req_test", sourceIP: "192.0.2.1",
+		},
+		json.RawMessage(`{"space_id":"spc_test","credential_id":"crd_totp"}`),
+	)
+	if err == nil || result != nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	for _, event := range recorder.events {
+		if event.Action == "credential.totp.generate" && event.Success {
+			t.Fatalf("invalid TOTP wrote success audit: %+v", event)
+		}
+		if strings.Contains(event.Reason, "not-base32") {
+			t.Fatalf("seed reached audit: %+v", event)
+		}
+	}
+}
+
+func TestNegativeTOTPClockFailsWithoutSuccessAudit(t *testing.T) {
+	recorder := &generationAuditRecorder{}
+	service := &fakeCredentialService{get: credentials.Decrypted{
+		Metadata: credentials.Metadata{
+			ID: "crd_totp", SpaceID: "spc_test",
+			DisplayName: "TOTP", Type: credentials.TypeTOTP, Version: 1,
+		},
+		Payload: json.RawMessage(
+			`{"issuer":"Example","account":"alice","seed":"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ","algorithm":"SHA1","digits":8,"period":30}`,
+		),
+	}}
+	result, err := handleTOTPGenerate(
+		context.Background(),
+		Dependencies{
+			Credentials: service, AuthAudit: recorder,
+			Clock: fixedClock{now: time.Unix(-1, 0).UTC()},
+		},
+		requestContext{
+			principal: agents.AuthenticatedPrincipal{
+				AgentID: "agt_test", TokenID: "tok_test",
+				TokenPrefix: "owat_fixture",
+			},
+			actor: audit.Actor{
+				Type: audit.ActorAgent, ID: "agt_test", Fingerprint: "fixture",
+			},
+			requestID: "req_test", sourceIP: "192.0.2.1",
+		},
+		json.RawMessage(`{"space_id":"spc_test","credential_id":"crd_totp"}`),
+	)
+	if err == nil || result != nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	for _, event := range recorder.events {
+		if event.Action == "credential.totp.generate" && event.Success {
+			t.Fatalf("negative clock wrote success audit: %+v", event)
+		}
+	}
+}
+
+func TestTOTPGenerationAuditFailureReturnsNoCode(t *testing.T) {
+	recorder := &generationAuditRecorder{
+		failAction: "credential.totp.generate",
+	}
+	service := &fakeCredentialService{get: credentials.Decrypted{
+		Metadata: credentials.Metadata{
+			ID: "crd_totp", SpaceID: "spc_test",
+			DisplayName: "TOTP", Type: credentials.TypeTOTP, Version: 1,
+		},
+		Payload: json.RawMessage(
+			`{"issuer":"Example","account":"alice","seed":"GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ","algorithm":"SHA1","digits":8,"period":30}`,
+		),
+	}}
+	result, err := handleTOTPGenerate(
+		context.Background(),
+		Dependencies{
+			Credentials: service, AuthAudit: recorder,
+			Clock: fixedClock{now: time.Unix(59, 0).UTC()},
+		},
+		requestContext{
+			principal: agents.AuthenticatedPrincipal{
+				AgentID: "agt_test", TokenID: "tok_test",
+				TokenPrefix: "owat_fixture",
+			},
+			actor: audit.Actor{
+				Type: audit.ActorAgent, ID: "agt_test", Fingerprint: "fixture",
+			},
+			requestID: "req_test", sourceIP: "192.0.2.1",
+		},
+		json.RawMessage(`{"space_id":"spc_test","credential_id":"crd_totp"}`),
+	)
+	if !errors.Is(err, audit.ErrAuditUnavailable) || result != nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	for _, event := range recorder.events {
+		if strings.Contains(event.Reason, "94287082") ||
+			strings.Contains(event.Reason, "GEZDGNBV") {
+			t.Fatalf("TOTP material reached audit: %+v", event)
+		}
+	}
+}
+
+func TestToolSuccessRejectsOutputSchemaMismatchWithoutLeakingPayload(t *testing.T) {
+	validator, err := compileOutputSchema(json.RawMessage(`{
+		"type":"object","additionalProperties":false,
+		"properties":{"id":{"type":"string"}},
+		"required":["id"]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := toolSuccess(
+		map[string]any{"id": 42, "payload": "fixture-sensitive-value"},
+		validator,
+	)
+	if !errors.Is(err, ErrInvalidToolOutput) || result != nil {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if strings.Contains(err.Error(), "fixture-sensitive-value") {
+		t.Fatalf("validation error leaked payload: %v", err)
 	}
 }

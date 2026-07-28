@@ -37,7 +37,6 @@ mcp_servers:
     enabled: true
     connect_timeout: 30
     timeout: 60
-    skip_preflight: true
     supports_parallel_tool_calls: false
     tools:
       include:
@@ -52,8 +51,7 @@ mcp_servers:
       enabled: false
 ```
 
-`skip_preflight: true` 用于允许 Hermes 跳过 GET/HEAD 内容类型探测；OpsWarden 的
-MCP 端点只接受经过认证的 POST。不要把
+OpsWarden 的 MCP 端点只接受经过认证的 POST。不要把
 `supports_parallel_tool_calls` 改为 `true`，因为凭据读写共享授权状态、审计和
 SQLite。
 

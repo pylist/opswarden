@@ -1,17 +1,9 @@
 package httpapi
 
 import (
-	"errors"
 	"net/http"
-	"strings"
 
-	"opswarden/internal/agents"
-	"opswarden/internal/assets"
-	"opswarden/internal/audit"
-	"opswarden/internal/authorization"
-	"opswarden/internal/credentials"
-	"opswarden/internal/identity"
-	"opswarden/internal/spaces"
+	"opswarden/internal/apierrors"
 )
 
 type errorEnvelope struct {
@@ -64,75 +56,12 @@ func writeAPIError(
 }
 
 func writeDomainError(writer http.ResponseWriter, request *http.Request, err error) {
-	switch {
-	case err == nil:
+	if err == nil {
 		return
-	case errors.Is(err, authorization.ErrUnauthenticated),
-		errors.Is(err, identity.ErrInvalidSession),
-		errors.Is(err, identity.ErrSessionExpired),
-		errors.Is(err, identity.ErrSessionRevoked),
-		errors.Is(err, identity.ErrInvalidCredentials),
-		errors.Is(err, identity.ErrInvalidChallenge),
-		errors.Is(err, identity.ErrInvalidTOTP),
-		errors.Is(err, identity.ErrTOTPReplay),
-		errors.Is(err, identity.ErrInvalidRecoveryCode),
-		errors.Is(err, agents.ErrAuthenticationFailed),
-		errors.Is(err, agents.ErrUnauthenticated),
-		errors.Is(err, spaces.ErrUnauthenticated):
-		writeAPIError(writer, request, http.StatusUnauthorized, "UNAUTHENTICATED", false, nil)
-	case errors.Is(err, credentials.ErrInvalidInput),
-		errors.Is(err, credentials.ErrInvalidPayload),
-		errors.Is(err, credentials.ErrIdempotencyRequired),
-		errors.Is(err, credentials.ErrReasonRequired),
-		errors.Is(err, assets.ErrInvalidInput),
-		errors.Is(err, assets.ErrInvalidCursor),
-		errors.Is(err, agents.ErrInvalidInput),
-		errors.Is(err, agents.ErrIdempotencyRequired),
-		errors.Is(err, agents.ErrInvalidGrant),
-		errors.Is(err, agents.ErrInvalidScope),
-		errors.Is(err, spaces.ErrInvalidName),
-		errors.Is(err, spaces.ErrInvalidRole),
-		errors.Is(err, identity.ErrInvalidOwnerInput),
-		errors.Is(err, audit.ErrInvalidFilter),
-		errors.Is(err, audit.ErrInvalidCursor):
-		writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
-	case errors.Is(err, credentials.ErrVersionConflict),
-		errors.Is(err, assets.ErrVersionConflict),
-		errors.Is(err, spaces.ErrVersionConflict),
-		errors.Is(err, spaces.ErrMembershipExists),
-		errors.Is(err, identity.ErrInitialOwnerExists):
-		writeAPIError(writer, request, http.StatusConflict, "VERSION_CONFLICT", false, nil)
-	case errors.Is(err, credentials.ErrIdempotencyConflict),
-		errors.Is(err, agents.ErrIdempotencyConflict):
-		writeAPIError(writer, request, http.StatusConflict, "IDEMPOTENCY_CONFLICT", false, nil)
-	case errors.Is(err, credentials.ErrNotFound),
-		errors.Is(err, assets.ErrNotFound),
-		errors.Is(err, assets.ErrCrossSpaceLink),
-		errors.Is(err, agents.ErrAgentNotFound),
-		errors.Is(err, agents.ErrTokenNotFound),
-		errors.Is(err, spaces.ErrNotFound),
-		errors.Is(err, spaces.ErrMembershipNotFound),
-		errors.Is(err, spaces.ErrUserNotFound),
-		errors.Is(err, authorization.ErrNotFound):
-		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
-	case errors.Is(err, authorization.ErrDenied),
-		errors.Is(err, identity.ErrForbidden),
-		errors.Is(err, identity.ErrRecentTOTPRequired),
-		errors.Is(err, identity.ErrInitialOwnerSourceDenied),
-		errors.Is(err, agents.ErrForbidden),
-		errors.Is(err, spaces.ErrForbidden),
-		errors.Is(err, spaces.ErrLastOwner):
-		writeAPIError(writer, request, http.StatusForbidden, "PERMISSION_DENIED", false, nil)
-	case errors.Is(err, audit.ErrAuditUnavailable),
-		errors.Is(err, assets.ErrUnavailable),
-		errors.Is(err, agents.ErrAuthenticationUnavailable):
-		writeAPIError(writer, request, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", true, nil)
-	default:
-		message := strings.ToLower(err.Error())
-		if strings.Contains(message, "busy") || strings.Contains(message, "locked") {
-			writeAPIError(writer, request, http.StatusServiceUnavailable, "STORAGE_BUSY", true, nil)
-			return
-		}
-		writeAPIError(writer, request, http.StatusInternalServerError, "INTERNAL_ERROR", false, nil)
 	}
+	classification := apierrors.Classify(err)
+	writeAPIError(
+		writer, request, classification.Status, string(classification.Code),
+		classification.Retryable, nil,
+	)
 }

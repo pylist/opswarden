@@ -90,12 +90,17 @@ func New(dependencies Dependencies) (http.Handler, error) {
 		&mcp.Implementation{Name: "opswarden", Version: "1.0.0"},
 		&mcp.ServerOptions{
 			Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+			GetSessionID: func() string {
+				return ""
+			},
 			Capabilities: &mcp.ServerCapabilities{
 				Tools: &mcp.ToolCapabilities{},
 			},
 		},
 	)
-	registerTools(server, dependencies)
+	if err := registerTools(server, dependencies); err != nil {
+		return nil, err
+	}
 	stream := mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return server },
 		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
@@ -155,12 +160,31 @@ func (handler *handler) ServeHTTP(
 		)
 		return
 	}
+	if len(request.Header.Values("Mcp-Session-Id")) != 0 {
+		writeTransportError(
+			writer, http.StatusBadRequest, "INVALID_REQUEST", requestID,
+		)
+		return
+	}
 	request.Body = http.MaxBytesReader(writer, request.Body, maxRequestBytes)
+	encoded, err := io.ReadAll(request.Body)
+	if err != nil || len(bytes.TrimSpace(encoded)) == 0 {
+		writeTransportError(
+			writer, http.StatusRequestEntityTooLarge, "INVALID_REQUEST", requestID,
+		)
+		return
+	}
+	envelope, err := decodeMCPEnvelope(encoded)
+	if err != nil {
+		writeTransportError(
+			writer, http.StatusBadRequest, "INVALID_REQUEST", requestID,
+		)
+		return
+	}
+	request.Body = io.NopCloser(bytes.NewReader(encoded))
 	raw, ok := bearerToken(request.Header.Values("Authorization"))
 	sourceIP := requestSourceIP(request, handler.dependencies.TrustedProxyCIDRs)
 	now := handler.dependencies.Clock.Now().UTC()
-	// Spend a conservative POST-source token before reading or parsing the body.
-	// The tool-specific source token below is a separate policy dimension.
 	sourceReservation, sourceDecision := handler.dependencies.Limiter.Reserve(
 		[]agents.LimitRequest{{
 			Subject:   "mcp-preauth-source:" + sourceIP,
@@ -173,15 +197,7 @@ func (handler *handler) ServeHTTP(
 		return
 	}
 	sourceReservation.Commit()
-	encoded, err := io.ReadAll(request.Body)
-	if err != nil || len(bytes.TrimSpace(encoded)) == 0 {
-		writeTransportError(
-			writer, http.StatusRequestEntityTooLarge, "INVALID_REQUEST", requestID,
-		)
-		return
-	}
-	request.Body = io.NopCloser(bytes.NewReader(encoded))
-	operation, sourceOperation := mcpRequestOperation(encoded)
+	operation, sourceOperation := mcpRequestOperation(envelope)
 	// Apply the same credential list/read/write source buckets used by REST once
 	// the bounded JSON-RPC envelope reveals the requested tool.
 	operationSourceReservation, sourceDecision :=
@@ -270,15 +286,40 @@ func acceptsMCPResponse(values []string) bool {
 	return acceptsJSON && acceptsEvents
 }
 
-func mcpRequestOperation(encoded []byte) (agents.Operation, agents.Operation) {
-	var envelope struct {
-		Method string `json:"method"`
-		Params struct {
-			Name string `json:"name"`
-		} `json:"params"`
+type mcpEnvelope struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+func decodeMCPEnvelope(encoded []byte) (mcpEnvelope, error) {
+	var envelope mcpEnvelope
+	if err := decodeExact(encoded, &envelope); err != nil ||
+		envelope.JSONRPC != "2.0" || envelope.Method == "" ||
+		strings.TrimSpace(envelope.Method) != envelope.Method {
+		return mcpEnvelope{}, ErrInvalidToolInput
 	}
-	if json.Unmarshal(encoded, &envelope) == nil && envelope.Method == "tools/call" {
-		switch envelope.Params.Name {
+	if len(envelope.Params) != 0 &&
+		(len(bytes.TrimSpace(envelope.Params)) == 0 ||
+			bytes.TrimSpace(envelope.Params)[0] != '{') {
+		return mcpEnvelope{}, ErrInvalidToolInput
+	}
+	return envelope, nil
+}
+
+func mcpRequestOperation(envelope mcpEnvelope) (agents.Operation, agents.Operation) {
+	if envelope.Method == "tools/call" {
+		var params struct {
+			Meta      json.RawMessage `json:"_meta,omitempty"`
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments,omitempty"`
+		}
+		if decodeExact(envelope.Params, &params) != nil {
+			return agents.OperationAgentRequestRead,
+				agents.OperationAgentRequestReadSource
+		}
+		switch params.Name {
 		case "credential_list":
 			return agents.OperationAgentCredentialList,
 				agents.OperationAgentCredentialListSource

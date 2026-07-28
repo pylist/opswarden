@@ -11,27 +11,29 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"hash"
 	"io"
 	"maps"
 	"net/netip"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"opswarden/internal/apierrors"
 	"opswarden/internal/assets"
 	"opswarden/internal/audit"
-	"opswarden/internal/authorization"
 	"opswarden/internal/credentials"
 )
 
 const maxToolArgumentDepth = 16
 
 var ErrInvalidToolInput = errors.New("invalid MCP tool input")
+var ErrInvalidToolOutput = errors.New("invalid MCP tool output")
 
 var approvedToolNames = []string{
 	"asset_get",
@@ -145,10 +147,17 @@ type assetOutput struct {
 	DeletedAt   *time.Time        `json:"deleted_at,omitempty"`
 }
 
-func registerTools(server *mcp.Server, dependencies Dependencies) {
+func registerTools(server *mcp.Server, dependencies Dependencies) error {
 	readOnly := true
 	closedWorld := false
-	addRawTool(server, &mcp.Tool{
+	var registrationError error
+	add := func(tool *mcp.Tool, handler toolHandler) {
+		if registrationError != nil {
+			return
+		}
+		registrationError = addRawTool(server, tool, dependencies, handler)
+	}
+	add(&mcp.Tool{
 		Name:         "credential_list",
 		Description:  "列出凭据元数据；绝不返回凭据明文。",
 		InputSchema:  schemaCredentialList,
@@ -156,8 +165,8 @@ func registerTools(server *mcp.Server, dependencies Dependencies) {
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint: readOnly, OpenWorldHint: &closedWorld,
 		},
-	}, dependencies, handleCredentialList)
-	addRawTool(server, &mcp.Tool{
+	}, handleCredentialList)
+	add(&mcp.Tool{
 		Name: "credential_get",
 		Description: "读取一个凭据及其敏感明文。结果必须作为敏感数据处理，" +
 			"不得记录、缓存或转发。",
@@ -166,32 +175,32 @@ func registerTools(server *mcp.Server, dependencies Dependencies) {
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint: readOnly, OpenWorldHint: &closedWorld,
 		},
-	}, dependencies, handleCredentialGet)
-	addRawTool(server, &mcp.Tool{
+	}, handleCredentialGet)
+	add(&mcp.Tool{
 		Name: "credential_create", Description: "创建凭据；payload 是敏感数据。",
 		InputSchema:  schemaCredentialCreate,
 		OutputSchema: schemaMutationOutput,
 		Annotations: &mcp.ToolAnnotations{
 			IdempotentHint: true, OpenWorldHint: &closedWorld,
 		},
-	}, dependencies, handleCredentialCreate)
-	addRawTool(server, &mcp.Tool{
+	}, handleCredentialCreate)
+	add(&mcp.Tool{
 		Name: "credential_update", Description: "按版本更新凭据；payload 是敏感数据。",
 		InputSchema:  schemaCredentialUpdate,
 		OutputSchema: schemaMutationOutput,
 		Annotations: &mcp.ToolAnnotations{
 			IdempotentHint: true, OpenWorldHint: &closedWorld,
 		},
-	}, dependencies, handleCredentialUpdate)
-	addRawTool(server, &mcp.Tool{
+	}, handleCredentialUpdate)
+	add(&mcp.Tool{
 		Name: "credential_delete", Description: "按版本将凭据移入回收站。",
 		InputSchema:  schemaCredentialDelete,
 		OutputSchema: schemaDeleteOutput,
 		Annotations: &mcp.ToolAnnotations{
 			IdempotentHint: true, OpenWorldHint: &closedWorld,
 		},
-	}, dependencies, handleCredentialDelete)
-	addRawTool(server, &mcp.Tool{
+	}, handleCredentialDelete)
+	add(&mcp.Tool{
 		Name: "totp_generate",
 		Description: "从 TOTP 凭据生成当前一次性验证码。结果是敏感数据；" +
 			"只返回当前 code 和 expiry，不返回 seed。",
@@ -200,23 +209,24 @@ func registerTools(server *mcp.Server, dependencies Dependencies) {
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint: readOnly, OpenWorldHint: &closedWorld,
 		},
-	}, dependencies, handleTOTPGenerate)
-	addRawTool(server, &mcp.Tool{
+	}, handleTOTPGenerate)
+	add(&mcp.Tool{
 		Name: "asset_list", Description: "列出资产。",
 		InputSchema:  schemaAssetList,
 		OutputSchema: schemaAssetListOutput,
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint: readOnly, OpenWorldHint: &closedWorld,
 		},
-	}, dependencies, handleAssetList)
-	addRawTool(server, &mcp.Tool{
+	}, handleAssetList)
+	add(&mcp.Tool{
 		Name: "asset_get", Description: "读取一个资产。",
 		InputSchema:  schemaAssetGet,
 		OutputSchema: schemaAssetOutput,
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint: readOnly, OpenWorldHint: &closedWorld,
 		},
-	}, dependencies, handleAssetGet)
+	}, handleAssetGet)
+	return registrationError
 }
 
 type toolHandler func(
@@ -231,7 +241,15 @@ func addRawTool(
 	tool *mcp.Tool,
 	dependencies Dependencies,
 	call toolHandler,
-) {
+) error {
+	rawOutputSchema, ok := tool.OutputSchema.(json.RawMessage)
+	if !ok {
+		return errors.New("MCP tool output schema must be raw JSON")
+	}
+	outputValidator, err := compileOutputSchema(rawOutputSchema)
+	if err != nil {
+		return errors.New("compile MCP tool output schema")
+	}
 	server.AddTool(tool, func(
 		ctx context.Context,
 		request *mcp.CallToolRequest,
@@ -247,8 +265,13 @@ func addRawTool(
 		if err != nil {
 			return toolError(toolErrorCode(err)), nil
 		}
-		return toolSuccess(result)
+		success, err := toolSuccess(result, outputValidator)
+		if err != nil {
+			return toolError("INTERNAL_ERROR"), nil
+		}
+		return success, nil
 	})
+	return nil
 }
 
 func handleCredentialList(
@@ -306,6 +329,7 @@ func handleCredentialGet(
 		ctx, credentialPrincipal(authenticated, input.SpaceID), input.CredentialID,
 	)
 	if err != nil {
+		clear(decrypted.Payload)
 		return nil, err
 	}
 	defer clear(decrypted.Payload)
@@ -503,6 +527,7 @@ func handleTOTPGenerate(
 		ctx, credentialPrincipal(authenticated, input.SpaceID), input.CredentialID,
 	)
 	if err != nil {
+		clear(decrypted.Payload)
 		return nil, err
 	}
 	defer clear(decrypted.Payload)
@@ -519,12 +544,16 @@ func handleTOTPGenerate(
 	defer clear(canonical)
 	var payload credentials.TOTPPayload
 	if err := json.Unmarshal(canonical, &payload); err != nil {
+		payload.Seed = ""
 		return nil, credentials.ErrNotFound
 	}
 	now := dependencies.Clock.Now().UTC()
-	if now.IsZero() {
-		return nil, audit.ErrAuditUnavailable
+	code, expiry, err := generateTOTP(payload, now)
+	payload.Seed = ""
+	if err != nil {
+		return nil, credentials.ErrNotFound
 	}
+	defer clear(code)
 	if err := dependencies.AuthAudit.RecordReadBeforeReturn(
 		ctx, audit.Event{
 			ID: newID("aud_"), RequestID: authenticated.requestID,
@@ -537,14 +566,10 @@ func handleTOTPGenerate(
 	); err != nil {
 		return nil, audit.ErrAuditUnavailable
 	}
-	code, expiry, err := generateTOTP(payload, now)
-	if err != nil {
-		return nil, credentials.ErrNotFound
-	}
 	return struct {
 		Code   string    `json:"code"`
 		Expiry time.Time `json:"expiry"`
-	}{Code: code, Expiry: expiry}, nil
+	}{Code: string(code), Expiry: expiry}, nil
 }
 
 func credentialPrincipal(
@@ -608,13 +633,36 @@ func mutationDTO(result credentials.MutationResult) any {
 	}{ID: result.ID, Version: result.Version, Status: result.Status}
 }
 
-func toolSuccess(value any) (*mcp.CallToolResult, error) {
+func compileOutputSchema(raw json.RawMessage) (*jsonschema.Resolved, error) {
+	var schema jsonschema.Schema
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		return nil, ErrInvalidToolOutput
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		return nil, ErrInvalidToolOutput
+	}
+	return resolved, nil
+}
+
+func toolSuccess(
+	value any,
+	validator *jsonschema.Resolved,
+) (*mcp.CallToolResult, error) {
 	encoded, err := json.Marshal(value)
 	if err != nil {
-		return nil, errors.New("encode MCP tool result")
+		return nil, ErrInvalidToolOutput
 	}
+	var instance any
+	if json.Unmarshal(encoded, &instance) != nil ||
+		validator == nil || validator.Validate(instance) != nil {
+		clear(encoded)
+		return nil, ErrInvalidToolOutput
+	}
+	text := string(encoded)
+	clear(encoded)
 	return &mcp.CallToolResult{
-		Content:           []mcp.Content{&mcp.TextContent{Text: string(encoded)}},
+		Content:           []mcp.Content{&mcp.TextContent{Text: text}},
 		StructuredContent: value,
 	}, nil
 }
@@ -627,34 +675,14 @@ func toolError(code string) *mcp.CallToolResult {
 }
 
 func toolErrorCode(err error) string {
-	switch {
-	case errors.Is(err, ErrInvalidToolInput),
-		errors.Is(err, credentials.ErrInvalidInput),
-		errors.Is(err, credentials.ErrInvalidPayload),
-		errors.Is(err, credentials.ErrIdempotencyRequired),
-		errors.Is(err, credentials.ErrReasonRequired),
-		errors.Is(err, assets.ErrInvalidInput),
-		errors.Is(err, assets.ErrInvalidCursor):
+	if errors.Is(err, ErrInvalidToolInput) {
 		return "INVALID_INPUT"
-	case errors.Is(err, credentials.ErrNotFound),
-		errors.Is(err, assets.ErrNotFound),
-		errors.Is(err, assets.ErrCrossSpaceLink),
-		errors.Is(err, authorization.ErrNotFound),
-		errors.Is(err, authorization.ErrDenied):
-		return "NOT_FOUND"
-	case errors.Is(err, authorization.ErrUnauthenticated):
-		return "UNAUTHENTICATED"
-	case errors.Is(err, credentials.ErrVersionConflict),
-		errors.Is(err, assets.ErrVersionConflict):
-		return "VERSION_CONFLICT"
-	case errors.Is(err, credentials.ErrIdempotencyConflict):
-		return "IDEMPOTENCY_CONFLICT"
-	case errors.Is(err, audit.ErrAuditUnavailable),
-		errors.Is(err, assets.ErrUnavailable):
-		return "STORAGE_UNAVAILABLE"
-	default:
-		return "INTERNAL_ERROR"
 	}
+	classification := apierrors.Classify(err)
+	if classification.Code == apierrors.CodeInvalidRequest {
+		return "INVALID_INPUT"
+	}
+	return string(classification.Code)
 }
 
 func decodeExact(raw json.RawMessage, destination any) error {
@@ -776,19 +804,19 @@ func consumeJSON(decoder *json.Decoder, depth int) error {
 func generateTOTP(
 	payload credentials.TOTPPayload,
 	now time.Time,
-) (string, time.Time, error) {
+) ([]byte, time.Time, error) {
 	if now.IsZero() || payload.Period < 1 || payload.Period > 300 ||
 		now.Before(time.Unix(0, 0)) ||
 		(payload.Digits != 6 && payload.Digits != 8) ||
 		strings.TrimSpace(payload.Seed) != payload.Seed ||
 		payload.Seed == "" {
-		return "", time.Time{}, ErrInvalidToolInput
+		return nil, time.Time{}, ErrInvalidToolInput
 	}
 	encoding := base32.StdEncoding.WithPadding(base32.NoPadding)
 	secret, err := encoding.DecodeString(payload.Seed)
 	if err != nil || encoding.EncodeToString(secret) != payload.Seed {
 		clear(secret)
-		return "", time.Time{}, ErrInvalidToolInput
+		return nil, time.Time{}, ErrInvalidToolInput
 	}
 	defer clear(secret)
 	var newHash func() hash.Hash
@@ -800,7 +828,7 @@ func generateTOTP(
 	case "SHA512":
 		newHash = sha512.New
 	default:
-		return "", time.Time{}, ErrInvalidToolInput
+		return nil, time.Time{}, ErrInvalidToolInput
 	}
 	counter := uint64(now.Unix() / int64(payload.Period))
 	var counterBytes [8]byte
@@ -818,7 +846,12 @@ func generateTOTP(
 	if payload.Digits == 8 {
 		modulus = 100_000_000
 	}
-	code := fmt.Sprintf("%0*d", payload.Digits, value%modulus)
+	digits := strconv.FormatUint(uint64(value%modulus), 10)
+	code := make([]byte, payload.Digits)
+	for index := range code {
+		code[index] = '0'
+	}
+	copy(code[len(code)-len(digits):], digits)
 	expiry := time.Unix(
 		(int64(counter)+1)*int64(payload.Period), 0,
 	).UTC()
@@ -834,99 +867,106 @@ var (
 		"type":"object","additionalProperties":false,
 		"properties":{
 			"space_id":{"type":"string","description":"Space ID"},
-			"type":{"type":"string","enum":["login","api_token","ssh_key","database","totp"]},
-			"tags":{"type":"object","additionalProperties":{"type":"string"}},
-			"include_deleted":{"type":"boolean"},
-			"deleted_only":{"type":"boolean"},
-			"after":{"type":"string"},
-			"limit":{"type":"integer","minimum":1,"maximum":500}
+			"type":{"type":"string","description":"Optional credential type filter","enum":["login","api_token","ssh_key","database","totp"]},
+			"tags":{"type":"object","description":"Required credential tag key-value filters","additionalProperties":{"type":"string"}},
+			"include_deleted":{"type":"boolean","description":"Include credentials in the recycle bin"},
+			"deleted_only":{"type":"boolean","description":"Return only credentials in the recycle bin"},
+			"after":{"type":"string","description":"Opaque cursor returned by the previous page"},
+			"limit":{"type":"integer","description":"Maximum metadata records to return","minimum":1,"maximum":500}
 		},"required":["space_id"]
 	}`)
 	schemaCredentialGet = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"space_id":{"type":"string"},
-			"credential_id":{"type":"string"}
+			"space_id":{"type":"string","description":"Space that bounds authorization"},
+			"credential_id":{"type":"string","description":"Credential ID to read"}
 		},"required":["space_id","credential_id"]
 	}`)
 	schemaCredentialCreate = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"space_id":{"type":"string"},
-			"display_name":{"type":"string"},
-			"type":{"type":"string","enum":["login","api_token","ssh_key","database","totp"]},
-			"tags":{"type":"object","additionalProperties":{"type":"string"}},
-			"asset_ids":{"type":"array","items":{"type":"string"}},
+			"space_id":{"type":"string","description":"Space that will own the credential"},
+			"display_name":{"type":"string","description":"Human-readable credential name"},
+			"type":{"type":"string","description":"Credential payload type","enum":["login","api_token","ssh_key","database","totp"]},
+			"tags":{"type":"object","description":"Credential authorization and search tags","additionalProperties":{"type":"string"}},
+			"asset_ids":{"type":"array","description":"Assets in the same Space to link","items":{"type":"string"}},
 			"payload":{"type":"object","description":"Sensitive credential payload"},
-			"reason":{"type":"string"},
-			"idempotency_key":{"type":"string"}
+			"reason":{"type":"string","description":"Required human-readable reason recorded in audit"},
+			"idempotency_key":{"type":"string","description":"Required unique retry key; reuse only for the identical create"}
 		},
 		"required":["space_id","display_name","type","payload","reason","idempotency_key"]
 	}`)
 	schemaCredentialUpdate = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"space_id":{"type":"string"},
-			"credential_id":{"type":"string"},
-			"expected_version":{"type":"integer","minimum":1},
-			"display_name":{"type":"string"},
-			"tags":{"type":"object","additionalProperties":{"type":"string"}},
-			"asset_ids":{"type":"array","items":{"type":"string"}},
-			"payload":{"type":"object","description":"Sensitive credential payload"},
-			"reason":{"type":"string"},
-			"idempotency_key":{"type":"string"}
+			"space_id":{"type":"string","description":"Space that bounds authorization"},
+			"credential_id":{"type":"string","description":"Credential ID to update"},
+			"expected_version":{"type":"integer","description":"Required current version for optimistic concurrency","minimum":1},
+			"display_name":{"type":"string","description":"Replacement human-readable name"},
+			"tags":{"type":"object","description":"Replacement authorization and search tags","additionalProperties":{"type":"string"}},
+			"asset_ids":{"type":"array","description":"Replacement same-Space asset links","items":{"type":"string"}},
+			"payload":{"type":"object","description":"Sensitive replacement credential payload"},
+			"reason":{"type":"string","description":"Required human-readable reason recorded in audit"},
+			"idempotency_key":{"type":"string","description":"Required unique retry key; reuse only for the identical update"}
 		},
 		"required":["space_id","credential_id","expected_version","reason","idempotency_key"]
 	}`)
 	schemaCredentialDelete = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"space_id":{"type":"string"},
-			"credential_id":{"type":"string"},
-			"expected_version":{"type":"integer","minimum":1},
-			"reason":{"type":"string"},
-			"idempotency_key":{"type":"string"}
+			"space_id":{"type":"string","description":"Space that bounds authorization"},
+			"credential_id":{"type":"string","description":"Credential ID to move to the recycle bin"},
+			"expected_version":{"type":"integer","description":"Required current version for optimistic concurrency","minimum":1},
+			"reason":{"type":"string","description":"Required human-readable reason recorded in audit"},
+			"idempotency_key":{"type":"string","description":"Required unique retry key; reuse only for the identical delete"}
 		},
 		"required":["space_id","credential_id","expected_version","reason","idempotency_key"]
 	}`)
-	schemaTOTPGenerate = schemaCredentialGet
-	schemaAssetList    = json.RawMessage(`{
+	schemaTOTPGenerate = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"space_id":{"type":"string"},
-			"type":{"type":"string"},
-			"environment":{"type":"string"},
-			"status":{"type":"string"},
-			"tags":{"type":"object","additionalProperties":{"type":"string"}},
-			"after":{"type":"string"},
-			"limit":{"type":"integer","minimum":1,"maximum":500}
+			"space_id":{"type":"string","description":"Space that bounds TOTP authorization"},
+			"credential_id":{"type":"string","description":"TOTP credential ID used to generate the current code"}
+		},"required":["space_id","credential_id"]
+	}`)
+	schemaAssetList = json.RawMessage(`{
+		"type":"object","additionalProperties":false,
+		"properties":{
+			"space_id":{"type":"string","description":"Space that bounds authorization"},
+			"type":{"type":"string","description":"Optional asset type filter"},
+			"environment":{"type":"string","description":"Optional asset environment filter"},
+			"status":{"type":"string","description":"Optional asset status filter"},
+			"tags":{"type":"object","description":"Required asset tag key-value filters","additionalProperties":{"type":"string"}},
+			"after":{"type":"string","description":"Opaque cursor returned by the previous page"},
+			"limit":{"type":"integer","description":"Maximum assets to return","minimum":1,"maximum":500}
 		},"required":["space_id"]
 	}`)
 	schemaAssetGet = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"space_id":{"type":"string"},
-			"asset_id":{"type":"string"}
+			"space_id":{"type":"string","description":"Space that bounds authorization"},
+			"asset_id":{"type":"string","description":"Asset ID to read"}
 		},"required":["space_id","asset_id"]
 	}`)
 	schemaCredentialMetadataOutput = json.RawMessage(`{
-		"type":"object","additionalProperties":false,
+		"type":"object","description":"Credential metadata","additionalProperties":false,
 		"properties":{
-			"id":{"type":"string"},"space_id":{"type":"string"},
-			"display_name":{"type":"string"},
-			"type":{"type":"string","enum":["login","api_token","ssh_key","database","totp"]},
-			"version":{"type":"integer","minimum":1},
-			"tags":{"type":"object","additionalProperties":{"type":"string"}},
-			"asset_ids":{"type":"array","items":{"type":"string"}},
-			"deleted_at":{"type":"string","format":"date-time"}
+			"id":{"type":"string","description":"Credential ID"},
+			"space_id":{"type":"string","description":"Owning Space ID"},
+			"display_name":{"type":"string","description":"Human-readable credential name"},
+			"type":{"type":"string","description":"Credential payload type","enum":["login","api_token","ssh_key","database","totp"]},
+			"version":{"type":"integer","description":"Current optimistic concurrency version","minimum":1},
+			"tags":{"type":"object","description":"Credential authorization and search tags","additionalProperties":{"type":"string"}},
+			"asset_ids":{"type":"array","description":"Linked same-Space asset IDs","items":{"type":"string"}},
+			"deleted_at":{"type":"string","description":"Recycle-bin timestamp when deleted","format":"date-time"}
 		},
 		"required":["id","space_id","display_name","type","version","tags","asset_ids"]
 	}`)
 	schemaCredentialListOutput = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"items":{"type":"array","items":` + string(schemaCredentialMetadataOutput) + `},
-			"next_cursor":{"type":"string"}
+			"items":{"type":"array","description":"Credential metadata records; never plaintext payloads","items":` + string(schemaCredentialMetadataOutput) + `},
+			"next_cursor":{"type":"string","description":"Opaque cursor for the next page"}
 		},"required":["items"]
 	}`)
 	schemaCredentialGetOutput = json.RawMessage(`{
@@ -939,36 +979,45 @@ var (
 	schemaMutationOutput = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"id":{"type":"string"},"version":{"type":"integer","minimum":1},
-			"status":{"type":"integer","minimum":200,"maximum":299}
+			"id":{"type":"string","description":"Mutated credential ID"},
+			"version":{"type":"integer","description":"Resulting credential version","minimum":1},
+			"status":{"type":"integer","description":"Stable domain HTTP-equivalent status","minimum":200,"maximum":299}
 		},"required":["id","version","status"]
 	}`)
 	schemaDeleteOutput = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
-		"properties":{"id":{"type":"string"},"deleted":{"const":true}},
+		"properties":{
+			"id":{"type":"string","description":"Deleted credential ID"},
+			"deleted":{"description":"True when the credential is in the recycle bin","const":true}
+		},
 		"required":["id","deleted"]
 	}`)
 	schemaTOTPOutput = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"code":{"type":"string","pattern":"^[0-9]{6}([0-9]{2})?$"},
-			"expiry":{"type":"string","format":"date-time"}
+			"code":{"type":"string","description":"Sensitive current one-time code; never the seed","pattern":"^[0-9]{6}([0-9]{2})?$"},
+			"expiry":{"type":"string","description":"Trusted server time when the code expires","format":"date-time"}
 		},"required":["code","expiry"]
 	}`)
 	schemaAssetOutput = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"id":{"type":"string"},"space_id":{"type":"string"},
-			"name":{"type":"string"},"type":{"type":"string"},
-			"hostname":{"type":"string"},"os":{"type":"string"},
-			"environment":{"type":"string"},"status":{"type":"string"},
-			"ips":{"type":"array","items":{"type":"string"}},
-			"ports":{"type":"array","items":{"type":"integer","minimum":1,"maximum":65535}},
-			"tags":{"type":"object","additionalProperties":{"type":"string"}},
-			"notes":{"type":"string"},"version":{"type":"integer","minimum":1},
-			"created_at":{"type":"string","format":"date-time"},
-			"updated_at":{"type":"string","format":"date-time"},
-			"deleted_at":{"type":"string","format":"date-time"}
+			"id":{"type":"string","description":"Asset ID"},
+			"space_id":{"type":"string","description":"Owning Space ID"},
+			"name":{"type":"string","description":"Human-readable asset name"},
+			"type":{"type":"string","description":"Asset type"},
+			"hostname":{"type":"string","description":"Asset hostname"},
+			"os":{"type":"string","description":"Operating system"},
+			"environment":{"type":"string","description":"Deployment environment"},
+			"status":{"type":"string","description":"Operational status"},
+			"ips":{"type":"array","description":"Canonical IP addresses","items":{"type":"string"}},
+			"ports":{"type":"array","description":"Network ports","items":{"type":"integer","minimum":1,"maximum":65535}},
+			"tags":{"type":"object","description":"Asset search and authorization tags","additionalProperties":{"type":"string"}},
+			"notes":{"type":"string","description":"Non-secret asset notes"},
+			"version":{"type":"integer","description":"Current optimistic concurrency version","minimum":1},
+			"created_at":{"type":"string","description":"Creation timestamp","format":"date-time"},
+			"updated_at":{"type":"string","description":"Last update timestamp","format":"date-time"},
+			"deleted_at":{"type":"string","description":"Deletion timestamp when deleted","format":"date-time"}
 		},
 		"required":["id","space_id","name","type","hostname","os","environment",
 			"status","ips","ports","tags","notes","version","created_at","updated_at"]
@@ -976,8 +1025,8 @@ var (
 	schemaAssetListOutput = json.RawMessage(`{
 		"type":"object","additionalProperties":false,
 		"properties":{
-			"items":{"type":"array","items":` + string(schemaAssetOutput) + `},
-			"next_cursor":{"type":"string"}
+			"items":{"type":"array","description":"Authorized asset records","items":` + string(schemaAssetOutput) + `},
+			"next_cursor":{"type":"string","description":"Opaque cursor for the next page"}
 		},"required":["items"]
 	}`)
 )
