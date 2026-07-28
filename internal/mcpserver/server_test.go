@@ -148,6 +148,62 @@ func (reader *countingReadCloser) Read(destination []byte) (int, error) {
 
 func (*countingReadCloser) Close() error { return nil }
 
+type bodyBlockedAfterPrefix struct {
+	remaining *strings.Reader
+	reached   chan struct{}
+	release   chan struct{}
+	first     bool
+	once      sync.Once
+}
+
+func (body *bodyBlockedAfterPrefix) Read(destination []byte) (int, error) {
+	if !body.first {
+		body.first = true
+		destination[0] = '{'
+		return 1, nil
+	}
+	body.once.Do(func() { close(body.reached) })
+	<-body.release
+	return body.remaining.Read(destination)
+}
+
+func (*bodyBlockedAfterPrefix) Close() error { return nil }
+
+type inspectBlockedAuthenticator struct {
+	mu        sync.Mutex
+	principal agents.AuthenticatedPrincipal
+	reached   chan struct{}
+	release   chan struct{}
+	inspects  int
+	auths     int
+}
+
+func (authenticator *inspectBlockedAuthenticator) InspectAuthentication(
+	_ context.Context,
+	_ string,
+) (agents.AuthenticatedPrincipal, error) {
+	authenticator.mu.Lock()
+	authenticator.inspects++
+	first := authenticator.inspects == 1
+	principal := authenticator.principal
+	authenticator.mu.Unlock()
+	if first {
+		close(authenticator.reached)
+		<-authenticator.release
+	}
+	return principal, nil
+}
+
+func (authenticator *inspectBlockedAuthenticator) Authenticate(
+	_ context.Context,
+	_ string,
+) (agents.AuthenticatedPrincipal, error) {
+	authenticator.mu.Lock()
+	defer authenticator.mu.Unlock()
+	authenticator.auths++
+	return authenticator.principal, nil
+}
+
 func (transport bearerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	clone := request.Clone(request.Context())
 	clone.Header.Set("Authorization", "Bearer "+transport.token)
@@ -653,6 +709,154 @@ func TestGenericSourceQuotaPrecedesFullObjectDecode(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestDelayedBodyUsesFreshOperationSourceClock(t *testing.T) {
+	initial := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: initial}
+	authenticator := &fakeAuthenticator{principal: agents.AuthenticatedPrincipal{
+		AgentID: "agt_test", TokenID: "tok_test", TokenPrefix: "owat_fixture",
+	}}
+	credentialService := &fakeCredentialService{}
+	handler, err := New(Dependencies{
+		Agents: authenticator, AuthAudit: &recordingAudit{},
+		Credentials: credentialService, Assets: &fakeAssetService{},
+		Clock: clock, Limiter: agents.NewLimiter(agents.LimiterConfig{}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyJSON := credentialListRequestJSON()
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	delayedBody := &bodyBlockedAfterPrefix{
+		remaining: strings.NewReader(bodyJSON[1:]),
+		reached:   reached, release: release,
+	}
+	delayedResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, mcpListRequest(delayedBody))
+		delayedResult <- response
+	}()
+	waitForSignal(t, reached, "delayed request body read")
+
+	clock.set(initial.Add(time.Second))
+	later := httptest.NewRecorder()
+	handler.ServeHTTP(
+		later,
+		mcpListRequest(io.NopCloser(strings.NewReader(bodyJSON))),
+	)
+	if later.Code != http.StatusOK {
+		t.Fatalf(
+			"later request status=%d body=%s",
+			later.Code, later.Body.String(),
+		)
+	}
+	close(release)
+	delayed := waitForResponse(t, delayedResult)
+	if delayed.Code != http.StatusOK {
+		t.Fatalf(
+			"delayed request status=%d body=%s",
+			delayed.Code, delayed.Body.String(),
+		)
+	}
+	if credentialService.listCalls != 2 {
+		t.Fatalf("domain list calls=%d want 2", credentialService.listCalls)
+	}
+}
+
+func TestDelayedInspectUsesFreshStrictClock(t *testing.T) {
+	initial := time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC)
+	clock := &mutableClock{now: initial}
+	authenticator := &inspectBlockedAuthenticator{
+		principal: agents.AuthenticatedPrincipal{
+			AgentID: "agt_test", TokenID: "tok_test", TokenPrefix: "owat_fixture",
+		},
+		reached: make(chan struct{}), release: make(chan struct{}),
+	}
+	credentialService := &fakeCredentialService{}
+	handler, err := New(Dependencies{
+		Agents: authenticator, AuthAudit: &recordingAudit{},
+		Credentials: credentialService, Assets: &fakeAssetService{},
+		Clock: clock, Limiter: agents.NewLimiter(agents.LimiterConfig{}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyJSON := credentialListRequestJSON()
+	delayedResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(
+			response,
+			mcpListRequest(io.NopCloser(strings.NewReader(bodyJSON))),
+		)
+		delayedResult <- response
+	}()
+	waitForSignal(t, authenticator.reached, "delayed authentication inspection")
+
+	clock.set(initial.Add(time.Second))
+	later := httptest.NewRecorder()
+	handler.ServeHTTP(
+		later,
+		mcpListRequest(io.NopCloser(strings.NewReader(bodyJSON))),
+	)
+	if later.Code != http.StatusOK {
+		t.Fatalf(
+			"later request status=%d body=%s",
+			later.Code, later.Body.String(),
+		)
+	}
+	close(authenticator.release)
+	delayed := waitForResponse(t, delayedResult)
+	if delayed.Code != http.StatusOK {
+		t.Fatalf(
+			"delayed request status=%d body=%s",
+			delayed.Code, delayed.Body.String(),
+		)
+	}
+	if credentialService.listCalls != 2 {
+		t.Fatalf("domain list calls=%d want 2", credentialService.listCalls)
+	}
+}
+
+func credentialListRequestJSON() string {
+	return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"credential_list","arguments":{"space_id":"spc_test"}}}`
+}
+
+func mcpListRequest(body io.ReadCloser) *http.Request {
+	request := httptest.NewRequest(
+		http.MethodPost, "http://opswarden.test/mcp", nil,
+	)
+	request.Body = body
+	request.Header.Set("Authorization", "Bearer owat_fixture-token")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	return request
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func waitForResponse(
+	t *testing.T,
+	response <-chan *httptest.ResponseRecorder,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	select {
+	case result := <-response:
+		return result
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for delayed response")
+		return nil
 	}
 }
 

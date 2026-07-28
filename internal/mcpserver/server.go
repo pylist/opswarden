@@ -179,13 +179,13 @@ func (handler *handler) ServeHTTP(
 		return
 	}
 	sourceIP := requestSourceIP(request, handler.dependencies.TrustedProxyCIDRs)
-	now := handler.dependencies.Clock.Now().UTC()
+	sourceNow := handler.dependencies.Clock.Now().UTC()
 	sourceReservation, sourceDecision := handler.dependencies.Limiter.Reserve(
 		[]agents.LimitRequest{{
 			Subject:   "mcp-preauth-source:" + sourceIP,
 			Operation: agents.OperationAgentRequestWriteSource,
 		}},
-		now,
+		sourceNow,
 	)
 	if !sourceDecision.Allowed {
 		writeRateLimitError(writer, sourceDecision, requestID)
@@ -219,13 +219,14 @@ func (handler *handler) ServeHTTP(
 	operation, sourceOperation := mcpRequestOperation(envelope)
 	// Apply the same credential list/read/write source buckets used by REST once
 	// the bounded JSON-RPC envelope reveals the requested tool.
+	operationSourceNow := handler.dependencies.Clock.Now().UTC()
 	operationSourceReservation, sourceDecision :=
 		handler.dependencies.Limiter.Reserve(
 			[]agents.LimitRequest{{
 				Subject:   "mcp-operation-source:" + sourceIP,
 				Operation: sourceOperation,
 			}},
-			now,
+			operationSourceNow,
 		)
 	if !sourceDecision.Allowed {
 		writeRateLimitError(writer, sourceDecision, requestID)
@@ -234,24 +235,25 @@ func (handler *handler) ServeHTTP(
 	operationSourceReservation.Commit()
 	raw, hasBearer := bearerToken(request.Header.Values("Authorization"))
 	if !hasBearer || !strings.HasPrefix(raw, "owat_") {
-		handler.rejectAuthentication(writer, request, requestID, sourceIP, now)
+		handler.rejectAuthentication(writer, request, requestID, sourceIP)
 		return
 	}
 	inspected, err := handler.dependencies.Agents.InspectAuthentication(
 		request.Context(), raw,
 	)
 	if err != nil || inspected.AgentID == "" || inspected.TokenID == "" {
-		handler.rejectAuthentication(writer, request, requestID, sourceIP, now)
+		handler.rejectAuthentication(writer, request, requestID, sourceIP)
 		return
 	}
 	strictSubject := "mcp-preauth-agent:" + bearerFingerprint(
 		inspected.AgentID+"\x00"+inspected.TokenID+"\x00"+raw,
 	)
+	strictNow := handler.dependencies.Clock.Now().UTC()
 	strictReservation, strictDecision := handler.dependencies.Limiter.Reserve(
 		[]agents.LimitRequest{{
 			Subject: strictSubject, Operation: operation,
 		}},
-		now,
+		strictNow,
 	)
 	if !strictDecision.Allowed {
 		writeRateLimitError(writer, strictDecision, requestID)
@@ -261,14 +263,15 @@ func (handler *handler) ServeHTTP(
 	principal, err := handler.dependencies.Agents.Authenticate(request.Context(), raw)
 	if err != nil || principal.AgentID != inspected.AgentID ||
 		principal.TokenID != inspected.TokenID {
-		handler.rejectAuthentication(writer, request, requestID, sourceIP, now)
+		handler.rejectAuthentication(writer, request, requestID, sourceIP)
 		return
 	}
 	actor := principal.AuditActor()
+	auditNow := handler.dependencies.Clock.Now().UTC()
 	if err := handler.dependencies.AuthAudit.RecordReadBeforeReturn(
 		request.Context(),
 		audit.Event{
-			ID: newID("aud_"), RequestID: requestID, CreatedAt: now,
+			ID: newID("aud_"), RequestID: requestID, CreatedAt: auditNow,
 			Actor: actor, Action: "auth.agent", ResourceType: "agent",
 			ResourceID: principal.AgentID, SourceIP: sourceIP,
 			UserAgent: safeUserAgent(request.UserAgent()), Success: true,
@@ -385,8 +388,8 @@ func (handler *handler) rejectAuthentication(
 	request *http.Request,
 	requestID string,
 	sourceIP string,
-	now time.Time,
 ) {
+	now := handler.dependencies.Clock.Now().UTC()
 	reservation, decision := handler.dependencies.Limiter.Reserve(
 		[]agents.LimitRequest{{
 			Subject:   "mcp-auth-failure:" + sourceIP,

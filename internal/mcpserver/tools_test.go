@@ -25,6 +25,7 @@ type fakeCredentialService struct {
 
 	listItems []credentials.Metadata
 	listNext  string
+	listCalls int
 	get       credentials.Decrypted
 	err       error
 
@@ -42,6 +43,7 @@ func (service *fakeCredentialService) List(
 ) ([]credentials.Metadata, string, error) {
 	service.mu.Lock()
 	defer service.mu.Unlock()
+	service.listCalls++
 	service.principal = principal
 	return service.listItems, service.listNext, service.err
 }
