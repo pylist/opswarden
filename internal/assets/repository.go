@@ -35,12 +35,17 @@ func (r *Repository) withTx(
 	ctx context.Context,
 	fn func(*sql.Tx) error,
 ) error {
-	return storage.WithTx(ctx, r.db, fn)
+	if err := storage.WithTx(ctx, r.db, fn); err != nil {
+		return stableStorageError(err)
+	}
+	return nil
 }
 
-func (r *Repository) list(
+func (r *Repository) listBatch(
 	ctx context.Context,
 	filter ListFilter,
+	after string,
+	limit int,
 ) ([]Asset, error) {
 	query := `
 		SELECT
@@ -48,9 +53,9 @@ func (r *Repository) list(
 			environment, status, ips_json, ports_json, notes, version,
 			created_at, updated_at, deleted_at
 		FROM assets
-		WHERE space_id = ? AND deleted_at IS NULL
+		WHERE space_id = ? AND id > ? AND deleted_at IS NULL
 	`
-	arguments := []any{filter.SpaceID}
+	arguments := []any{filter.SpaceID, after}
 	if filter.Type != "" {
 		query += ` AND type = ?`
 		arguments = append(arguments, filter.Type)
@@ -82,7 +87,7 @@ func (r *Repository) list(
 		arguments = append(arguments, encoded)
 	}
 	query += ` ORDER BY id LIMIT ?`
-	arguments = append(arguments, filter.Limit)
+	arguments = append(arguments, limit)
 	rows, err := r.db.Reader.QueryContext(ctx, query, arguments...)
 	if err != nil {
 		return nil, fmt.Errorf("list assets: %w", err)
@@ -299,15 +304,17 @@ func replaceTags(
 func (r *Repository) linkedCredentialMetadata(
 	ctx context.Context,
 	assetID string,
+	after string,
+	limit int,
 ) ([]credentials.Metadata, error) {
 	rows, err := r.db.Reader.QueryContext(ctx, `
 		SELECT c.id, c.space_id, c.name, c.type, c.current_version, c.deleted_at
 		FROM asset_credentials ac
 		JOIN credentials c ON c.id = ac.credential_id
-		WHERE ac.asset_id = ? AND c.deleted_at IS NULL
+		WHERE ac.asset_id = ? AND c.id > ? AND c.deleted_at IS NULL
 		ORDER BY c.id
-		LIMIT 500
-	`, assetID)
+		LIMIT ?
+	`, assetID, after, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list linked credential metadata: %w", err)
 	}

@@ -1,13 +1,17 @@
 package assets
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"slices"
 	"strings"
@@ -26,7 +30,19 @@ const (
 	maxAddresses     = 128
 	maxPorts         = 128
 	maxTags          = 64
+	listScanBatch    = 256
+	maxListScan      = 4096
+	maxCursorBytes   = 1024
+	cursorVersion    = 1
 )
+
+var strictCursorEncoding = base64.RawURLEncoding.Strict()
+
+type cursorPayload struct {
+	Version int    `json:"v"`
+	AfterID string `json:"after_id"`
+	Binding string `json:"binding"`
+}
 
 type AuditAppender interface {
 	AppendTx(context.Context, *sql.Tx, audit.Event) error
@@ -64,10 +80,16 @@ func (s *Service) List(
 	ctx context.Context,
 	principal Principal,
 	filter ListFilter,
-) ([]Asset, error) {
+) ([]Asset, string, error) {
 	filter, err := normalizeListFilter(filter)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	after, err := decodeCursor(
+		filter.After, assetListBinding(filter),
+	)
+	if err != nil {
+		return nil, "", err
 	}
 	if principal.Human != nil {
 		if err := authorize(
@@ -75,34 +97,68 @@ func (s *Service) List(
 			authorization.Resource{SpaceID: filter.SpaceID},
 			authorization.ListAsset,
 		); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	} else if principal.Agent != nil {
 		if !agentHasSpaceScope(
 			*principal.Agent, filter.SpaceID, authorization.ScopeAssetList,
 		) {
-			return nil, ErrNotFound
+			return nil, "", ErrNotFound
 		}
 	} else {
-		return nil, authorization.ErrUnauthenticated
+		return nil, "", authorization.ErrUnauthenticated
 	}
-	rows, err := s.repository.list(ctx, filter)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]Asset, 0, len(rows))
-	for _, asset := range rows {
-		if err := authorize(
-			principal, resourceForAsset(asset), authorization.ListAsset,
-		); err != nil {
-			if principal.Agent != nil && errors.Is(err, ErrNotFound) {
-				continue
-			}
-			return nil, err
+	authorized := make([]Asset, 0, filter.Limit+1)
+	scanned := 0
+	exhausted := false
+	for scanned < maxListScan && len(authorized) <= filter.Limit {
+		batchLimit := min(listScanBatch, maxListScan-scanned)
+		rows, err := s.repository.listBatch(ctx, filter, after, batchLimit)
+		if err != nil {
+			return nil, "", stableStorageError(err)
 		}
-		result = append(result, cloneAsset(asset))
+		if len(rows) == 0 {
+			exhausted = true
+			break
+		}
+		for _, asset := range rows {
+			scanned++
+			after = asset.ID
+			if err := authorize(
+				principal, resourceForAsset(asset), authorization.ListAsset,
+			); err != nil {
+				if principal.Agent != nil && errors.Is(err, ErrNotFound) {
+					continue
+				}
+				return nil, "", err
+			}
+			authorized = append(authorized, cloneAsset(asset))
+			if len(authorized) == filter.Limit+1 {
+				break
+			}
+		}
+		if len(rows) < batchLimit {
+			exhausted = true
+			break
+		}
 	}
-	return result, nil
+	if len(authorized) > filter.Limit {
+		next, err := encodeCursor(
+			authorized[filter.Limit-1].ID, assetListBinding(filter),
+		)
+		if err != nil {
+			return nil, "", ErrUnavailable
+		}
+		return authorized[:filter.Limit], next, nil
+	}
+	if exhausted {
+		return authorized, "", nil
+	}
+	next, err := encodeCursor(after, assetListBinding(filter))
+	if err != nil {
+		return nil, "", ErrUnavailable
+	}
+	return authorized, next, nil
 }
 
 func (s *Service) Get(
@@ -115,7 +171,7 @@ func (s *Service) Get(
 	}
 	asset, err := s.repository.byID(ctx, s.repository.db.Reader, assetID)
 	if err != nil {
-		return Asset{}, err
+		return Asset{}, stableStorageError(err)
 	}
 	if err := authorize(
 		principal, resourceForAsset(asset), authorization.ReadAsset,
@@ -408,6 +464,25 @@ func (s *Service) UnlinkCredential(
 		); err != nil {
 			return err
 		}
+		credentialSpaceID, credentialTags, err := credentialIdentityTx(
+			ctx, tx, credentialID,
+		)
+		if err != nil {
+			return err
+		}
+		if credentialSpaceID != asset.SpaceID {
+			return ErrCrossSpaceLink
+		}
+		if err := authorize(
+			principal,
+			authorization.Resource{
+				SpaceID: credentialSpaceID, ResourceID: credentialID,
+				Labels: credentialTags,
+			},
+			authorization.LinkCredential,
+		); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `
 			DELETE FROM asset_credentials
 			WHERE space_id = ? AND asset_id = ? AND credential_id = ?
@@ -433,41 +508,89 @@ func (s *Service) ListCredentialMetadata(
 	ctx context.Context,
 	principal Principal,
 	assetID string,
-) ([]credentials.Metadata, error) {
+	page CredentialListPage,
+) ([]credentials.Metadata, string, error) {
 	if !validIdentifier(assetID) {
-		return nil, ErrNotFound
+		return nil, "", ErrNotFound
+	}
+	page, err := normalizeCredentialListPage(page)
+	if err != nil {
+		return nil, "", err
 	}
 	asset, err := s.repository.byID(ctx, s.repository.db.Reader, assetID)
 	if err != nil {
-		return nil, err
+		return nil, "", stableStorageError(err)
 	}
 	if err := authorize(
 		principal, resourceForAsset(asset), authorization.ReadAsset,
 	); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	rows, err := s.repository.linkedCredentialMetadata(ctx, assetID)
+	binding := credentialListBinding(asset.SpaceID, asset.ID)
+	after, err := decodeCursor(page.After, binding)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	result := make([]credentials.Metadata, 0, len(rows))
-	for _, metadata := range rows {
-		if err := authorize(
-			principal,
-			authorization.Resource{
-				SpaceID: metadata.SpaceID, ResourceID: metadata.ID,
-				Labels: metadata.Tags,
-			},
-			authorization.ListCredential,
-		); err != nil {
-			if principal.Agent != nil && errors.Is(err, ErrNotFound) {
-				continue
-			}
-			return nil, err
+	authorized := make([]credentials.Metadata, 0, page.Limit+1)
+	scanned := 0
+	exhausted := false
+	for scanned < maxListScan && len(authorized) <= page.Limit {
+		batchLimit := min(listScanBatch, maxListScan-scanned)
+		rows, err := s.repository.linkedCredentialMetadata(
+			ctx, assetID, after, batchLimit,
+		)
+		if err != nil {
+			return nil, "", stableStorageError(err)
 		}
-		result = append(result, cloneCredentialMetadata(metadata))
+		if len(rows) == 0 {
+			exhausted = true
+			break
+		}
+		for _, metadata := range rows {
+			scanned++
+			after = metadata.ID
+			if err := authorize(
+				principal,
+				authorization.Resource{
+					SpaceID: metadata.SpaceID, ResourceID: metadata.ID,
+					Labels: metadata.Tags,
+				},
+				authorization.ListCredential,
+			); err != nil {
+				if principal.Agent != nil && errors.Is(err, ErrNotFound) {
+					continue
+				}
+				return nil, "", err
+			}
+			authorized = append(
+				authorized, cloneCredentialMetadata(metadata),
+			)
+			if len(authorized) == page.Limit+1 {
+				break
+			}
+		}
+		if len(rows) < batchLimit {
+			exhausted = true
+			break
+		}
 	}
-	return result, nil
+	if len(authorized) > page.Limit {
+		next, err := encodeCursor(
+			authorized[page.Limit-1].ID, binding,
+		)
+		if err != nil {
+			return nil, "", ErrUnavailable
+		}
+		return authorized[:page.Limit], next, nil
+	}
+	if exhausted {
+		return authorized, "", nil
+	}
+	next, err := encodeCursor(after, binding)
+	if err != nil {
+		return nil, "", ErrUnavailable
+	}
+	return authorized, next, nil
 }
 
 func (s *Service) appendAuditTx(
@@ -567,6 +690,28 @@ func authorize(
 	return err
 }
 
+func stableStorageError(err error) error {
+	for _, known := range []error{
+		ErrInvalidInput,
+		ErrNotFound,
+		ErrVersionConflict,
+		ErrCrossSpaceLink,
+		ErrInvalidCursor,
+		ErrUnavailable,
+		ErrAuditUnavailable,
+		authorization.ErrDenied,
+		authorization.ErrNotFound,
+		authorization.ErrUnauthenticated,
+		context.Canceled,
+		context.DeadlineExceeded,
+	} {
+		if errors.Is(err, known) {
+			return known
+		}
+	}
+	return ErrUnavailable
+}
+
 func agentHasSpaceScope(
 	principal authorization.AgentPrincipal,
 	spaceID string,
@@ -632,10 +777,99 @@ func normalizeListFilter(filter ListFilter) (ListFilter, error) {
 		!validOptionalText(filter.Environment, 128) ||
 		!validOptionalText(filter.Status, 128) ||
 		filter.Limit < 1 || filter.Limit > maxListLimit ||
+		len(filter.After) > maxCursorBytes ||
 		validateTags(filter.Tags) != nil {
 		return ListFilter{}, ErrInvalidInput
 	}
 	return filter, nil
+}
+
+func normalizeCredentialListPage(
+	page CredentialListPage,
+) (CredentialListPage, error) {
+	if page.Limit == 0 {
+		page.Limit = defaultListLimit
+	}
+	if page.Limit < 1 || page.Limit > maxListLimit ||
+		len(page.After) > maxCursorBytes {
+		return CredentialListPage{}, ErrInvalidInput
+	}
+	return page, nil
+}
+
+func assetListBinding(filter ListFilter) string {
+	return hashCursorBinding(struct {
+		SpaceID     string            `json:"space_id"`
+		Type        string            `json:"type"`
+		Environment string            `json:"environment"`
+		Status      string            `json:"status"`
+		Tags        map[string]string `json:"tags"`
+	}{
+		SpaceID: filter.SpaceID, Type: filter.Type,
+		Environment: filter.Environment, Status: filter.Status,
+		Tags: cloneTags(filter.Tags),
+	})
+}
+
+func credentialListBinding(spaceID, assetID string) string {
+	return hashCursorBinding(struct {
+		SpaceID string `json:"space_id"`
+		AssetID string `json:"asset_id"`
+	}{SpaceID: spaceID, AssetID: assetID})
+}
+
+func hashCursorBinding(value any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func encodeCursor(afterID, binding string) (string, error) {
+	if !validIdentifier(afterID) || len(binding) != sha256.Size*2 {
+		return "", ErrInvalidCursor
+	}
+	encoded, err := json.Marshal(cursorPayload{
+		Version: cursorVersion, AfterID: afterID, Binding: binding,
+	})
+	if err != nil {
+		return "", ErrInvalidCursor
+	}
+	return base64.RawURLEncoding.EncodeToString(encoded), nil
+}
+
+func decodeCursor(encoded, binding string) (string, error) {
+	if encoded == "" {
+		return "", nil
+	}
+	if len(encoded) > maxCursorBytes {
+		return "", ErrInvalidCursor
+	}
+	raw, err := strictCursorEncoding.DecodeString(encoded)
+	if err != nil ||
+		base64.RawURLEncoding.EncodeToString(raw) != encoded {
+		return "", ErrInvalidCursor
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var payload cursorPayload
+	if err := decoder.Decode(&payload); err != nil {
+		return "", ErrInvalidCursor
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return "", ErrInvalidCursor
+	}
+	canonical, err := json.Marshal(payload)
+	if err != nil || !bytes.Equal(canonical, raw) ||
+		payload.Version != cursorVersion ||
+		!validIdentifier(payload.AfterID) ||
+		payload.Binding != binding {
+		return "", ErrInvalidCursor
+	}
+	return payload.AfterID, nil
 }
 
 func validateCreateInput(input CreateInput) error {

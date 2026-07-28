@@ -209,6 +209,64 @@ func TestCredentialIdempotencyMigrationBackfillsAndClearsLegacyEnvelope(t *testi
 	}
 }
 
+func TestAssetMetadataMigrationPreservesReadableLegacyDescriptions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "asset-upgrade.db")
+	db, err := sql.Open(driverName, sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	available, err := loadMigrations(migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+			applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	for _, candidate := range available {
+		if candidate.version > 5 {
+			continue
+		}
+		mustExec(t, db, string(candidate.contents))
+		mustExec(t, db, `
+			INSERT INTO schema_migrations (version, name, checksum)
+			VALUES (?, ?, ?)
+		`, candidate.version, candidate.name, candidate.checksum)
+	}
+	mustExec(t, db, `INSERT INTO spaces (id, name) VALUES ('legacy-space', 'Legacy')`)
+	mustExec(t, db, `
+		INSERT INTO assets (id, space_id, name, type, description)
+		VALUES
+		  ('legacy-readable', 'legacy-space', 'Readable', 'server', 'Visible description'),
+		  ('legacy-null', 'legacy-space', 'Null', 'server', NULL),
+		  ('legacy-control', 'legacy-space', 'Control', 'server', ?)
+	`, "unsafe\x00description")
+
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]string{
+		"legacy-readable": "Visible description",
+		"legacy-null":     "",
+		"legacy-control":  "",
+	} {
+		var notes string
+		if err := db.QueryRow(
+			`SELECT notes FROM assets WHERE id = ?`, id,
+		).Scan(&notes); err != nil {
+			t.Fatal(err)
+		}
+		if notes != want {
+			t.Fatalf("%s notes=%q want=%q", id, notes, want)
+		}
+	}
+}
+
 func TestImmediateMigrationTransactionLocksBeforeCallback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lock.db")
 	firstDB, err := sql.Open(driverName, sqliteDSN(path))

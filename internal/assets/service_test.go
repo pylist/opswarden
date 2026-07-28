@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/netip"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -236,8 +238,8 @@ func TestAssetListsOnlyAuthorizedCredentialMetadata(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := h.service.ListCredentialMetadata(
-		h.ctx, h.labelScopedAgent, h.assetID,
+	rows, _, err := h.service.ListCredentialMetadata(
+		h.ctx, h.labelScopedAgent, h.assetID, CredentialListPage{Limit: 50},
 	)
 	if err != nil || len(rows) != 1 ||
 		rows[0].DisplayName != h.allowedDisplayName {
@@ -259,7 +261,7 @@ func TestCreateGetListAndUpdateValidatedMetadata(t *testing.T) {
 		!reflect.DeepEqual(got.Ports, []uint16{22, 443}) {
 		t.Fatalf("unexpected created asset: %+v", got)
 	}
-	rows, err := h.service.List(
+	rows, _, err := h.service.List(
 		h.ctx, h.reader, ListFilter{SpaceID: h.spaceID, Limit: 50},
 	)
 	if err != nil || len(rows) != 1 || rows[0].ID != h.assetID {
@@ -402,5 +404,426 @@ func TestReadsLegacyAssetRowsWithSQLiteDefaultTimestamps(t *testing.T) {
 	}
 	if got.Version != 1 || got.Name != "Legacy host" {
 		t.Fatalf("legacy asset=%+v", got)
+	}
+}
+
+func TestListScansPastUnauthorizedRowsBeforeApplyingPageLimit(t *testing.T) {
+	h := newAssetHarness(t)
+	insertAssets(t, h, 520, "denied")
+	insertAsset(t, h, "ast_zzzz_allowed", "allowed")
+	principal := scopedAssetAgent(map[string]string{"visibility": "allowed"})
+
+	rows, next, err := h.service.List(
+		h.ctx, principal, ListFilter{SpaceID: h.spaceID, Limit: 1},
+	)
+	if err != nil || len(rows) != 1 || rows[0].ID != "ast_zzzz_allowed" ||
+		next != "" {
+		t.Fatalf("rows=%+v next=%q err=%v", rows, next, err)
+	}
+}
+
+func TestListReturnsContinuationWhenAuthorizationScanBudgetIsExhausted(
+	t *testing.T,
+) {
+	h := newAssetHarness(t)
+	insertAssets(t, h, maxListScan, "denied")
+	insertAsset(t, h, "ast_zzzz_allowed", "allowed")
+	principal := scopedAssetAgent(map[string]string{"visibility": "allowed"})
+
+	rows, next, err := h.service.List(
+		h.ctx, principal, ListFilter{SpaceID: h.spaceID, Limit: 1},
+	)
+	if err != nil || len(rows) != 0 || next == "" {
+		t.Fatalf("first rows=%+v next=%q err=%v", rows, next, err)
+	}
+	rows, final, err := h.service.List(
+		h.ctx, principal,
+		ListFilter{SpaceID: h.spaceID, Limit: 1, After: next},
+	)
+	if err != nil || len(rows) != 1 || rows[0].ID != "ast_zzzz_allowed" ||
+		final != "" {
+		t.Fatalf("second rows=%+v next=%q err=%v", rows, final, err)
+	}
+}
+
+func TestListCursorHasNoOmissionsDuplicatesAndIsBoundToFilter(t *testing.T) {
+	h := newAssetHarness(t)
+	for index := range 5 {
+		insertAsset(
+			t, h, fmt.Sprintf("ast_page_%02d", index), "allowed",
+		)
+	}
+	principal := scopedAssetAgent(map[string]string{"visibility": "allowed"})
+	filter := ListFilter{
+		SpaceID: h.spaceID, Type: "server",
+		Tags: map[string]string{"visibility": "allowed"}, Limit: 2,
+	}
+	var ids []string
+	for {
+		rows, next, err := h.service.List(h.ctx, principal, filter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			ids = append(ids, row.ID)
+		}
+		if next == "" {
+			break
+		}
+		filter.After = next
+	}
+	if len(ids) != 5 {
+		t.Fatalf("ids=%v", ids)
+	}
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, duplicate := seen[id]; duplicate {
+			t.Fatalf("duplicate %q in %v", id, ids)
+		}
+		seen[id] = struct{}{}
+	}
+
+	first := ListFilter{
+		SpaceID: h.spaceID, Type: "server",
+		Tags: map[string]string{"visibility": "allowed"}, Limit: 1,
+	}
+	_, cursor, err := h.service.List(h.ctx, principal, first)
+	if err != nil || cursor == "" {
+		t.Fatalf("cursor=%q err=%v", cursor, err)
+	}
+	for name, changed := range map[string]ListFilter{
+		"space": {
+			SpaceID: h.otherSpaceID, Type: "server",
+			Tags:  map[string]string{"visibility": "allowed"},
+			Limit: 1, After: cursor,
+		},
+		"type": {
+			SpaceID: h.spaceID, Type: "device",
+			Tags:  map[string]string{"visibility": "allowed"},
+			Limit: 1, After: cursor,
+		},
+		"canonical": {
+			SpaceID: h.spaceID, Type: "server",
+			Tags:  map[string]string{"visibility": "allowed"},
+			Limit: 1, After: cursor + "=",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := h.service.List(
+				h.ctx, principal, changed,
+			); !errors.Is(err, ErrInvalidCursor) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}
+
+func TestCredentialMetadataScansPastUnauthorizedPrefixAndPaginates(t *testing.T) {
+	h := newAssetHarness(t)
+	insertLinkedCredentials(t, h, 520, "dev")
+	insertLinkedCredential(t, h, "crd_zzzz_allowed", "Allowed after prefix", "prod")
+
+	page := CredentialListPage{Limit: 1}
+	rows, next, err := h.service.ListCredentialMetadata(
+		h.ctx, h.labelScopedAgent, h.assetID, page,
+	)
+	if err != nil || len(rows) != 1 ||
+		rows[0].ID != "crd_zzzz_allowed" || next != "" {
+		t.Fatalf("rows=%+v next=%q err=%v", rows, next, err)
+	}
+
+	insertLinkedCredential(t, h, "crd_zzzz_allowed_2", "Allowed two", "prod")
+	rows, next, err = h.service.ListCredentialMetadata(
+		h.ctx, h.labelScopedAgent, h.assetID, page,
+	)
+	if err != nil || len(rows) != 1 || next == "" {
+		t.Fatalf("first rows=%+v next=%q err=%v", rows, next, err)
+	}
+	second, final, err := h.service.ListCredentialMetadata(
+		h.ctx, h.labelScopedAgent, h.assetID,
+		CredentialListPage{Limit: 1, After: next},
+	)
+	if err != nil || len(second) != 1 || final != "" ||
+		second[0].ID == rows[0].ID {
+		t.Fatalf("second=%+v next=%q err=%v", second, final, err)
+	}
+}
+
+func TestCredentialMetadataReturnsContinuationAtScanBudget(t *testing.T) {
+	h := newAssetHarness(t)
+	insertLinkedCredentials(t, h, maxListScan, "dev")
+	insertLinkedCredential(t, h, "crd_zzzz_allowed", "Allowed after budget", "prod")
+
+	rows, next, err := h.service.ListCredentialMetadata(
+		h.ctx, h.labelScopedAgent, h.assetID, CredentialListPage{Limit: 1},
+	)
+	if err != nil || len(rows) != 0 || next == "" {
+		t.Fatalf("first rows=%+v next=%q err=%v", rows, next, err)
+	}
+	rows, final, err := h.service.ListCredentialMetadata(
+		h.ctx, h.labelScopedAgent, h.assetID,
+		CredentialListPage{Limit: 1, After: next},
+	)
+	if err != nil || len(rows) != 1 ||
+		rows[0].ID != "crd_zzzz_allowed" || final != "" {
+		t.Fatalf("second rows=%+v next=%q err=%v", rows, final, err)
+	}
+}
+
+func TestCredentialCursorIsBoundToAssetAndSpace(t *testing.T) {
+	h := newAssetHarness(t)
+	insertLinkedCredential(t, h, "crd_cursor_1", "Cursor one", "prod")
+	insertLinkedCredential(t, h, "crd_cursor_2", "Cursor two", "prod")
+	_, cursor, err := h.service.ListCredentialMetadata(
+		h.ctx, h.labelScopedAgent, h.assetID, CredentialListPage{Limit: 1},
+	)
+	if err != nil || cursor == "" {
+		t.Fatalf("cursor=%q err=%v", cursor, err)
+	}
+	second, err := h.service.Create(h.ctx, h.owner, h.createInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.service.ListCredentialMetadata(
+		h.ctx, h.labelScopedAgent, second.ID,
+		CredentialListPage{Limit: 1, After: cursor},
+	); !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("cross-asset cursor got %v", err)
+	}
+	if _, _, err := h.service.ListCredentialMetadata(
+		h.ctx, h.labelScopedAgent, h.assetID,
+		CredentialListPage{Limit: 1, After: cursor + "="},
+	); !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("noncanonical cursor got %v", err)
+	}
+}
+
+func TestUnlinkRequiresActiveSameSpaceCredentialAndAuthorization(t *testing.T) {
+	t.Run("soft deleted credential", func(t *testing.T) {
+		h := newAssetHarness(t)
+		if err := h.service.LinkCredential(
+			h.ctx, h.owner, h.assetID, "crd_allowed",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.db.Writer.ExecContext(h.ctx, `
+			UPDATE credentials SET deleted_at = CURRENT_TIMESTAMP
+			WHERE id = 'crd_allowed'
+		`); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.service.UnlinkCredential(
+			h.ctx, h.owner, h.assetID, "crd_allowed",
+		); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("got %v", err)
+		}
+	})
+
+	t.Run("reader denied", func(t *testing.T) {
+		h := newAssetHarness(t)
+		if err := h.service.UnlinkCredential(
+			h.ctx, h.reader, h.assetID, "crd_allowed",
+		); !errors.Is(err, authorization.ErrDenied) {
+			t.Fatalf("got %v", err)
+		}
+	})
+
+	t.Run("cross Space", func(t *testing.T) {
+		h := newAssetHarness(t)
+		if err := h.service.UnlinkCredential(
+			h.ctx, h.owner, h.assetID, h.otherSpaceCredentialID,
+		); !errors.Is(err, ErrCrossSpaceLink) {
+			t.Fatalf("got %v", err)
+		}
+	})
+}
+
+func TestUnlinkAuditFailureRollsBackRelationship(t *testing.T) {
+	h := newAssetHarness(t)
+	if err := h.service.LinkCredential(
+		h.ctx, h.owner, h.assetID, "crd_allowed",
+	); err != nil {
+		t.Fatal(err)
+	}
+	h.audit.FailNext(audit.ErrAuditUnavailable)
+	if err := h.service.UnlinkCredential(
+		h.ctx, h.owner, h.assetID, "crd_allowed",
+	); !errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("got %v", err)
+	}
+	var count int
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT count(*) FROM asset_credentials
+		WHERE asset_id = ? AND credential_id = 'crd_allowed'
+	`, h.assetID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestStorageFailuresReturnStableDomainError(t *testing.T) {
+	t.Run("closed database", func(t *testing.T) {
+		h := newAssetHarness(t)
+		if err := h.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err := h.service.List(
+			h.ctx, h.reader, ListFilter{SpaceID: h.spaceID},
+		)
+		if !errors.Is(err, ErrUnavailable) ||
+			strings.Contains(strings.ToLower(err.Error()), "database") {
+			t.Fatalf("got %q", err)
+		}
+	})
+
+	t.Run("constraint trigger", func(t *testing.T) {
+		h := newAssetHarness(t)
+		if _, err := h.db.Writer.ExecContext(h.ctx, `
+			CREATE TRIGGER reject_asset_insert
+			BEFORE INSERT ON assets
+			BEGIN
+				SELECT RAISE(ABORT, 'SENSITIVE assets constraint detail');
+			END
+		`); err != nil {
+			t.Fatal(err)
+		}
+		input := h.createInput()
+		input.Name = "Rejected"
+		_, err := h.service.Create(h.ctx, h.owner, input)
+		if !errors.Is(err, ErrUnavailable) ||
+			strings.Contains(err.Error(), "SENSITIVE") ||
+			strings.Contains(strings.ToLower(err.Error()), "insert") {
+			t.Fatalf("got %q", err)
+		}
+	})
+}
+
+func scopedAssetAgent(labels map[string]string) Principal {
+	principal := agentAssetPrincipal(nil)
+	principal.Agent.Grants[0].Labels = labels
+	return principal
+}
+
+func insertAssets(t *testing.T, h *assetHarness, count int, visibility string) {
+	t.Helper()
+	tx, err := h.db.Writer.BeginTx(h.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for index := range count {
+		id := fmt.Sprintf("ast_scan_%05d", index)
+		insertAssetTx(t, h.ctx, tx, id, visibility)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertAsset(t *testing.T, h *assetHarness, id, visibility string) {
+	t.Helper()
+	tx, err := h.db.Writer.BeginTx(h.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	insertAssetTx(t, h.ctx, tx, id, visibility)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertAssetTx(
+	t *testing.T,
+	ctx context.Context,
+	tx *sql.Tx,
+	id, visibility string,
+) {
+	t.Helper()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO assets (id, space_id, name, type)
+		VALUES (?, 'spc_main', ?, 'server')
+	`, id, id); err != nil {
+		t.Fatal(err)
+	}
+	tag, err := encodeTag("visibility", visibility)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO asset_tags (asset_id, tag) VALUES (?, ?)
+	`, id, tag); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertLinkedCredentials(
+	t *testing.T,
+	h *assetHarness,
+	count int,
+	environment string,
+) {
+	t.Helper()
+	tx, err := h.db.Writer.BeginTx(h.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for index := range count {
+		id := fmt.Sprintf("crd_scan_%05d", index)
+		insertLinkedCredentialTx(
+			t, h.ctx, tx, h.assetID, id, id, environment,
+		)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertLinkedCredential(
+	t *testing.T,
+	h *assetHarness,
+	id, name, environment string,
+) {
+	t.Helper()
+	tx, err := h.db.Writer.BeginTx(h.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	insertLinkedCredentialTx(
+		t, h.ctx, tx, h.assetID, id, name, environment,
+	)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertLinkedCredentialTx(
+	t *testing.T,
+	ctx context.Context,
+	tx *sql.Tx,
+	assetID, id, name, environment string,
+) {
+	t.Helper()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO credentials (id, space_id, name, type, current_version)
+		VALUES (?, 'spc_main', ?, 'login', 1)
+	`, id, name); err != nil {
+		t.Fatal(err)
+	}
+	tag, err := encodeTag("environment", environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO credential_tags (credential_id, tag) VALUES (?, ?)
+	`, id, tag); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO asset_credentials (space_id, asset_id, credential_id)
+		VALUES ('spc_main', ?, ?)
+	`, assetID, id); err != nil {
+		t.Fatal(err)
 	}
 }

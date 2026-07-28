@@ -14,6 +14,8 @@ var (
 	ErrNotFound         = errors.New("asset not found")
 	ErrVersionConflict  = errors.New("asset version conflict")
 	ErrCrossSpaceLink   = errors.New("asset and credential belong to different Spaces")
+	ErrInvalidCursor    = errors.New("invalid asset cursor")
+	ErrUnavailable      = errors.New("asset service unavailable")
 	ErrAuditUnavailable = audit.ErrAuditUnavailable
 )
 
@@ -74,4 +76,10 @@ type ListFilter struct {
 	Status      string
 	Tags        map[string]string
 	Limit       int
+	After       string
+}
+
+type CredentialListPage struct {
+	Limit int
+	After string
 }
