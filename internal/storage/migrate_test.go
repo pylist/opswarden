@@ -40,8 +40,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := db.Writer.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	if before != 5 || after != before {
-		t.Fatalf("migration counts before/after = %d/%d, want 5/5", before, after)
+	if before != 6 || after != before {
+		t.Fatalf("migration counts before/after = %d/%d, want 6/6", before, after)
 	}
 }
 
@@ -87,8 +87,8 @@ func TestConcurrentMigrateOnIndependentDatabases(t *testing.T) {
 			if err := databases[0].QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&versions); err != nil {
 				t.Fatal(err)
 			}
-			if versions != 5 {
-				t.Fatalf("schema migration count = %d, want 5", versions)
+			if versions != 6 {
+				t.Fatalf("schema migration count = %d, want 6", versions)
 			}
 		})
 	}
@@ -584,6 +584,9 @@ func TestInitialSchemaContainsHashSoftDeleteAndLookupColumns(t *testing.T) {
 	assertColumns(t, db.Writer, "agent_tokens", "token_hash", "expires_at")
 	assertColumns(t, db.Writer, "users", "deleted_at")
 	assertColumns(t, db.Writer, "assets", "deleted_at")
+	assertColumns(t, db.Writer, "assets",
+		"hostname", "operating_system", "environment", "status",
+		"ips_json", "ports_json", "notes", "version")
 	assertColumns(t, db.Writer, "credentials", "deleted_at")
 	assertColumns(t, db.Writer, "idempotency_records", "agent_id", "endpoint", "key_hash", "expires_at")
 	assertColumns(t, db.Writer, "asset_tags", "asset_id", "tag")
