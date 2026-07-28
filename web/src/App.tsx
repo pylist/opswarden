@@ -18,6 +18,7 @@ function AppContent() {
   const [setupAvailability, setSetupAvailability] = useState<
     "loading" | "available" | "unavailable" | "forbidden"
   >("loading");
+  const [setupRequestId, setSetupRequestId] = useState("");
 
   useEffect(() => {
     const sync = () => setPath(window.location.pathname);
@@ -38,6 +39,7 @@ function AppContent() {
       })
       .catch((error) => {
         if (active) {
+          setSetupRequestId(error instanceof ApiError ? error.requestId : "");
           setSetupAvailability(
             error instanceof ApiError && error.status === 403
               ? "forbidden"
@@ -66,8 +68,8 @@ function AppContent() {
   if (path === "/setup" && setupAvailability === "available") {
     return (
       <SetupPage
-        onLogin={(completed) => {
-          if (completed) {
+        onLogin={(completed, unavailable) => {
+          if (completed || unavailable) {
             setSetupAvailability("unavailable");
           }
           navigate("/");
@@ -81,7 +83,9 @@ function AppContent() {
       onSetup={() => navigate("/setup")}
       setupNotice={
         setupAvailability === "forbidden"
-          ? "如需初始化或重置服务，请联系管理员在服务器本机操作。"
+          ? `如需初始化或重置服务，请联系管理员在服务器本机操作。${
+              setupRequestId ? `（请求编号：${setupRequestId}）` : ""
+            }`
           : undefined
       }
     />

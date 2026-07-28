@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { apiPath } from "../api/client";
 import type { ListResponse, Space } from "../api/types";
 import { useAuth } from "../auth/AuthProvider";
 import { SpaceSwitcher } from "../spaces/SpaceSwitcher";
@@ -14,10 +15,11 @@ const viewTitles: Record<View, string> = {
   members: "成员与权限",
   settings: "设置",
 };
+const views = new Set<View>(Object.keys(viewTitles) as View[]);
 
 function initialView(): View {
   const value = new URL(window.location.href).searchParams.get("view");
-  return value && value in viewTitles ? (value as View) : "overview";
+  return value && views.has(value as View) ? (value as View) : "overview";
 }
 
 export function AppShell() {
@@ -26,11 +28,12 @@ export function AppShell() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [currentSpace, setCurrentSpace] = useState<Space | null>(null);
   const menuButton = useRef<HTMLButtonElement>(null);
+  const isMobile = useMobileLayout();
 
   const closeDrawer = useCallback(() => {
     setDrawerOpen(false);
-    menuButton.current?.focus();
-  }, []);
+    if (isMobile) menuButton.current?.focus();
+  }, [isMobile]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -41,6 +44,26 @@ export function AppShell() {
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [closeDrawer, drawerOpen]);
+
+  useEffect(() => {
+    const sync = () => {
+      const next = initialView();
+      setView(next);
+      const url = new URL(window.location.href);
+      const raw = url.searchParams.get("view");
+      if (raw && !views.has(raw as View)) {
+        url.searchParams.set("view", next);
+        window.history.replaceState({}, "", `${url.pathname}${url.search}`);
+      }
+    };
+    sync();
+    window.addEventListener("popstate", sync);
+    return () => window.removeEventListener("popstate", sync);
+  }, []);
+
+  useEffect(() => {
+    if (!isMobile) setDrawerOpen(false);
+  }, [isMobile]);
 
   function navigate(next: View) {
     setView(next);
@@ -54,10 +77,11 @@ export function AppShell() {
       <Sidebar
         current={view}
         open={drawerOpen}
+        mobile={isMobile}
         onNavigate={navigate}
         onClose={closeDrawer}
       />
-      <div className="app-column">
+      <div className="app-column" inert={isMobile && drawerOpen ? true : undefined}>
         <header className="app-header">
           <button
             ref={menuButton}
@@ -73,6 +97,7 @@ export function AppShell() {
             api={api}
             currentSpace={currentSpace}
             onChange={setCurrentSpace}
+            systemRole={principal?.systemRole ?? ""}
           />
           <div className="header-account">
             <span className="account-id">{principal?.userId}</span>
@@ -114,22 +139,39 @@ function Overview({
   });
 
   useEffect(() => {
+    setMetrics({
+      credentials: "—",
+      assets: "—",
+      agents: "—",
+      audit: "—",
+    });
     if (!space) {
       return;
     }
+    const controller = new AbortController();
     let active = true;
     async function load() {
       const requests: Array<Promise<ListResponse<unknown>>> = [
-        api.request(`/api/v1/spaces/${space!.id}/credentials`),
-        api.request(`/api/v1/spaces/${space!.id}/assets`),
-        api.request("/api/v1/agents"),
-        api.request("/api/v1/audit-events"),
+        api.request(apiPath(["spaces", space!.id, "credentials"]), {
+          signal: controller.signal,
+        }),
+        api.request(apiPath(["spaces", space!.id, "assets"]), {
+          signal: controller.signal,
+        }),
+        api.request(apiPath(["agents"]), { signal: controller.signal }),
+        api.request(
+          apiPath(["audit-events"], { spaceId: space!.id }),
+          { signal: controller.signal },
+        ),
       ];
       const results = await Promise.allSettled(requests);
       if (!active) return;
       const count = (index: number) => {
         const result = results[index];
-        return result.status === "fulfilled" ? String(result.value.items.length) : "受限";
+        return result.status === "fulfilled" &&
+          Array.isArray(result.value.items)
+          ? String(result.value.items.length)
+          : "受限";
       };
       setMetrics({
         credentials: count(0),
@@ -141,8 +183,9 @@ function Overview({
     void load();
     return () => {
       active = false;
+      controller.abort();
     };
-  }, [api, space]);
+  }, [api, space?.id]);
 
   const cards = [
     ["当前页凭据", metrics.credentials, "仅统计已加载的元数据"],
@@ -172,6 +215,22 @@ function Overview({
       </section>
     </>
   );
+}
+
+function useMobileLayout() {
+  const query = "(max-width: 720px)";
+  const [mobile, setMobile] = useState(
+    () => window.matchMedia?.(query).matches ?? false,
+  );
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const media = window.matchMedia(query);
+    const update = () => setMobile(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return mobile;
 }
 
 function EmptyView({ view }: { view: View }) {

@@ -273,6 +273,40 @@ select:focus {
   height: 16px;
 }
 
+.factor-modes {
+  display: flex;
+  gap: 16px;
+  margin: 8px 0;
+  padding: 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+}
+
+.factor-modes legend {
+  padding: 0 4px;
+  color: #374151;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.factor-modes label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.factor-modes input {
+  width: 16px;
+  height: 16px;
+}
+
+.seed-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+}
+
 .app-frame {
   min-height: 100vh;
 }
@@ -336,7 +370,7 @@ select:focus {
 
 .sidebar-caption {
   margin: auto 8px 8px;
-  color: #9ca3af;
+  color: #6b7280;
   font-size: 12px;
 }
 
@@ -501,7 +535,7 @@ select:focus {
 }
 
 .metric-card span {
-  color: #9ca3af;
+  color: #6b7280;
   font-size: 12px;
 }
 
@@ -597,6 +631,14 @@ select:focus {
   .metric-grid,
   .recovery-codes {
     grid-template-columns: 1fr;
+  }
+
+  .seed-field {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .seed-field input {
+    grid-column: 1 / -1;
   }
 }
 

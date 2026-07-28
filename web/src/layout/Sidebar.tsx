@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type KeyboardEvent } from "react";
 
 export type View =
   | "overview"
@@ -22,12 +22,20 @@ const navigation: Array<{ view: View; label: string; glyph: string }> = [
 type SidebarProps = {
   current: View;
   open: boolean;
+  mobile: boolean;
   onNavigate: (view: View) => void;
   onClose: () => void;
 };
 
-export function Sidebar({ current, open, onNavigate, onClose }: SidebarProps) {
+export function Sidebar({
+  current,
+  open,
+  mobile,
+  onNavigate,
+  onClose,
+}: SidebarProps) {
   const firstLink = useRef<HTMLAnchorElement>(null);
+  const lastLink = useRef<HTMLAnchorElement>(null);
 
   useEffect(() => {
     if (open) {
@@ -35,12 +43,26 @@ export function Sidebar({ current, open, onNavigate, onClose }: SidebarProps) {
     }
   }, [open]);
 
+  function trapFocus(event: KeyboardEvent<HTMLElement>) {
+    if (!mobile || !open || event.key !== "Tab") return;
+    if (event.shiftKey && document.activeElement === firstLink.current) {
+      event.preventDefault();
+      lastLink.current?.focus();
+    } else if (!event.shiftKey && document.activeElement === lastLink.current) {
+      event.preventDefault();
+      firstLink.current?.focus();
+    }
+  }
+
+  const hidden = mobile && !open;
   return (
     <>
       <nav
         className={`sidebar ${open ? "is-open" : ""}`}
         aria-label="主导航"
-        aria-hidden={!open ? undefined : false}
+        aria-hidden={hidden ? true : undefined}
+        inert={hidden ? true : undefined}
+        onKeyDown={trapFocus}
       >
         <div className="sidebar-brand">
           <span className="brand-mark small" aria-hidden="true">O</span>
@@ -50,8 +72,15 @@ export function Sidebar({ current, open, onNavigate, onClose }: SidebarProps) {
           {navigation.map((item, index) => (
             <a
               key={item.view}
-              ref={index === 0 ? firstLink : undefined}
+              ref={
+                index === 0
+                  ? firstLink
+                  : index === navigation.length - 1
+                    ? lastLink
+                    : undefined
+              }
               href={`/?view=${item.view}`}
+              tabIndex={hidden ? -1 : 0}
               aria-current={current === item.view ? "page" : undefined}
               onClick={(event) => {
                 event.preventDefault();

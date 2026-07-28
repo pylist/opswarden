@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 
+import { formatApiError, SessionSupersededError } from "../api/client";
 import { useAuth } from "./AuthProvider";
 
 export function LoginPage({
@@ -16,6 +17,7 @@ export function LoginPage({
   const [password, setPassword] = useState("");
   const [challengeId, setChallengeId] = useState("");
   const [secondFactor, setSecondFactor] = useState("");
+  const [factorMode, setFactorMode] = useState<"totp" | "recovery">("totp");
   const [error, setError] = useState("");
   const busy = status === "authenticating";
 
@@ -28,7 +30,9 @@ export function LoginPage({
       setChallengeId(challenge.challengeId);
     } catch (reason) {
       setPassword("");
-      setError(String(reason));
+      if (!(reason instanceof SessionSupersededError)) {
+        setError(formatApiError(reason));
+      }
     }
   }
 
@@ -41,7 +45,9 @@ export function LoginPage({
       setChallengeId("");
     } catch (reason) {
       setSecondFactor("");
-      setError(String(reason));
+      if (!(reason instanceof SessionSupersededError)) {
+        setError(formatApiError(reason));
+      }
     }
   }
 
@@ -57,11 +63,41 @@ export function LoginPage({
 
         {challengeId ? (
           <form onSubmit={submitSecondFactor}>
-            <label htmlFor="second-factor">动态验证码或恢复码</label>
+            <fieldset className="factor-modes">
+              <legend>验证方式</legend>
+              <label>
+                <input
+                  type="radio"
+                  name="factor-mode"
+                  checked={factorMode === "totp"}
+                  onChange={() => {
+                    setFactorMode("totp");
+                    setSecondFactor("");
+                  }}
+                />
+                动态验证码
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="factor-mode"
+                  checked={factorMode === "recovery"}
+                  onChange={() => {
+                    setFactorMode("recovery");
+                    setSecondFactor("");
+                  }}
+                />
+                恢复码
+              </label>
+            </fieldset>
+            <label htmlFor="second-factor">
+              {factorMode === "totp" ? "动态验证码" : "恢复码"}
+            </label>
             <input
               id="second-factor"
               autoComplete="one-time-code"
-              inputMode="numeric"
+              inputMode={factorMode === "totp" ? "numeric" : "text"}
+              autoCapitalize={factorMode === "recovery" ? "characters" : "off"}
               value={secondFactor}
               onChange={(event) => setSecondFactor(event.target.value)}
               required

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 
-import type { ApiClient } from "../api/client";
+import { apiPath, formatApiError, type ApiClient } from "../api/client";
 import type { ListResponse, Space, SpaceRole } from "../api/types";
 
 const roleLabels: Record<SpaceRole, string> = {
@@ -13,33 +13,40 @@ type SpaceSwitcherProps = {
   api: ApiClient;
   currentSpace: Space | null;
   onChange: (space: Space | null) => void;
+  systemRole: string;
 };
 
 export function SpaceSwitcher({
   api,
   currentSpace,
   onChange,
+  systemRole,
 }: SpaceSwitcherProps) {
   const [spaces, setSpaces] = useState<Space[]>([]);
   const [state, setState] = useState<"loading" | "ready" | "error">("loading");
+  const [loadError, setLoadError] = useState("");
   const [initialName, setInitialName] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
 
   const load = useCallback(async () => {
     setState("loading");
+    setLoadError("");
     try {
-      const response = await api.request<ListResponse<Space>>("/api/v1/spaces");
+      const response = await api.request<ListResponse<Space>>(apiPath(["spaces"]));
+      if (
+        !Array.isArray(response.items) ||
+        !response.items.every(isSpace)
+      ) {
+        throw new Error("invalid response");
+      }
       setSpaces(response.items);
-      const requested = new URL(window.location.href).searchParams.get("space");
-      const selected =
-        response.items.find((space) => space.id === requested) ??
-        response.items.find((space) => space.id === currentSpace?.id) ??
-        response.items[0] ??
-        null;
+      const selected = selectFromLocation(response.items, currentSpace);
       onChange(selected);
+      writeSelectedSpace(selected);
       setState("ready");
-    } catch {
+    } catch (error) {
+      setLoadError(formatApiError(error));
       setState("error");
     }
   }, [api, currentSpace?.id, onChange]);
@@ -50,16 +57,21 @@ export function SpaceSwitcher({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    if (state !== "ready") return;
+    const sync = () => {
+      const selected = selectFromLocation(spaces, currentSpace);
+      onChange(selected);
+      writeSelectedSpace(selected);
+    };
+    window.addEventListener("popstate", sync);
+    return () => window.removeEventListener("popstate", sync);
+  }, [currentSpace, onChange, spaces, state]);
+
   function select(id: string) {
     const selected = spaces.find((space) => space.id === id) ?? null;
     onChange(selected);
-    const url = new URL(window.location.href);
-    if (selected) {
-      url.searchParams.set("space", selected.id);
-    } else {
-      url.searchParams.delete("space");
-    }
-    window.history.replaceState({}, "", `${url.pathname}${url.search}`);
+    writeSelectedSpace(selected);
   }
 
   async function createInitialSpace(event: FormEvent) {
@@ -68,18 +80,16 @@ export function SpaceSwitcher({
     setCreating(true);
     setCreateError("");
     try {
-      const created = await api.request<Space>("/api/v1/spaces", {
+      const created = await api.request<Space>(apiPath(["spaces"]), {
         method: "POST",
         body: { name: initialName.trim() },
       });
       setSpaces([created]);
       setInitialName("");
       onChange(created);
-      const url = new URL(window.location.href);
-      url.searchParams.set("space", created.id);
-      window.history.replaceState({}, "", `${url.pathname}${url.search}`);
+      writeSelectedSpace(created);
     } catch (error) {
-      setCreateError(String(error));
+      setCreateError(formatApiError(error));
     } finally {
       setCreating(false);
     }
@@ -91,12 +101,15 @@ export function SpaceSwitcher({
   if (state === "error") {
     return (
       <div className="switcher-error">
-        <span>空间加载失败</span>
+        <span>{loadError || "空间加载失败"}</span>
         <button type="button" onClick={() => void load()}>重新加载空间</button>
       </div>
     );
   }
   if (!spaces.length) {
+    if (systemRole !== "system_owner") {
+      return <p className="switcher-status">当前账号尚未加入任何空间。</p>;
+    }
     return (
       <form className="initial-space-form" onSubmit={createInitialSpace}>
         <label htmlFor="initial-space-name">初始空间名称</label>
@@ -133,5 +146,38 @@ export function SpaceSwitcher({
         重新加载空间
       </button>
     </div>
+  );
+}
+
+function selectFromLocation(spaces: Space[], current: Space | null) {
+  const requested = new URL(window.location.href).searchParams.get("space");
+  return (
+    spaces.find((space) => space.id === requested) ??
+    spaces.find((space) => space.id === current?.id) ??
+    spaces[0] ??
+    null
+  );
+}
+
+function writeSelectedSpace(selected: Space | null) {
+  const url = new URL(window.location.href);
+  if (selected) {
+    url.searchParams.set("space", selected.id);
+  } else {
+    url.searchParams.delete("space");
+  }
+  window.history.replaceState({}, "", `${url.pathname}${url.search}`);
+}
+
+function isSpace(value: unknown): value is Space {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<Space>;
+  return (
+    typeof candidate.id === "string" &&
+    /^[A-Za-z0-9_-]+$/.test(candidate.id) &&
+    typeof candidate.name === "string" &&
+    (candidate.role === "owner" ||
+      candidate.role === "editor" ||
+      candidate.role === "reader")
   );
 }

@@ -1,54 +1,114 @@
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 
-import { ApiClient } from "../api/client";
+import { ApiClient, ApiError, formatApiError } from "../api/client";
 import type { BootstrapResponse } from "../api/types";
+
+const base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+export function generateTOTPSeed() {
+  const bytes = new Uint8Array(20);
+  globalThis.crypto.getRandomValues(bytes);
+  let bits = 0;
+  let value = 0;
+  let result = "";
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      result += base32Alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) {
+    result += base32Alphabet[(value << (5 - bits)) & 31];
+  }
+  bytes.fill(0);
+  return result;
+}
 
 export function SetupPage({
   onLogin,
 }: {
-  onLogin: (completed: boolean) => void;
+  onLogin: (completed: boolean, unavailable?: boolean) => void;
 }) {
+  const client = useRef(new ApiClient()).current;
+  const submitting = useRef(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [totpSeed, setTotpSeed] = useState("");
+  const [totpSeed, setTotpSeed] = useState(generateTOTPSeed);
+  const [seedVisible, setSeedVisible] = useState(false);
   const [recoveryCodes, setRecoveryCodes] = useState<string[]>([]);
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
+  function clearEnrollment() {
+    setPassword("");
+    setTotpSeed("");
+    setSeedVisible(false);
+  }
+
   function leaveSetup() {
     const completed = recoveryCodes.length > 0;
     setRecoveryCodes([]);
-    setPassword("");
-    setTotpSeed("");
+    clearEnrollment();
     onLogin(completed);
   }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (submitting.current) return;
+    submitting.current = true;
     setBusy(true);
     setError("");
+    const submittedSeed = totpSeed;
     try {
-      const result = await new ApiClient().publicRequest<BootstrapResponse>(
+      const result = await client.publicRequest<BootstrapResponse>(
         "/api/v1/bootstrap/initial-owner",
         {
           method: "POST",
-          body: { email, password, totpSeed },
+          body: { email, password, totpSeed: submittedSeed },
         },
       );
-      setPassword("");
-      setTotpSeed("");
+      if (
+        typeof result.userId !== "string" ||
+        !Array.isArray(result.recoveryCodes) ||
+        !result.recoveryCodes.every(
+          (code) => typeof code === "string" && code.length > 0,
+        )
+      ) {
+        throw new ApiError("INVALID_RESPONSE", "", 502);
+      }
+      clearEnrollment();
       setRecoveryCodes(result.recoveryCodes);
     } catch (reason) {
       setPassword("");
-      const message = String(reason);
+      if (reason instanceof ApiError && reason.code === "VERSION_CONFLICT") {
+        clearEnrollment();
+        onLogin(false, true);
+        return;
+      }
+      setTotpSeed(generateTOTPSeed());
+      setSeedVisible(false);
       setError(
-        message.includes("PERMISSION_DENIED") || message.includes("权限")
-          ? "初始化只允许从服务器本机或已配置的内部网络访问。"
-          : message,
+        reason instanceof ApiError && reason.code === "PERMISSION_DENIED"
+          ? supportMessage(
+              "初始化只允许从服务器本机或已配置的内部网络访问。",
+              reason.requestId,
+            )
+          : formatApiError(reason),
       );
     } finally {
+      submitting.current = false;
       setBusy(false);
+    }
+  }
+
+  async function copySeed() {
+    try {
+      await navigator.clipboard.writeText(totpSeed);
+    } catch {
+      setError("无法访问剪贴板，请显示后手动录入。");
     }
   }
 
@@ -60,8 +120,8 @@ export function SetupPage({
         {!recoveryCodes.length ? (
           <>
             <p className="muted">
-              使用验证器生成一个 Base32 TOTP 种子并离线保存。服务端会安全验证
-              初始化是否仍被允许；已经完成初始化时不会覆盖现有管理员。
+              OpsWarden 已使用 Web Crypto 生成 160 位随机 TOTP 种子。将它手动录入
+              验证器并离线保存；种子不会进入地址栏或浏览器存储。
             </p>
             <form onSubmit={submit}>
               <label htmlFor="setup-email">管理员邮箱</label>
@@ -84,14 +144,30 @@ export function SetupPage({
                 required
               />
               <label htmlFor="totp-seed">TOTP 种子</label>
-              <input
-                id="totp-seed"
-                autoComplete="off"
-                spellCheck={false}
-                value={totpSeed}
-                onChange={(event) => setTotpSeed(event.target.value)}
-                required
-              />
+              <div className="seed-field">
+                <input
+                  id="totp-seed"
+                  type={seedVisible ? "text" : "password"}
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={totpSeed}
+                  readOnly
+                />
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => setSeedVisible((visible) => !visible)}
+                >
+                  {seedVisible ? "隐藏种子" : "显示种子"}
+                </button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void copySeed()}
+                >
+                  复制种子
+                </button>
+              </div>
               <button className="primary-button" disabled={busy} type="submit">
                 {busy ? "正在创建…" : "创建初始管理员"}
               </button>
@@ -132,4 +208,8 @@ export function SetupPage({
       </section>
     </main>
   );
+}
+
+function supportMessage(message: string, requestId: string) {
+  return requestId ? `${message}（请求编号：${requestId}）` : message;
 }
