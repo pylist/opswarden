@@ -1,4 +1,5 @@
 .superpowers/
+.worktrees/
 .env
 
 # Runtime data and sensitive material
