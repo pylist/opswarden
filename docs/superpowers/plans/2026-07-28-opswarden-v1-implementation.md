@@ -219,9 +219,9 @@ git commit -m "feat: add envelope encryption and master key validation"
 
 **Interfaces:**
 - Consumes: `config.Config.DataDir`.
-- Produces: `storage.Open(path string) (*sql.DB, error)`.
+- Produces: `storage.Open(path string) (*storage.DB, error)`, where `DB.Writer` is a single-connection write handle and `DB.Reader` is a bounded read pool.
 - Produces: `storage.Migrate(context.Context, *sql.DB) error`.
-- Produces: `storage.WithTx(ctx context.Context, db *sql.DB, fn func(*sql.Tx) error) error`.
+- Produces: `storage.WithTx(ctx context.Context, db *storage.DB, fn func(*sql.Tx) error) error`, always using `DB.Writer`.
 
 - [ ] **Step 1: Write failing migration and pragma tests**
 
@@ -249,7 +249,7 @@ Expected: compile failure because `Open` and `Migrate` are undefined.
 
 - [ ] **Step 3: Implement the schema and migration runner**
 
-The migration must encode foreign keys, unique normalized emails, immutable credential version numbers, normalized `credential_tags` and `asset_tags`, Space-local asset/credential links, hashed session/token columns, soft-delete timestamps, idempotency uniqueness `(agent_id, endpoint, key_hash)`, and indexes for Space, type, tags lookup, audit time, and expiration cleanup. `Open` must use one writer connection and a bounded reader pool.
+The migration must encode foreign keys, unique normalized emails, immutable credential version numbers, normalized `credential_tags` and `asset_tags`, Space-local asset/credential links, hashed session/token columns, soft-delete timestamps, idempotency uniqueness `(agent_id, endpoint, key_hash)`, and indexes for Space, type, tags lookup, audit time, and expiration cleanup. `Open` must return a `DB` containing one writer connection and a reader pool capped at four connections; both handles use the same SQLite file and required pragmas.
 
 - [ ] **Step 4: Verify migration idempotence and rollback**
 

@@ -12,5 +12,7 @@ master.key
 
 # Build output
 dist/
+!internal/webui/dist/
+!internal/webui/dist/**
 coverage/
 bin/
