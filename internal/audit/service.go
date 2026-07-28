@@ -44,6 +44,8 @@ type cursorPayload struct {
 	ID        string `json:"id"`
 }
 
+var strictRawBase64URL = base64.RawURLEncoding.Strict()
+
 func NewService(repository *Repository) (*Service, error) {
 	if repository == nil || repository.db == nil {
 		return nil, errors.New("audit repository is required")
@@ -220,8 +222,7 @@ func scanEvent(row rowScanner) (Event, error) {
 	event.ResourceID = resourceID.String
 	event.RequestID = metadata.RequestID
 	event.Actor = Actor{
-		Type: metadata.ActorType, TokenID: metadata.TokenID,
-		Fingerprint: metadata.Fingerprint,
+		Type: metadata.ActorType, Fingerprint: metadata.Fingerprint,
 	}
 	switch {
 	case actorUserID.Valid && !actorAgentID.Valid && metadata.ActorType == ActorUser:
@@ -282,7 +283,7 @@ func encodeCursor(event Event) (Cursor, error) {
 	if err != nil {
 		return "", ErrInvalidCursor
 	}
-	cursor := base64.RawURLEncoding.EncodeToString(encoded)
+	cursor := strictRawBase64URL.EncodeToString(encoded)
 	if len(cursor) > MaxCursorBytes {
 		return "", ErrInvalidCursor
 	}
@@ -302,8 +303,11 @@ func decodeCursor(cursor Cursor) (time.Time, string, error) {
 		}
 		return time.Time{}, "", ErrInvalidCursor
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(string(cursor))
+	decoded, err := strictRawBase64URL.DecodeString(string(cursor))
 	if err != nil || len(decoded) == 0 || len(decoded) > MaxCursorBytes {
+		return time.Time{}, "", ErrInvalidCursor
+	}
+	if strictRawBase64URL.EncodeToString(decoded) != string(cursor) {
 		return time.Time{}, "", ErrInvalidCursor
 	}
 	decoder := json.NewDecoder(bytes.NewReader(decoded))

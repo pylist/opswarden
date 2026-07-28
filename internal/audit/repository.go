@@ -22,7 +22,6 @@ type auditMetadata struct {
 	Version      int          `json:"v"`
 	RequestID    string       `json:"request_id"`
 	ActorType    ActorType    `json:"actor_type"`
-	TokenID      string       `json:"token_id"`
 	Fingerprint  string       `json:"fingerprint"`
 	SourceIP     string       `json:"source_ip"`
 	UserAgent    string       `json:"user_agent,omitempty"`
@@ -89,7 +88,6 @@ func encodeMetadata(event Event) ([]byte, error) {
 		Version:      auditMetadataVersion,
 		RequestID:    event.RequestID,
 		ActorType:    event.Actor.Type,
-		TokenID:      event.Actor.TokenID,
 		Fingerprint:  event.Actor.Fingerprint,
 		SourceIP:     event.SourceIP,
 		UserAgent:    event.UserAgent,

@@ -40,8 +40,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := db.Writer.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	if before != 3 || after != before {
-		t.Fatalf("migration counts before/after = %d/%d, want 3/3", before, after)
+	if before != 4 || after != before {
+		t.Fatalf("migration counts before/after = %d/%d, want 4/4", before, after)
 	}
 }
 
@@ -87,8 +87,8 @@ func TestConcurrentMigrateOnIndependentDatabases(t *testing.T) {
 			if err := databases[0].QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&versions); err != nil {
 				t.Fatal(err)
 			}
-			if versions != 3 {
-				t.Fatalf("schema migration count = %d, want 3", versions)
+			if versions != 4 {
+				t.Fatalf("schema migration count = %d, want 4", versions)
 			}
 		})
 	}
@@ -340,6 +340,125 @@ func TestSessionIdleMigrationBackfillsOldRowsAndEnforcesNotNull(t *testing.T) {
 		(id, user_id, token_hash, expires_at, idle_expires_at)
 		VALUES ('null-idle', 'legacy-user', X'03', '2099-01-01T00:00:00Z', NULL)`); err == nil {
 		t.Fatal("NULL session idle expiry succeeded")
+	}
+}
+
+func TestAuditOwnershipMigrationPreservesRowsStripsTokenIDAndRestrictsDeletes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit-upgrade.db")
+	db, err := sql.Open(driverName, sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	available, err := loadMigrations(migrations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundAuditMigration := false
+	mustExec(t, db, `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+			applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	for _, candidate := range available {
+		if candidate.version == 4 {
+			foundAuditMigration = true
+			continue
+		}
+		if candidate.version > 4 {
+			continue
+		}
+		mustExec(t, db, string(candidate.contents))
+		mustExec(t, db, `
+			INSERT INTO schema_migrations (version, name, checksum)
+			VALUES (?, ?, ?)
+		`, candidate.version, candidate.name, candidate.checksum)
+	}
+	if !foundAuditMigration {
+		t.Fatal("audit ownership migration 0004 not found")
+	}
+
+	mustExec(t, db, `INSERT INTO users
+		(id, email, normalized_email, password_hash, system_role)
+		VALUES ('legacy-user', 'legacy@example.com', 'legacy@example.com', X'01', 'member')`)
+	mustExec(t, db, `INSERT INTO spaces (id, name) VALUES ('legacy-space', 'Legacy')`)
+	mustExec(t, db, `INSERT INTO agents (id, name, created_by_user_id)
+		VALUES ('legacy-agent', 'Legacy Agent', 'legacy-user')`)
+	userMetadata := `{"v":1,"request_id":"request-user","actor_type":"user","token_id":"session-record","fingerprint":"0123456789abcdef","source_ip":"192.0.2.10","success":true,"change_fields":[]}`
+	agentMetadata := `{"v":1,"request_id":"request-agent","actor_type":"agent","token_id":"agent-token-record","fingerprint":"fedcba9876543210","source_ip":"192.0.2.11","success":true,"change_fields":[]}`
+	mustExec(t, db, `INSERT INTO audit_events
+		(id, space_id, actor_user_id, action, entity_type, entity_id, metadata_json, created_at)
+		VALUES ('legacy-audit-user', 'legacy-space', 'legacy-user', 'credential.read',
+			'credential', 'credential-1', ?, '2026-07-28T12:00:00.000000000Z')`,
+		userMetadata)
+	mustExec(t, db, `INSERT INTO audit_events
+		(id, space_id, actor_agent_id, action, entity_type, entity_id, metadata_json, created_at)
+		VALUES ('legacy-audit-agent', 'legacy-space', 'legacy-agent', 'credential.read',
+			'credential', 'credential-2', ?, '2026-07-28T12:00:01.000000000Z')`,
+		agentMetadata)
+
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Query(`SELECT id, metadata_json FROM audit_events ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var migratedIDs []string
+	wantMetadata := map[string]string{
+		"legacy-audit-user":  `{"v":1,"request_id":"request-user","actor_type":"user","fingerprint":"0123456789abcdef","source_ip":"192.0.2.10","success":true,"change_fields":[]}`,
+		"legacy-audit-agent": `{"v":1,"request_id":"request-agent","actor_type":"agent","fingerprint":"fedcba9876543210","source_ip":"192.0.2.11","success":true,"change_fields":[]}`,
+	}
+	for rows.Next() {
+		var id, metadata string
+		if err := rows.Scan(&id, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		migratedIDs = append(migratedIDs, id)
+		if strings.Contains(metadata, `"token_id"`) ||
+			strings.Contains(metadata, "session-record") ||
+			strings.Contains(metadata, "agent-token-record") {
+			t.Fatalf("legacy token/session record survived migration: %s", metadata)
+		}
+		if metadata != wantMetadata[id] {
+			t.Fatalf("migrated metadata for %s = %s, want %s", id, metadata, wantMetadata[id])
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(migratedIDs, ","), "legacy-audit-agent,legacy-audit-user"; got != want {
+		t.Fatalf("migrated audit IDs = %q, want %q", got, want)
+	}
+	assertColumnMissing(t, db, "audit_events", "token_id")
+
+	for name, statement := range map[string]string{
+		"user":  `DELETE FROM users WHERE id = 'legacy-user'`,
+		"agent": `DELETE FROM agents WHERE id = 'legacy-agent'`,
+		"space": `DELETE FROM spaces WHERE id = 'legacy-space'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := db.Exec(statement); err == nil {
+				t.Fatalf("physical %s delete succeeded with migrated audit history", name)
+			}
+		})
+	}
+	for name, statement := range map[string]string{
+		"user":  `UPDATE users SET deleted_at = '2026-07-28T12:30:00Z' WHERE id = 'legacy-user'`,
+		"agent": `UPDATE agents SET deleted_at = '2026-07-28T12:30:00Z' WHERE id = 'legacy-agent'`,
+		"space": `UPDATE spaces SET deleted_at = '2026-07-28T12:30:00Z' WHERE id = 'legacy-space'`,
+	} {
+		t.Run("soft_"+name, func(t *testing.T) {
+			if _, err := db.Exec(statement); err != nil {
+				t.Fatalf("soft %s delete: %v", name, err)
+			}
+		})
 	}
 }
 

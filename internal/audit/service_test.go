@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -94,20 +95,17 @@ func TestActorFingerprintIsExactlySixteenLowercaseHexCharacters(t *testing.T) {
 	}
 }
 
-func TestActorRequiresTypedIDAndSeparateTokenID(t *testing.T) {
+func TestActorRequiresTypedID(t *testing.T) {
 	for name, actor := range map[string]Actor{
 		"missing type": {
-			ID: "user-1", TokenID: "session-1", Fingerprint: "0123456789abcdef",
+			ID: "user-1", Fingerprint: "0123456789abcdef",
 		},
 		"unknown type": {
-			Type: "service", ID: "service-1", TokenID: "token-1",
+			Type: "service", ID: "service-1",
 			Fingerprint: "0123456789abcdef",
 		},
 		"missing actor ID": {
-			Type: ActorUser, TokenID: "session-1", Fingerprint: "0123456789abcdef",
-		},
-		"missing token ID": {
-			Type: ActorUser, ID: "user-1", Fingerprint: "0123456789abcdef",
+			Type: ActorUser, Fingerprint: "0123456789abcdef",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -309,6 +307,10 @@ func TestAppendTxPersistsOnlyTheTypedAllowlist(t *testing.T) {
 			t.Fatalf("metadata contains forbidden key %q: %s", forbidden, metadata)
 		}
 	}
+	wantMetadata := `{"v":1,"request_id":"request-1","actor_type":"user","fingerprint":"0123456789abcdef","source_ip":"192.0.2.10","user_agent":"OpsWarden CLI/1","success":true,"change_fields":["display_name","tags"],"reason":"approved rotation"}`
+	if metadata != wantMetadata {
+		t.Fatalf("metadata = %s, want fixed allowlist %s", metadata, wantMetadata)
+	}
 
 	rows, next, err := h.service.List(h.ctx, Filter{SpaceID: "space-1", Limit: 10})
 	if err != nil {
@@ -387,8 +389,7 @@ func TestListFiltersActorActionAndResource(t *testing.T) {
 	}
 	agentEvent := h.event("audit-agent", h.now.Add(time.Second))
 	agentEvent.Actor = Actor{
-		Type: ActorAgent, ID: "agent-1", TokenID: "agent-token-1",
-		Fingerprint: "fedcba9876543210",
+		Type: ActorAgent, ID: "agent-1", Fingerprint: "fedcba9876543210",
 	}
 	agentEvent.Action = "credential.update"
 	agentEvent.ResourceID = "credential-2"
@@ -406,6 +407,55 @@ func TestListFiltersActorActionAndResource(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != agentEvent.ID {
 		t.Fatalf("filtered rows = %+v", rows)
+	}
+}
+
+func TestAuditOwnershipRestrictsPhysicalDeleteWhileSoftDeletePreservesList(t *testing.T) {
+	h := newAuditHarness(t)
+	userEvent := h.event("audit-owned-by-user", h.now)
+	if err := h.service.RecordReadBeforeReturn(h.ctx, userEvent); err != nil {
+		t.Fatal(err)
+	}
+	agentEvent := h.event("audit-owned-by-agent", h.now.Add(time.Second))
+	agentEvent.Actor = Actor{
+		Type: ActorAgent, ID: "agent-1", Fingerprint: "fedcba9876543210",
+	}
+	if err := h.service.RecordReadBeforeReturn(h.ctx, agentEvent); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, statement := range map[string]string{
+		"user":  `DELETE FROM users WHERE id = 'user-1'`,
+		"agent": `DELETE FROM agents WHERE id = 'agent-1'`,
+		"space": `DELETE FROM spaces WHERE id = 'space-1'`,
+	} {
+		if _, err := h.db.Writer.ExecContext(h.ctx, statement); err == nil {
+			t.Fatalf("physical %s delete succeeded with audit history", name)
+		}
+	}
+	for name, statement := range map[string]string{
+		"user":  `UPDATE users SET deleted_at = '2026-07-28T12:30:00Z' WHERE id = 'user-1'`,
+		"agent": `UPDATE agents SET deleted_at = '2026-07-28T12:30:00Z' WHERE id = 'agent-1'`,
+		"space": `UPDATE spaces SET deleted_at = '2026-07-28T12:30:00Z' WHERE id = 'space-1'`,
+	} {
+		result, err := h.db.Writer.ExecContext(h.ctx, statement)
+		if err != nil {
+			t.Fatalf("soft %s delete: %v", name, err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil || changed != 1 {
+			t.Fatalf("soft %s delete changed=%d err=%v", name, changed, err)
+		}
+	}
+
+	rows, _, err := h.service.List(h.ctx, Filter{SpaceID: "space-1", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := []string{rows[0].ID, rows[1].ID}
+	want := []string{"audit-owned-by-agent", "audit-owned-by-user"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("events after soft delete = %v, want %v", got, want)
 	}
 }
 
@@ -436,6 +486,33 @@ func TestCursorDecoderRejectsMalformedNonCanonicalAndOversizedInputs(t *testing.
 				t.Fatalf("error echoed cursor")
 			}
 		})
+	}
+}
+
+func TestCursorDecoderRejectsEquivalentEncodingWithNonZeroTrailingBits(t *testing.T) {
+	h := newAuditHarness(t)
+	var nonCanonical Cursor
+	for suffixLength := 0; suffixLength < 3 && nonCanonical == ""; suffixLength++ {
+		event := h.event(
+			"audit-cursor-bits"+strings.Repeat("x", suffixLength),
+			h.now,
+		)
+		canonical, err := encodeCursor(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nonCanonical, _ = equivalentBase64URLWithNonZeroTrailingBits(canonical)
+	}
+	if nonCanonical == "" {
+		t.Fatal("could not construct equivalent non-canonical cursor")
+	}
+
+	_, _, err := h.service.List(h.ctx, Filter{
+		SpaceID: "space-1", Limit: 10, After: nonCanonical,
+	})
+
+	if !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("equivalent non-canonical cursor accepted: %q, err=%v", nonCanonical, err)
 	}
 }
 
@@ -505,7 +582,6 @@ func validEvent() Event {
 		Actor: Actor{
 			Type:        ActorUser,
 			ID:          "user-1",
-			TokenID:     "session-1",
 			Fingerprint: "0123456789abcdef",
 		},
 		Action:       "credential.read",
@@ -599,6 +675,26 @@ func (h *auditHarness) mustExec(query string, args ...any) {
 	if _, err := h.db.Writer.ExecContext(h.ctx, query, args...); err != nil {
 		panic(err)
 	}
+}
+
+func equivalentBase64URLWithNonZeroTrailingBits(canonical Cursor) (Cursor, bool) {
+	decoded, err := base64.RawURLEncoding.DecodeString(string(canonical))
+	if err != nil {
+		return "", false
+	}
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	prefix := string(canonical[:len(canonical)-1])
+	for _, replacement := range alphabet {
+		candidate := prefix + string(replacement)
+		if candidate == string(canonical) {
+			continue
+		}
+		candidateDecoded, err := base64.RawURLEncoding.DecodeString(candidate)
+		if err == nil && bytes.Equal(candidateDecoded, decoded) {
+			return Cursor(candidate), true
+		}
+	}
+	return "", false
 }
 
 var _ interface {

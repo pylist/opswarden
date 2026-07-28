@@ -48,7 +48,6 @@ var (
 type Actor struct {
 	Type        ActorType
 	ID          string
-	TokenID     string
 	Fingerprint string
 }
 
@@ -143,7 +142,7 @@ func validateActor(actor Actor) error {
 	if actor.Type != ActorUser && actor.Type != ActorAgent {
 		return ErrInvalidActor
 	}
-	if !validIdentifier(actor.ID, 256) || !validIdentifier(actor.TokenID, 256) {
+	if !validIdentifier(actor.ID, 256) {
 		return ErrInvalidActor
 	}
 	if len(actor.Fingerprint) != 16 {
