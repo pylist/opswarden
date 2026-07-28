@@ -10,6 +10,7 @@ type Operation string
 
 const (
 	OperationAuthFailure     Operation = "auth_failure"
+	OperationBootstrap       Operation = "bootstrap"
 	OperationCredentialList  Operation = "credential_list"
 	OperationCredentialRead  Operation = "credential_read"
 	OperationCredentialWrite Operation = "credential_write"
@@ -17,6 +18,7 @@ const (
 
 var allOperations = []Operation{
 	OperationAuthFailure,
+	OperationBootstrap,
 	OperationCredentialList,
 	OperationCredentialRead,
 	OperationCredentialWrite,
@@ -67,10 +69,12 @@ func NewLimiter(config LimiterConfig) *Limiter {
 	}
 	defaultCapacity := map[Operation]int{
 		OperationAuthFailure: 5, OperationCredentialList: 60,
+		OperationBootstrap:      2,
 		OperationCredentialRead: 30, OperationCredentialWrite: 20,
 	}
 	defaultRefill := map[Operation]float64{
 		OperationAuthFailure: 1.0 / 60, OperationCredentialList: 1,
+		OperationBootstrap:      1.0 / 60,
 		OperationCredentialRead: 0.5, OperationCredentialWrite: 1.0 / 3,
 	}
 	for _, operation := range allOperations {

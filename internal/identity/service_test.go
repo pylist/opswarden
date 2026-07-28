@@ -93,6 +93,90 @@ func TestCreateInitialOwnerRestrictsSourceAndPersistsApprovedArgonParameters(t *
 	}
 }
 
+func TestExistingOwnerRejectsBootstrapBeforePasswordKDF(t *testing.T) {
+	kdf := &recordingPasswordKDF{}
+	h := newIdentityHarnessWithKDF(t, kdf.derive)
+	kdf.reset()
+	_, err := h.service.CreateInitialOwner(h.ctx, CreateOwnerInput{
+		Email: "other@example.test", Password: "untrusted-password-fixture",
+		TOTPSeed: testTOTPSeed, SourceIP: netip.MustParseAddr("127.0.0.1"),
+	})
+	if !errors.Is(err, ErrInitialOwnerExists) {
+		t.Fatalf("create error=%v", err)
+	}
+	if len(kdf.calls) != 0 {
+		t.Fatalf("existing-owner path ran password KDF: %+v", kdf.calls)
+	}
+}
+
+func TestConcurrentBootstrapCreatesOneOwnerAndOneAudit(t *testing.T) {
+	h := newIdentityHarnessWithoutOwner(t)
+	auditRepository, err := audit.NewRepository(h.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(
+		h.db, cryptobox.New([32]byte{1, 2, 3, 4}), h.clock,
+		Config{
+			InternalCIDRs: []netip.Prefix{
+				netip.MustParsePrefix("10.23.0.0/16"),
+			},
+			Audit: auditRepository,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for index := range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			_, err := service.CreateInitialOwner(h.ctx, CreateOwnerInput{
+				Email:    fmt.Sprintf("owner-%d@example.test", index),
+				Password: "concurrent-bootstrap-password",
+				TOTPSeed: testTOTPSeed, SourceIP: netip.MustParseAddr("127.0.0.1"),
+				RequestID: fmt.Sprintf("req_bootstrap_%d", index),
+			})
+			results <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+	var succeeded, alreadyExists int
+	for range 2 {
+		switch err := <-results; {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrInitialOwnerExists):
+			alreadyExists++
+		default:
+			t.Fatalf("bootstrap error=%v", err)
+		}
+	}
+	if succeeded != 1 || alreadyExists != 1 {
+		t.Fatalf("success/existing=%d/%d", succeeded, alreadyExists)
+	}
+	var users, audits int
+	if err := h.db.Reader.QueryRowContext(
+		h.ctx, `SELECT count(*) FROM users`,
+	).Scan(&users); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.Reader.QueryRowContext(
+		h.ctx, `SELECT count(*) FROM audit_events WHERE action = ?`,
+		"identity.initial_owner.create",
+	).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if users != 1 || audits != 1 {
+		t.Fatalf("users/audits=%d/%d", users, audits)
+	}
+}
+
 func TestCreateInitialOwnerRollsBackWhenAuditFails(t *testing.T) {
 	h := newIdentityHarnessWithoutOwner(t)
 	service, err := NewService(
@@ -543,6 +627,37 @@ func TestAuditedRecentTOTPVerificationRollsBackPrivilegeOnAuditFailure(t *testin
 			"recent TOTP escaped audit rollback: before=%v after=%v",
 			before.RecentTOTPAt, after.RecentTOTPAt,
 		)
+	}
+}
+
+func TestAuditedLogoutRollsBackSessionRevocationWhenAuditFails(t *testing.T) {
+	h := newIdentityHarness(t)
+	session := h.login(t)
+	service, err := NewService(
+		h.db, cryptobox.New([32]byte{1, 2, 3, 4}), h.clock,
+		Config{
+			InternalCIDRs: []netip.Prefix{
+				netip.MustParsePrefix("10.23.0.0/16"),
+			},
+			Audit: failingIdentityAudit{},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = service.LogoutAudited(
+		h.ctx, session.RawToken,
+		AuthenticationContext{
+			RequestID: "req_logout", SourceIP: "127.0.0.1",
+		},
+	)
+	if !errors.Is(err, audit.ErrAuditUnavailable) {
+		t.Fatalf("logout error=%v", err)
+	}
+	if _, err := h.service.ResolveSession(
+		h.ctx, session.RawToken,
+	); err != nil {
+		t.Fatalf("session was revoked despite failed audit: %v", err)
 	}
 }
 

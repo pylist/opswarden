@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/crypto/hkdf"
 
+	"opswarden/internal/agents"
 	"opswarden/internal/audit"
 	"opswarden/internal/identity"
 	"opswarden/internal/platform"
@@ -26,6 +27,7 @@ const (
 	jwtLifetime      = 15 * time.Minute
 	jwtMaxTokenBytes = 4096
 	jwtKeyContext    = "opswarden/browser-jwt-signing/v1"
+	passwordWorkWait = 100 * time.Millisecond
 )
 
 var (
@@ -206,6 +208,64 @@ type reverifyRequest struct {
 	Code string `json:"code"`
 }
 
+type loginFailureReservation struct {
+	router    *Router
+	subject   string
+	committed bool
+}
+
+func (reservation *loginFailureReservation) Commit() {
+	if reservation != nil {
+		reservation.committed = true
+	}
+}
+
+func (reservation *loginFailureReservation) Close() {
+	if reservation == nil || reservation.committed {
+		return
+	}
+	reservation.router.deps.Limiter.Refund(
+		reservation.subject, agents.OperationAuthFailure,
+		reservation.router.deps.Clock.Now(),
+	)
+}
+
+func (router *Router) reserveLoginFailure(
+	writer http.ResponseWriter,
+	request *http.Request,
+	stage string,
+	stableIdentity string,
+) (*loginFailureReservation, bool) {
+	subject := "human-" + stage + "-ip:" +
+		requestMetadataFromContext(request.Context()).sourceIP +
+		"-principal:" + humanFingerprint(stage+":"+stableIdentity)
+	decision := router.deps.Limiter.Allow(
+		subject, agents.OperationAuthFailure, router.deps.Clock.Now(),
+	)
+	if !decision.Allowed {
+		writeRateLimitError(writer, request, decision)
+		return nil, false
+	}
+	return &loginFailureReservation{
+		router: router, subject: subject,
+	}, true
+}
+
+func (router *Router) acquirePasswordWork() bool {
+	timer := time.NewTimer(passwordWorkWait)
+	defer timer.Stop()
+	select {
+	case router.passwordWork <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (router *Router) releasePasswordWork() {
+	<-router.passwordWork
+}
+
 func (router *Router) handleBootstrap(
 	writer http.ResponseWriter,
 	request *http.Request,
@@ -221,19 +281,54 @@ func (router *Router) handleBootstrap(
 		writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
 		return
 	}
+	ownerInput := identity.CreateOwnerInput{
+		Email: input.Email, Password: input.Password, TOTPSeed: input.TOTPSeed,
+	}
+	if err := identity.ValidateInitialOwnerInput(ownerInput); err != nil {
+		writeAPIError(
+			writer, request, http.StatusBadRequest,
+			"INVALID_REQUEST", false, nil,
+		)
+		return
+	}
 	metadata := requestMetadataFromContext(request.Context())
 	sourceIP, err := netip.ParseAddr(metadata.sourceIP)
 	if err != nil {
 		writeAPIError(writer, request, http.StatusForbidden, "PERMISSION_DENIED", false, nil)
 		return
 	}
-	result, err := router.deps.Identity.CreateInitialOwner(
-		request.Context(), identity.CreateOwnerInput{
-			Email: input.Email, Password: input.Password, TOTPSeed: input.TOTPSeed,
-			SourceIP: sourceIP, RequestID: metadata.requestID,
-			UserAgent: metadata.userAgent,
-		},
+	exists, err := router.deps.Identity.HasInitialOwner(request.Context())
+	if err != nil {
+		writeDomainError(writer, request, err)
+		return
+	}
+	if exists {
+		writeDomainError(writer, request, identity.ErrInitialOwnerExists)
+		return
+	}
+	decision := router.deps.Limiter.Allow(
+		"bootstrap-ip:"+metadata.sourceIP,
+		agents.OperationBootstrap, router.deps.Clock.Now(),
 	)
+	if !decision.Allowed {
+		writeRateLimitError(writer, request, decision)
+		return
+	}
+	if !router.acquirePasswordWork() {
+		writeRateLimitError(writer, request, agents.Decision{
+			RetryAfter: time.Second,
+		})
+		return
+	}
+	ownerInput.SourceIP = sourceIP
+	ownerInput.RequestID = metadata.requestID
+	ownerInput.UserAgent = metadata.userAgent
+	result, err := func() (identity.CreateOwnerResult, error) {
+		defer router.releasePasswordWork()
+		return router.deps.Identity.CreateInitialOwner(
+			request.Context(), ownerInput,
+		)
+	}()
 	if err != nil {
 		writeDomainError(writer, request, err)
 		return
@@ -282,10 +377,16 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			},
 		)
 		if err != nil {
-			router.recordKnownAuthenticationFailure(
+			if auditErr := router.recordKnownAuthenticationFailure(
 				request, auth.actor, "auth.totp.reverify",
 				auth.human.UserID, "REVERIFY_FAILED",
-			)
+			); auditErr != nil {
+				writeAPIError(
+					writer, request, http.StatusServiceUnavailable,
+					"STORAGE_UNAVAILABLE", true, nil,
+				)
+				return
+			}
 			writeDomainError(writer, request, err)
 			return
 		}
@@ -294,10 +395,16 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			ExpiresAt: router.deps.Clock.Now().UTC().Add(jwtLifetime),
 		})
 		if err != nil {
-			router.recordKnownAuthenticationFailure(
+			if auditErr := router.recordKnownAuthenticationFailure(
 				request, auth.actor, "auth.totp.reverify",
 				auth.human.UserID, "JWT_ISSUE_FAILED",
-			)
+			); auditErr != nil {
+				writeAPIError(
+					writer, request, http.StatusServiceUnavailable,
+					"STORAGE_UNAVAILABLE", true, nil,
+				)
+				return
+			}
 			writeAPIError(
 				writer, request, http.StatusInternalServerError,
 				"INTERNAL_ERROR", false, nil,
@@ -324,16 +431,34 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			)
 			return
 		}
-		challenge, err := router.deps.Identity.BeginLogin(
-			request.Context(), input.Email, input.Password,
+		reservation, allowed := router.reserveLoginFailure(
+			writer, request, "password",
+			strings.ToLower(strings.TrimSpace(input.Email)),
 		)
+		if !allowed {
+			return
+		}
+		defer reservation.Close()
+		if !router.acquirePasswordWork() {
+			writeRateLimitError(writer, request, agents.Decision{
+				RetryAfter: time.Second,
+			})
+			return
+		}
+		challenge, err := func() (identity.LoginChallenge, error) {
+			defer router.releasePasswordWork()
+			return router.deps.Identity.BeginLogin(
+				request.Context(), input.Email, input.Password,
+			)
+		}()
 		if err != nil {
-			router.penalizeLoginFailure(
-				request, "password", errors.Is(err, identity.ErrInvalidCredentials),
-			)
-			router.recordAuthenticationFailure(
-				request, "auth.password", "INVALID_CREDENTIALS",
-			)
+			if errors.Is(err, identity.ErrInvalidCredentials) {
+				reservation.Commit()
+				router.rejectAnonymousAuthentication(
+					writer, request, "auth.password", "INVALID_CREDENTIALS",
+				)
+				return
+			}
 			writeDomainError(writer, request, err)
 			return
 		}
@@ -363,20 +488,29 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			)
 			return
 		}
+		reservation, allowed := router.reserveLoginFailure(
+			writer, request, "totp", input.ChallengeID,
+		)
+		if !allowed {
+			return
+		}
+		defer reservation.Close()
 		session, err := router.deps.Identity.CompleteLogin(
 			request.Context(), input.ChallengeID, input.SecondFactor,
 		)
 		if err != nil {
-			router.penalizeLoginFailure(
-				request, "totp",
+			authenticationFailure :=
 				errors.Is(err, identity.ErrInvalidChallenge) ||
 					errors.Is(err, identity.ErrInvalidTOTP) ||
 					errors.Is(err, identity.ErrTOTPReplay) ||
-					errors.Is(err, identity.ErrInvalidRecoveryCode),
-			)
-			router.recordAuthenticationFailure(
-				request, "auth.totp", "INVALID_SECOND_FACTOR",
-			)
+					errors.Is(err, identity.ErrInvalidRecoveryCode)
+			if authenticationFailure {
+				reservation.Commit()
+				router.rejectAnonymousAuthentication(
+					writer, request, "auth.totp", "INVALID_SECOND_FACTOR",
+				)
+				return
+			}
 			writeDomainError(writer, request, err)
 			return
 		}
@@ -438,10 +572,16 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			ExpiresAt: router.deps.Clock.Now().UTC().Add(jwtLifetime),
 		})
 		if err != nil {
-			router.recordKnownAuthenticationFailure(
+			if auditErr := router.recordKnownAuthenticationFailure(
 				request, auth.actor, "auth.refresh",
 				auth.human.UserID, "REFRESH_FAILED",
-			)
+			); auditErr != nil {
+				writeAPIError(
+					writer, request, http.StatusServiceUnavailable,
+					"STORAGE_UNAVAILABLE", true, nil,
+				)
+				return
+			}
 			writeAPIError(
 				writer, request, http.StatusInternalServerError,
 				"INTERNAL_ERROR", false, nil,
@@ -470,23 +610,29 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			)
 			return
 		}
-		if err := router.deps.Identity.Logout(
+		metadata := requestMetadataFromContext(request.Context())
+		if err := router.deps.Identity.LogoutAudited(
 			request.Context(), auth.rawSession,
+			identity.AuthenticationContext{
+				RequestID: metadata.requestID, SourceIP: metadata.sourceIP,
+				UserAgent: metadata.userAgent,
+			},
 		); err != nil {
-			router.recordKnownAuthenticationFailure(
+			if errors.Is(err, audit.ErrAuditUnavailable) {
+				writeDomainError(writer, request, err)
+				return
+			}
+			if auditErr := router.recordKnownAuthenticationFailure(
 				request, auth.actor, "auth.logout",
 				auth.human.UserID, "LOGOUT_FAILED",
-			)
+			); auditErr != nil {
+				writeAPIError(
+					writer, request, http.StatusServiceUnavailable,
+					"STORAGE_UNAVAILABLE", true, nil,
+				)
+				return
+			}
 			writeDomainError(writer, request, err)
-			return
-		}
-		if err := router.recordAuthentication(
-			request.Context(), auth.actor, "auth.logout", "user", auth.human.UserID,
-		); err != nil {
-			writeAPIError(
-				writer, request, http.StatusServiceUnavailable,
-				"STORAGE_UNAVAILABLE", true, nil,
-			)
 			return
 		}
 		writer.WriteHeader(http.StatusNoContent)
@@ -495,22 +641,6 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			writer, request, http.StatusNotFound,
 			"NOT_FOUND", false, nil,
 		)
-	}
-}
-
-func (router *Router) penalizeLoginFailure(
-	request *http.Request,
-	_ string,
-	authenticationFailure bool,
-) {
-	if !authenticationFailure {
-		return
-	}
-	reservation, _ := request.Context().Value(
-		loginReservationContextKey{},
-	).(*loginReservation)
-	if reservation != nil {
-		reservation.committed = true
 	}
 }
 

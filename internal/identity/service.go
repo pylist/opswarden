@@ -123,14 +123,18 @@ func (s *Service) CreateInitialOwner(
 	if !s.initialOwnerSourceAllowed(input.SourceIP) {
 		return CreateOwnerResult{}, ErrInitialOwnerSourceDenied
 	}
-	email := strings.TrimSpace(input.Email)
-	normalizedEmail := normalizeEmail(email)
-	seed, err := decodeTOTPSecret(input.TOTPSeed)
-	if normalizedEmail == "" || input.Password == "" || err != nil || len(seed) == 0 {
-		clear(seed)
+	if err := ValidateInitialOwnerInput(input); err != nil {
 		return CreateOwnerResult{}, ErrInvalidOwnerInput
 	}
-	clear(seed)
+	email := strings.TrimSpace(input.Email)
+	normalizedEmail := normalizeEmail(email)
+	hasUsers, err := s.repository.hasUsers(ctx)
+	if err != nil {
+		return CreateOwnerResult{}, err
+	}
+	if hasUsers {
+		return CreateOwnerResult{}, ErrInitialOwnerExists
+	}
 
 	userID, err := randomID(16)
 	if err != nil {
@@ -197,6 +201,25 @@ func (s *Service) CreateInitialOwner(
 		return CreateOwnerResult{}, err
 	}
 	return CreateOwnerResult{UserID: userID, RecoveryCodes: recoveryCodes}, nil
+}
+
+func ValidateInitialOwnerInput(input CreateOwnerInput) error {
+	email := strings.TrimSpace(input.Email)
+	if normalizeEmail(email) == "" || len(email) > 320 ||
+		input.Password == "" || len(input.Password) > 1024 ||
+		len(input.TOTPSeed) > 256 {
+		return ErrInvalidOwnerInput
+	}
+	seed, err := decodeTOTPSecret(input.TOTPSeed)
+	defer clear(seed)
+	if err != nil || len(seed) == 0 {
+		return ErrInvalidOwnerInput
+	}
+	return nil
+}
+
+func (s *Service) HasInitialOwner(ctx context.Context) (bool, error) {
+	return s.repository.hasUsers(ctx)
 }
 
 func (s *Service) BeginLogin(
@@ -365,7 +388,43 @@ func (s *Service) Logout(ctx context.Context, rawToken string) error {
 	if rawToken == "" {
 		return nil
 	}
-	return s.repository.revokeSession(ctx, rawToken, s.now())
+	return s.repository.revokeSession(ctx, rawToken, s.now(), nil)
+}
+
+func (s *Service) LogoutAudited(
+	ctx context.Context,
+	rawToken string,
+	authentication AuthenticationContext,
+) error {
+	if rawToken == "" {
+		return ErrInvalidSession
+	}
+	if s.audit == nil {
+		return audit.ErrAuditUnavailable
+	}
+	now := s.now()
+	auditID, err := randomID(16)
+	if err != nil {
+		return err
+	}
+	sessionFingerprint := sha256.Sum256([]byte(rawToken))
+	defer clear(sessionFingerprint[:])
+	return s.repository.revokeSession(
+		ctx, rawToken, now,
+		func(tx *sql.Tx, principal SessionPrincipal) error {
+			return s.audit.AppendTx(ctx, tx, audit.Event{
+				ID: auditID, RequestID: authentication.RequestID,
+				CreatedAt: now,
+				Actor: audit.Actor{
+					Type: audit.ActorUser, ID: principal.UserID,
+					Fingerprint: hex.EncodeToString(sessionFingerprint[:8]),
+				},
+				Action: "auth.logout", ResourceType: "user",
+				ResourceID: principal.UserID, SourceIP: authentication.SourceIP,
+				UserAgent: authentication.UserAgent, Success: true,
+			})
+		},
+	)
 }
 
 func (s *Service) RevokeUserSessions(ctx context.Context, userID string) error {

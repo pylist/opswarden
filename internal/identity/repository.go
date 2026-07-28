@@ -16,6 +16,16 @@ type repository struct {
 	db *storage.DB
 }
 
+func (r *repository) hasUsers(ctx context.Context) (bool, error) {
+	var exists bool
+	if err := r.db.Reader.QueryRowContext(
+		ctx, `SELECT EXISTS(SELECT 1 FROM users LIMIT 1)`,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check initial identity owner: %w", err)
+	}
+	return exists, nil
+}
+
 type userRecord struct {
 	ID           string
 	PasswordHash []byte
@@ -334,14 +344,44 @@ func querySession(ctx context.Context, tx *sql.Tx, tokenHash []byte) (sessionRec
 	return record, nil
 }
 
-func (r *repository) revokeSession(ctx context.Context, rawToken string, now time.Time) error {
+func (r *repository) revokeSession(
+	ctx context.Context,
+	rawToken string,
+	now time.Time,
+	beforeCommit func(*sql.Tx, SessionPrincipal) error,
+) error {
 	tokenHash := sha256.Sum256([]byte(rawToken))
+	defer clear(tokenHash[:])
 	return storage.WithTx(ctx, r.db, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
-			UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE token_hash = ?
+		var principal SessionPrincipal
+		if beforeCommit != nil {
+			record, err := querySession(ctx, tx, tokenHash[:])
+			if err != nil {
+				return err
+			}
+			if record.Revoked {
+				return ErrSessionRevoked
+			}
+			if !now.Before(record.ExpiresAt) || !now.Before(record.IdleExpiresAt) {
+				return ErrSessionExpired
+			}
+			principal = principalFromSession(record)
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?)
+			WHERE token_hash = ?
 		`, formatTime(now), tokenHash[:])
 		if err != nil {
 			return fmt.Errorf("revoke identity session: %w", err)
+		}
+		if beforeCommit != nil {
+			changed, err := result.RowsAffected()
+			if err != nil || changed != 1 {
+				return ErrInvalidSession
+			}
+			if err := beforeCommit(tx, principal); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

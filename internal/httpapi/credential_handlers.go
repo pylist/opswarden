@@ -214,6 +214,13 @@ func (router *Router) handleMembers(
 			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
 			return
 		}
+		if input.ExpectedVersion == 0 {
+			writeAPIError(
+				writer, request, http.StatusBadRequest,
+				"INVALID_REQUEST", false, nil,
+			)
+			return
+		}
 		member, err := router.deps.Spaces.ChangeRoleAudited(
 			request.Context(), mutation, spaceID, rest[0],
 			input.Role, input.ExpectedVersion,
@@ -229,6 +236,13 @@ func (router *Router) handleMembers(
 			writer, request, defaultBodyLimit, &input,
 		); err != nil {
 			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			return
+		}
+		if input.ExpectedVersion == 0 {
+			writeAPIError(
+				writer, request, http.StatusBadRequest,
+				"INVALID_REQUEST", false, nil,
+			)
 			return
 		}
 		if err := router.deps.Spaces.RemoveMemberAudited(

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,12 +23,14 @@ import (
 )
 
 type IdentityService interface {
+	HasInitialOwner(context.Context) (bool, error)
 	CreateInitialOwner(context.Context, identity.CreateOwnerInput) (identity.CreateOwnerResult, error)
 	BeginLogin(context.Context, string, string) (identity.LoginChallenge, error)
 	CompleteLogin(context.Context, string, string) (identity.Session, error)
 	ResolveSession(context.Context, string) (identity.SessionPrincipal, error)
 	VerifyRecentTOTPAudited(context.Context, string, string, identity.AuthenticationContext) (identity.SessionPrincipal, error)
 	Logout(context.Context, string) error
+	LogoutAudited(context.Context, string, identity.AuthenticationContext) error
 }
 
 type SpaceService interface {
@@ -101,9 +104,11 @@ type Dependencies struct {
 }
 
 type Router struct {
-	deps   Dependencies
-	jwt    *jwtSigner
-	logger *slog.Logger
+	deps            Dependencies
+	jwt             *jwtSigner
+	logger          *slog.Logger
+	authFailureGate *anonymousFailureGate
+	passwordWork    chan struct{}
 }
 
 type authentication struct {
@@ -134,6 +139,8 @@ func New(dependencies Dependencies) http.Handler {
 	clear(dependencies.MasterKey[:])
 	router := &Router{
 		deps: dependencies, jwt: signer, logger: dependencies.Logger,
+		authFailureGate: newAnonymousFailureGate(),
+		passwordWork:    make(chan struct{}, 4),
 	}
 	if err != nil {
 		router.jwt = nil
@@ -308,49 +315,98 @@ func (router *Router) recordAuthenticationFailure(
 	request *http.Request,
 	action string,
 	errorCode string,
-) {
-	if err := router.recordAuthenticationOutcome(
+) error {
+	return router.recordAuthenticationOutcome(
 		request.Context(), anonymousAuthenticationActor(), action,
 		"authentication", "", false, errorCode,
-	); err != nil {
-		router.logger.Error(
-			"authentication audit unavailable",
-			slog.String("request_id", requestID(request.Context())),
-			slog.String("action", action),
-		)
-	}
+	)
 }
 
 func (router *Router) recordKnownAuthenticationFailure(
 	request *http.Request,
 	actor audit.Actor,
 	action, resourceID, errorCode string,
-) {
-	if err := router.recordAuthenticationOutcome(
+) error {
+	return router.recordAuthenticationOutcome(
 		request.Context(), actor, action, "user", resourceID, false, errorCode,
-	); err != nil {
-		router.logger.Error(
-			"authentication audit unavailable",
-			slog.String("request_id", requestID(request.Context())),
-			slog.String("action", action),
-		)
+	)
+}
+
+func protectedAuthFailureAction(
+	request *http.Request,
+) string {
+	switch request.URL.Path {
+	case "/api/v1/auth/refresh":
+		return "auth.refresh"
+	case "/api/v1/auth/logout":
+		return "auth.logout"
+	case "/api/v1/auth/reverify":
+		return "auth.totp.reverify"
+	default:
+		return ""
 	}
 }
 
-func (router *Router) recordProtectedAuthRouteFailure(
+func (router *Router) rejectAnonymousAuthentication(
+	writer http.ResponseWriter,
 	request *http.Request,
+	fallbackAction string,
 	errorCode string,
 ) {
-	var action string
-	switch request.URL.Path {
-	case "/api/v1/auth/refresh":
-		action = "auth.refresh"
-	case "/api/v1/auth/logout":
-		action = "auth.logout"
-	case "/api/v1/auth/reverify":
-		action = "auth.totp.reverify"
-	default:
+	action := protectedAuthFailureAction(request)
+	if action == "" {
+		action = fallbackAction
+	}
+	metadata := requestMetadataFromContext(request.Context())
+	observation := router.authFailureGate.observe(
+		metadata.sourceIP+"|"+action, router.deps.Clock.Now(),
+	)
+	if observation.aggregateCount > 0 {
+		event := audit.Event{
+			ID:        strings.Replace(newRequestID(), "req_", "aud_", 1),
+			RequestID: metadata.requestID, CreatedAt: router.deps.Clock.Now().UTC(),
+			Actor:  anonymousAuthenticationActor(),
+			Action: "auth.failure.aggregate", ResourceType: "authentication",
+			ResourceID: action, SourceIP: metadata.sourceIP,
+			UserAgent: metadata.userAgent, Success: false,
+			ErrorCode: "RATE_LIMITED",
+			Reason: "operation=" + action +
+				";suppressed_count=" + strconv.FormatUint(
+				observation.aggregateCount, 10,
+			) +
+				";window_start=" + observation.aggregateStart.UTC().Format(time.RFC3339),
+		}
+		if router.deps.AuthAudit != nil {
+			if err := router.deps.AuthAudit.RecordReadBeforeReturn(
+				request.Context(), event,
+			); err != nil {
+				writeAPIError(
+					writer, request, http.StatusServiceUnavailable,
+					"STORAGE_UNAVAILABLE", true, nil,
+				)
+				return
+			}
+		}
+	}
+	if observation.rateLimited {
+		writeRateLimitError(writer, request, agents.Decision{
+			RetryAfter: observation.retryAfter,
+		})
 		return
 	}
-	router.recordAuthenticationFailure(request, action, errorCode)
+	if observation.recordIndividual {
+		if err := router.recordAuthenticationFailure(
+			request, action, errorCode,
+		); err != nil {
+			writeAPIError(
+				writer, request, http.StatusServiceUnavailable,
+				"STORAGE_UNAVAILABLE", true, nil,
+			)
+			return
+		}
+	}
+	writeAPIError(
+		writer, request, http.StatusUnauthorized,
+		"UNAUTHENTICATED", false, nil,
+	)
 }

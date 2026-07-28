@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +27,7 @@ import (
 	"opswarden/internal/credentials"
 	"opswarden/internal/identity"
 	"opswarden/internal/spaces"
+	"opswarden/internal/storage"
 )
 
 type fixedClock struct {
@@ -153,6 +156,8 @@ type fakeIdentityService struct {
 	principal     identity.SessionPrincipal
 	ownerResult   identity.CreateOwnerResult
 	ownerInput    identity.CreateOwnerInput
+	hasOwner      bool
+	ownerCalls    int
 	beginError    error
 	completeError error
 	ownerError    error
@@ -163,13 +168,17 @@ type fakeIdentityService struct {
 }
 
 type recordingAuthAudit struct {
-	events []audit.Event
+	events     []audit.Event
+	failAction string
 }
 
 func (recorder *recordingAuthAudit) RecordReadBeforeReturn(
 	_ context.Context,
 	event audit.Event,
 ) error {
+	if event.Action == recorder.failAction {
+		return audit.ErrAuditUnavailable
+	}
 	recorder.events = append(recorder.events, event)
 	return nil
 }
@@ -216,12 +225,27 @@ func (service *fakeIdentityService) Logout(context.Context, string) error {
 	return service.logoutError
 }
 
+func (service *fakeIdentityService) LogoutAudited(
+	context.Context,
+	string,
+	identity.AuthenticationContext,
+) error {
+	return service.logoutError
+}
+
 func (service *fakeIdentityService) CreateInitialOwner(
 	_ context.Context,
 	input identity.CreateOwnerInput,
 ) (identity.CreateOwnerResult, error) {
+	service.ownerCalls++
 	service.ownerInput = input
 	return service.ownerResult, service.ownerError
+}
+
+func (service *fakeIdentityService) HasInitialOwner(
+	context.Context,
+) (bool, error) {
+	return service.hasOwner, nil
 }
 
 func (service *fakeIdentityService) VerifyRecentTOTPAudited(
@@ -271,6 +295,48 @@ func TestBootstrapCreatesInitialOwnerOnlyFromRequestSource(t *testing.T) {
 	}
 	if got := response.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control=%q", got)
+	}
+}
+
+func TestBootstrapExistingOwnerSkipsExpensiveCreation(t *testing.T) {
+	service := &fakeIdentityService{hasOwner: true}
+	handler := New(Dependencies{
+		Identity: service, Clock: &fixedClock{now: time.Now().UTC()},
+		MasterKey: [32]byte{1},
+	})
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/v1/bootstrap/initial-owner",
+		strings.NewReader(
+			`{"email":"owner@example.test","password":"strong-password",`+
+				`"totpSeed":"JBSWY3DPEHPK3PXP"}`,
+		),
+	)
+	request.RemoteAddr = "127.0.0.1:4444"
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if service.ownerCalls != 0 {
+		t.Fatalf("existing owner reached expensive create %d times", service.ownerCalls)
+	}
+	invalid := httptest.NewRequest(
+		http.MethodPost, "/api/v1/bootstrap/initial-owner",
+		strings.NewReader(
+			`{"email":"owner@example.test","password":"strong-password",`+
+				`"totpSeed":"not-base32"}`,
+		),
+	)
+	invalid.RemoteAddr = "127.0.0.1:4444"
+	invalid.Header.Set("Content-Type", "application/json")
+	invalidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidResponse, invalid)
+	if invalidResponse.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"invalid status=%d body=%s",
+			invalidResponse.Code, invalidResponse.Body.String(),
+		)
 	}
 }
 
@@ -457,7 +523,7 @@ func TestFailedAuthenticationAuditNeverContainsSubmittedCredentials(t *testing.T
 	}
 }
 
-func TestProtectedAuthRouteFailureHasJWTAndRouteSpecificAudit(t *testing.T) {
+func TestProtectedAuthRouteFailureHasOneRouteSpecificAudit(t *testing.T) {
 	recorder := &recordingAuthAudit{}
 	handler := New(Dependencies{
 		Identity: &fakeIdentityService{}, AuthAudit: recorder,
@@ -471,11 +537,154 @@ func TestProtectedAuthRouteFailureHasJWTAndRouteSpecificAudit(t *testing.T) {
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
-	if len(recorder.events) != 2 ||
-		recorder.events[0].Action != "auth.jwt" ||
-		recorder.events[1].Action != "auth.logout" ||
-		recorder.events[1].Success {
+	if len(recorder.events) != 1 ||
+		recorder.events[0].Action != "auth.logout" ||
+		recorder.events[0].Success {
 		t.Fatalf("failure audits=%+v", recorder.events)
+	}
+}
+
+func TestRequiredAuthenticationFailureAuditFailsClosed(t *testing.T) {
+	recorder := &recordingAuthAudit{failAction: "auth.jwt"}
+	handler := New(Dependencies{
+		Identity: &fakeIdentityService{}, AuthAudit: recorder,
+		Clock: &fixedClock{now: time.Now().UTC()}, MasterKey: [32]byte{1},
+	})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"STORAGE_UNAVAILABLE"`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAnonymousAuthenticationFloodHasBoundedDurableAudit(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "auth-gate.db")
+	db, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	auditRepository, err := audit.NewRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditService, err := audit.NewService(auditRepository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	identityService := &fakeIdentityService{
+		session: identity.Session{
+			RawToken: "opaque-session-token", ExpiresAt: now.Add(time.Hour),
+		},
+		principal: identity.SessionPrincipal{
+			UserID: "usr_test", SessionID: "ses_test", IssuedAt: now,
+		},
+	}
+	if _, err := db.Writer.Exec(`
+		INSERT INTO users
+			(id, email, normalized_email, password_hash, system_role)
+		VALUES ('usr_test', 'user@example.test', 'user@example.test', X'01', 'member')
+	`); err != nil {
+		t.Fatal(err)
+	}
+	clock := &fixedClock{now: now}
+	handler := New(Dependencies{
+		Identity: identityService, Spaces: fakeSpaceService{},
+		AuthAudit: auditService, Clock: clock,
+		MasterKey: [32]byte{1},
+	})
+	const tokenFixture = "invalid-jwt-fixture-must-not-persist"
+	var limited int
+	for range 100 {
+		request := httptest.NewRequest(
+			http.MethodGet, "/api/v1/me?leak-query=true", nil,
+		)
+		request.RemoteAddr = "198.51.100.10:4242"
+		request.Header.Set("Authorization", "Bearer "+tokenFixture)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code == http.StatusTooManyRequests {
+			limited++
+		}
+	}
+	if limited == 0 {
+		t.Fatal("anonymous authentication flood was never rate limited")
+	}
+	var rows int
+	if err := db.Reader.QueryRow(`
+		SELECT count(*) FROM audit_events
+	`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows > 8 {
+		t.Fatalf("audit rows grew with request count: %d", rows)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/me", nil)
+	request.RemoteAddr = "198.51.100.11:4242"
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("different-IP status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := db.Writer.Exec(`CREATE TABLE auth_gate_probe (id INTEGER)`); err != nil {
+		t.Fatalf("audit flood made writer unavailable: %v", err)
+	}
+	jwt, err := handler.(*Router).jwt.sign(
+		identityService.principal.UserID, identityService.session,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	success := serveAuthorized(
+		handler, jwt, http.MethodGet, "/api/v1/me", nil,
+	)
+	if success.Code != http.StatusOK {
+		t.Fatalf("valid JWT blocked by failure quota: %d %s", success.Code, success.Body.String())
+	}
+	clock.now = clock.now.Add(anonymousFailureWindow)
+	rollover := httptest.NewRequest(
+		http.MethodGet, "/api/v1/me?still-not-persisted=true", nil,
+	)
+	rollover.RemoteAddr = "198.51.100.10:4242"
+	rollover.Header.Set("Authorization", "Bearer "+tokenFixture)
+	rolloverResponse := httptest.NewRecorder()
+	handler.ServeHTTP(rolloverResponse, rollover)
+	if rolloverResponse.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"rollover status=%d body=%s",
+			rolloverResponse.Code, rolloverResponse.Body.String(),
+		)
+	}
+	aggregateEvents, _, err := auditService.List(
+		context.Background(), audit.Filter{Action: "auth.failure.aggregate"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aggregateEvents) != 1 ||
+		!strings.Contains(aggregateEvents[0].Reason, "suppressed_count=95") {
+		t.Fatalf("aggregate audits=%+v", aggregateEvents)
+	}
+	if _, err := db.Writer.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []string{
+		tokenFixture, "leak-query", "still-not-persisted",
+	} {
+		if bytes.Contains(raw, []byte(fixture)) {
+			t.Fatalf("authentication aggregate leaked %q", fixture)
+		}
 	}
 }
 
@@ -503,6 +712,22 @@ func TestKnownLogoutFailureKeepsUserAuditActor(t *testing.T) {
 		logoutEvent.Actor.ID != service.principal.UserID ||
 		logoutEvent.Success {
 		t.Fatalf("logout audit=%+v events=%+v", logoutEvent, recorder.events)
+	}
+}
+
+func TestKnownAuthenticationFailureAuditUnavailableReturns503(t *testing.T) {
+	handler, token, service := authenticatedTestHandler(
+		t, &fakeCredentialService{}, nil,
+	)
+	recorder := &recordingAuthAudit{failAction: "auth.logout"}
+	handler.(*Router).deps.AuthAudit = recorder
+	service.logoutError = errors.New("logout unavailable")
+	response := serveAuthorized(
+		handler, token, http.MethodPost, "/api/v1/auth/logout", nil,
+	)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"STORAGE_UNAVAILABLE"`) {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -770,6 +995,39 @@ func TestSpaceMemberRESTIsBoundToPathSpaceAndVersioned(t *testing.T) {
 	}
 }
 
+func TestSpaceMemberMutationRejectsZeroExpectedVersionAsInvalidRequest(t *testing.T) {
+	handler, token, _ := authenticatedTestHandler(
+		t, &fakeCredentialService{}, nil,
+	)
+	tests := []struct {
+		method string
+		body   string
+	}{
+		{
+			method: http.MethodPatch,
+			body:   `{"role":"editor","expectedVersion":0}`,
+		},
+		{
+			method: http.MethodDelete,
+			body:   `{"expectedVersion":0}`,
+		},
+	}
+	for _, test := range tests {
+		response := serveAuthorized(
+			handler, token, test.method,
+			"/api/v1/spaces/spc_test/members/member",
+			strings.NewReader(test.body),
+		)
+		if response.Code != http.StatusBadRequest ||
+			!strings.Contains(response.Body.String(), `"code":"INVALID_REQUEST"`) {
+			t.Fatalf(
+				"%s status=%d body=%s",
+				test.method, response.Code, response.Body.String(),
+			)
+		}
+	}
+}
+
 func TestCredentialPathSpaceMismatchIsConcealed(t *testing.T) {
 	fixture := "fixture-password-must-not-appear"
 	handler, token, _ := authenticatedTestHandler(
@@ -909,6 +1167,36 @@ type blockingIdentityService struct {
 	calls   int
 }
 
+type blockingBootstrapIdentityService struct {
+	*fakeIdentityService
+	release chan struct{}
+	mu      sync.Mutex
+	calls   int
+}
+
+func (service *blockingBootstrapIdentityService) CreateInitialOwner(
+	context.Context,
+	identity.CreateOwnerInput,
+) (identity.CreateOwnerResult, error) {
+	service.mu.Lock()
+	service.calls++
+	service.mu.Unlock()
+	<-service.release
+	return identity.CreateOwnerResult{}, identity.ErrInvalidOwnerInput
+}
+
+type blockingEOFReader struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (reader *blockingEOFReader) Read([]byte) (int, error) {
+	reader.once.Do(func() { close(reader.started) })
+	<-reader.release
+	return 0, io.EOF
+}
+
 func (service *blockingIdentityService) BeginLogin(
 	context.Context,
 	string,
@@ -968,6 +1256,188 @@ func TestLoginFailureReservationBlocksConcurrentAuthenticationBurst(t *testing.T
 	close(service.release)
 	if response := <-firstResult; response.Code != http.StatusUnauthorized {
 		t.Fatalf("first status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestSlowLoginBodyDoesNotReserveAuthenticationFailureCapacity(t *testing.T) {
+	handler := loginLimitTestHandler(t, &fakeIdentityService{}, nil)
+	reader := &blockingEOFReader{
+		started: make(chan struct{}), release: make(chan struct{}),
+	}
+	firstResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		request := httptest.NewRequest(
+			http.MethodPost, "/api/v1/auth/login/begin", reader,
+		)
+		request.RemoteAddr = "198.51.100.10:4242"
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		firstResult <- response
+	}()
+	<-reader.started
+	second := postLoginBegin(
+		handler, `{"email":"other@example.test","password":"good"}`,
+		"198.51.100.10:4242", "",
+	)
+	if second.Code != http.StatusOK {
+		t.Fatalf(
+			"slow body reserved auth capacity: status=%d body=%s",
+			second.Code, second.Body.String(),
+		)
+	}
+	close(reader.release)
+	if first := <-firstResult; first.Code != http.StatusBadRequest {
+		t.Fatalf("slow request status=%d body=%s", first.Code, first.Body.String())
+	}
+}
+
+func TestLoginFailureQuotaSeparatesAccountsBehindOneNAT(t *testing.T) {
+	handler := loginLimitTestHandler(
+		t, &fakeIdentityService{beginError: identity.ErrInvalidCredentials}, nil,
+	)
+	first := postLoginBegin(
+		handler, `{"email":"first@example.test","password":"bad"}`,
+		"198.51.100.10:4242", "",
+	)
+	second := postLoginBegin(
+		handler, `{"email":"second@example.test","password":"bad"}`,
+		"198.51.100.10:4242", "",
+	)
+	if first.Code != http.StatusUnauthorized ||
+		second.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"NAT account statuses=(%d,%d) bodies=(%s,%s)",
+			first.Code, second.Code, first.Body.String(), second.Body.String(),
+		)
+	}
+}
+
+func TestPasswordKDFConcurrencyIsGloballyBounded(t *testing.T) {
+	service := &blockingIdentityService{
+		fakeIdentityService: &fakeIdentityService{},
+		started:             make(chan struct{}),
+		release:             make(chan struct{}),
+	}
+	handler := loginLimitTestHandler(t, service, nil)
+	const attempts = 12
+	results := make(chan int, attempts)
+	var workers sync.WaitGroup
+	for index := range attempts {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			request := httptest.NewRequest(
+				http.MethodPost, "/api/v1/auth/login/begin",
+				strings.NewReader(
+					fmt.Sprintf(
+						`{"email":"user-%d@example.test","password":"bad"}`,
+						index,
+					),
+				),
+			)
+			request.RemoteAddr = fmt.Sprintf("198.51.100.%d:4242", index+1)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			results <- response.Code
+		}()
+	}
+	time.Sleep(250 * time.Millisecond)
+	service.mu.Lock()
+	calls := service.calls
+	service.mu.Unlock()
+	close(service.release)
+	workers.Wait()
+	close(results)
+	if calls > 4 {
+		t.Fatalf("concurrent password KDF calls=%d, want <=4", calls)
+	}
+	var limited int
+	for status := range results {
+		if status == http.StatusTooManyRequests {
+			limited++
+		}
+	}
+	if limited == 0 {
+		t.Fatal("password KDF saturation never returned 429")
+	}
+}
+
+func TestBootstrapKDFConcurrencyAndIPQuotaAreIndependent(t *testing.T) {
+	service := &blockingBootstrapIdentityService{
+		fakeIdentityService: &fakeIdentityService{},
+		release:             make(chan struct{}),
+	}
+	handler := loginLimitTestHandler(t, service, nil)
+	const attempts = 12
+	results := make(chan int, attempts)
+	var workers sync.WaitGroup
+	for index := range attempts {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			request := httptest.NewRequest(
+				http.MethodPost, "/api/v1/bootstrap/initial-owner",
+				strings.NewReader(
+					fmt.Sprintf(
+						`{"email":"owner-%d@example.test",`+
+							`"password":"strong-password",`+
+							`"totpSeed":"JBSWY3DPEHPK3PXP"}`,
+						index,
+					),
+				),
+			)
+			request.RemoteAddr = fmt.Sprintf("127.0.0.%d:4242", index+1)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			results <- response.Code
+		}()
+	}
+	time.Sleep(250 * time.Millisecond)
+	service.mu.Lock()
+	calls := service.calls
+	service.mu.Unlock()
+	close(service.release)
+	workers.Wait()
+	close(results)
+	if calls > 4 {
+		t.Fatalf("concurrent bootstrap KDF calls=%d, want <=4", calls)
+	}
+	var limited int
+	for status := range results {
+		if status == http.StatusTooManyRequests {
+			limited++
+		}
+	}
+	if limited == 0 {
+		t.Fatal("bootstrap KDF saturation never returned 429")
+	}
+
+	failing := &fakeIdentityService{ownerError: identity.ErrInvalidOwnerInput}
+	quotaHandler := loginLimitTestHandler(t, failing, nil)
+	for index := range 3 {
+		response := postBootstrap(
+			quotaHandler, "127.0.0.20:4242", index,
+		)
+		want := http.StatusBadRequest
+		if index == 2 {
+			want = http.StatusTooManyRequests
+		}
+		if response.Code != want {
+			t.Fatalf(
+				"same-IP attempt %d status=%d body=%s",
+				index+1, response.Code, response.Body.String(),
+			)
+		}
+	}
+	otherIP := postBootstrap(quotaHandler, "127.0.0.21:4242", 4)
+	if otherIP.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"different-IP status=%d body=%s",
+			otherIP.Code, otherIP.Body.String(),
+		)
 	}
 }
 
@@ -1059,6 +1529,29 @@ func postLoginBegin(
 	if forwardedFor != "" {
 		request.Header.Set("X-Forwarded-For", forwardedFor)
 	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func postBootstrap(
+	handler http.Handler,
+	remoteAddr string,
+	index int,
+) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(
+		http.MethodPost, "/api/v1/bootstrap/initial-owner",
+		strings.NewReader(
+			fmt.Sprintf(
+				`{"email":"owner-%d@example.test",`+
+					`"password":"strong-password",`+
+					`"totpSeed":"JBSWY3DPEHPK3PXP"}`,
+				index,
+			),
+		),
+	)
+	request.RemoteAddr = remoteAddr
+	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response

@@ -21,12 +21,6 @@ type responseCapture struct {
 	status int
 }
 
-type loginReservation struct {
-	committed bool
-}
-
-type loginReservationContextKey struct{}
-
 func (capture *responseCapture) WriteHeader(status int) {
 	if capture.status == 0 {
 		capture.status = status
@@ -110,38 +104,7 @@ func (router *Router) loggingMiddleware(next http.Handler) http.Handler {
 }
 
 func (router *Router) rateLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method == http.MethodPost &&
-			(request.URL.Path == "/api/v1/auth/login/begin" ||
-				request.URL.Path == "/api/v1/auth/login/complete") {
-			stage := "password"
-			if request.URL.Path == "/api/v1/auth/login/complete" {
-				stage = "totp"
-			}
-			subject := loginRateSubject(request, stage)
-			decision := router.deps.Limiter.Allow(
-				subject, agents.OperationAuthFailure, router.deps.Clock.Now(),
-			)
-			if !decision.Allowed {
-				writeRateLimitError(writer, request, decision)
-				return
-			}
-			reservation := &loginReservation{}
-			ctx := context.WithValue(
-				request.Context(), loginReservationContextKey{}, reservation,
-			)
-			defer func() {
-				if !reservation.committed {
-					router.deps.Limiter.Refund(
-						subject, agents.OperationAuthFailure,
-						router.deps.Clock.Now(),
-					)
-				}
-			}()
-			request = request.WithContext(ctx)
-		}
-		next.ServeHTTP(writer, request)
-	})
+	return next
 }
 
 func (router *Router) authenticationMiddleware(next http.Handler) http.Handler {
@@ -156,53 +119,23 @@ func (router *Router) authenticationMiddleware(next http.Handler) http.Handler {
 		}
 		raw, ok := bearerToken(request.Header.Values("Authorization"))
 		if !ok {
-			router.recordAuthenticationFailure(
-				request, "auth.jwt", "MISSING_OR_INVALID_BEARER",
-			)
-			router.recordProtectedAuthRouteFailure(
-				request, "MISSING_OR_INVALID_BEARER",
-			)
-			writeAPIError(
-				writer, request, http.StatusUnauthorized,
-				"UNAUTHENTICATED", false, nil,
+			router.rejectAnonymousAuthentication(
+				writer, request, "auth.jwt", "MISSING_OR_INVALID_BEARER",
 			)
 			return
 		}
 		var authenticated authentication
 		if strings.HasPrefix(raw, "owat_") {
 			if router.deps.Agents == nil || !routeAllowsAgent(request) {
-				router.recordAuthenticationFailure(
-					request, "auth.agent", "INVALID_AGENT_BEARER",
-				)
-				router.recordProtectedAuthRouteFailure(
-					request, "INVALID_AGENT_BEARER",
-				)
-				writeAPIError(
-					writer, request, http.StatusUnauthorized,
-					"UNAUTHENTICATED", false, nil,
+				router.rejectAnonymousAuthentication(
+					writer, request, "auth.agent", "INVALID_AGENT_BEARER",
 				)
 				return
 			}
 			principal, err := router.deps.Agents.Authenticate(request.Context(), raw)
 			if err != nil {
-				subject := "agent-auth-ip:" +
-					requestMetadataFromContext(request.Context()).sourceIP
-				decision := router.deps.Limiter.Allow(
-					subject, agents.OperationAuthFailure, router.deps.Clock.Now(),
-				)
-				if !decision.Allowed {
-					writeRateLimitError(writer, request, decision)
-					return
-				}
-				router.recordAuthenticationFailure(
-					request, "auth.agent", "INVALID_AGENT_BEARER",
-				)
-				router.recordProtectedAuthRouteFailure(
-					request, "INVALID_AGENT_BEARER",
-				)
-				writeAPIError(
-					writer, request, http.StatusUnauthorized,
-					"UNAUTHENTICATED", false, nil,
+				router.rejectAnonymousAuthentication(
+					writer, request, "auth.agent", "INVALID_AGENT_BEARER",
 				)
 				return
 			}
@@ -220,29 +153,15 @@ func (router *Router) authenticationMiddleware(next http.Handler) http.Handler {
 			}
 		} else {
 			if router.jwt == nil || router.deps.Identity == nil {
-				router.recordAuthenticationFailure(
-					request, "auth.jwt", "JWT_UNAVAILABLE",
-				)
-				router.recordProtectedAuthRouteFailure(
-					request, "JWT_UNAVAILABLE",
-				)
-				writeAPIError(
-					writer, request, http.StatusUnauthorized,
-					"UNAUTHENTICATED", false, nil,
+				router.rejectAnonymousAuthentication(
+					writer, request, "auth.jwt", "JWT_UNAVAILABLE",
 				)
 				return
 			}
 			claims, err := router.jwt.verify(raw)
 			if err != nil {
-				router.recordAuthenticationFailure(
-					request, "auth.jwt", "INVALID_JWT",
-				)
-				router.recordProtectedAuthRouteFailure(
-					request, "INVALID_JWT",
-				)
-				writeAPIError(
-					writer, request, http.StatusUnauthorized,
-					"UNAUTHENTICATED", false, nil,
+				router.rejectAnonymousAuthentication(
+					writer, request, "auth.jwt", "INVALID_JWT",
 				)
 				return
 			}
@@ -250,15 +169,8 @@ func (router *Router) authenticationMiddleware(next http.Handler) http.Handler {
 				request.Context(), claims.Session,
 			)
 			if err != nil || session.UserID != claims.Subject {
-				router.recordAuthenticationFailure(
-					request, "auth.jwt", "INVALID_SESSION",
-				)
-				router.recordProtectedAuthRouteFailure(
-					request, "INVALID_SESSION",
-				)
-				writeAPIError(
-					writer, request, http.StatusUnauthorized,
-					"UNAUTHENTICATED", false, nil,
+				router.rejectAnonymousAuthentication(
+					writer, request, "auth.jwt", "INVALID_SESSION",
 				)
 				return
 			}
@@ -445,11 +357,6 @@ func addressInPrefixes(address netip.Addr, prefixes []netip.Prefix) bool {
 		}
 	}
 	return false
-}
-
-func loginRateSubject(request *http.Request, stage string) string {
-	return "human-" + stage + "-ip:" +
-		requestMetadataFromContext(request.Context()).sourceIP
 }
 
 func safeUserAgent(value string) string {
