@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -195,6 +196,54 @@ type completeLoginRequest struct {
 	SecondFactor string `json:"secondFactor"`
 }
 
+type bootstrapRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	TOTPSeed string `json:"totpSeed"`
+}
+
+type reverifyRequest struct {
+	Code string `json:"code"`
+}
+
+func (router *Router) handleBootstrap(
+	writer http.ResponseWriter,
+	request *http.Request,
+) {
+	if request.Method != http.MethodPost || router.deps.Identity == nil {
+		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
+		return
+	}
+	var input bootstrapRequest
+	if err := decodeJSONBody(
+		writer, request, defaultBodyLimit, &input,
+	); err != nil {
+		writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+		return
+	}
+	metadata := requestMetadataFromContext(request.Context())
+	sourceIP, err := netip.ParseAddr(metadata.sourceIP)
+	if err != nil {
+		writeAPIError(writer, request, http.StatusForbidden, "PERMISSION_DENIED", false, nil)
+		return
+	}
+	result, err := router.deps.Identity.CreateInitialOwner(
+		request.Context(), identity.CreateOwnerInput{
+			Email: input.Email, Password: input.Password, TOTPSeed: input.TOTPSeed,
+			SourceIP: sourceIP, RequestID: metadata.requestID,
+			UserAgent: metadata.userAgent,
+		},
+	)
+	if err != nil {
+		writeDomainError(writer, request, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, struct {
+		UserID        string   `json:"userId"`
+		RecoveryCodes []string `json:"recoveryCodes"`
+	}{UserID: result.UserID, RecoveryCodes: result.RecoveryCodes})
+}
+
 func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Request) {
 	if router.deps.Identity == nil || router.jwt == nil {
 		writeAPIError(
@@ -204,6 +253,65 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 		return
 	}
 	switch {
+	case request.URL.Path == "/api/v1/auth/reverify" &&
+		request.Method == http.MethodPost:
+		auth, ok := request.Context().Value(authenticationKey).(authentication)
+		if !ok || auth.human == nil || auth.rawSession == "" {
+			writeAPIError(
+				writer, request, http.StatusUnauthorized,
+				"UNAUTHENTICATED", false, nil,
+			)
+			return
+		}
+		var input reverifyRequest
+		if err := decodeJSONBody(
+			writer, request, defaultBodyLimit, &input,
+		); err != nil {
+			writeAPIError(
+				writer, request, http.StatusBadRequest,
+				"INVALID_REQUEST", false, nil,
+			)
+			return
+		}
+		metadata := requestMetadataFromContext(request.Context())
+		principal, err := router.deps.Identity.VerifyRecentTOTPAudited(
+			request.Context(), auth.rawSession, input.Code,
+			identity.AuthenticationContext{
+				RequestID: metadata.requestID, SourceIP: metadata.sourceIP,
+				UserAgent: metadata.userAgent,
+			},
+		)
+		if err != nil {
+			router.recordKnownAuthenticationFailure(
+				request, auth.actor, "auth.totp.reverify",
+				auth.human.UserID, "REVERIFY_FAILED",
+			)
+			writeDomainError(writer, request, err)
+			return
+		}
+		token, err := router.jwt.sign(principal.UserID, identity.Session{
+			RawToken:  auth.rawSession,
+			ExpiresAt: router.deps.Clock.Now().UTC().Add(jwtLifetime),
+		})
+		if err != nil {
+			router.recordKnownAuthenticationFailure(
+				request, auth.actor, "auth.totp.reverify",
+				auth.human.UserID, "JWT_ISSUE_FAILED",
+			)
+			writeAPIError(
+				writer, request, http.StatusInternalServerError,
+				"INTERNAL_ERROR", false, nil,
+			)
+			return
+		}
+		writeJSON(writer, http.StatusOK, struct {
+			Token     string    `json:"token"`
+			TokenType string    `json:"tokenType"`
+			ExpiresAt time.Time `json:"expiresAt"`
+		}{
+			Token: token, TokenType: "Bearer",
+			ExpiresAt: router.deps.Clock.Now().UTC().Add(jwtLifetime),
+		})
 	case request.URL.Path == "/api/v1/auth/login/begin" &&
 		request.Method == http.MethodPost:
 		var input beginLoginRequest
@@ -220,7 +328,23 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			request.Context(), input.Email, input.Password,
 		)
 		if err != nil {
+			router.penalizeLoginFailure(
+				request, "password", errors.Is(err, identity.ErrInvalidCredentials),
+			)
+			router.recordAuthenticationFailure(
+				request, "auth.password", "INVALID_CREDENTIALS",
+			)
 			writeDomainError(writer, request, err)
+			return
+		}
+		if err := router.recordAuthentication(
+			request.Context(), anonymousAuthenticationActor(),
+			"auth.password", "authentication", "",
+		); err != nil {
+			writeAPIError(
+				writer, request, http.StatusServiceUnavailable,
+				"STORAGE_UNAVAILABLE", true, nil,
+			)
 			return
 		}
 		writeJSON(writer, http.StatusOK, struct {
@@ -243,6 +367,16 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			request.Context(), input.ChallengeID, input.SecondFactor,
 		)
 		if err != nil {
+			router.penalizeLoginFailure(
+				request, "totp",
+				errors.Is(err, identity.ErrInvalidChallenge) ||
+					errors.Is(err, identity.ErrInvalidTOTP) ||
+					errors.Is(err, identity.ErrTOTPReplay) ||
+					errors.Is(err, identity.ErrInvalidRecoveryCode),
+			)
+			router.recordAuthenticationFailure(
+				request, "auth.totp", "INVALID_SECOND_FACTOR",
+			)
 			writeDomainError(writer, request, err)
 			return
 		}
@@ -259,7 +393,7 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			Fingerprint: humanFingerprint(session.RawToken),
 		}
 		if err := router.recordAuthentication(
-			request.Context(), actor, "user.authenticate", "user", principal.UserID,
+			request.Context(), actor, "auth.totp", "user", principal.UserID,
 		); err != nil {
 			_ = router.deps.Identity.Logout(request.Context(), session.RawToken)
 			writeAPIError(
@@ -304,9 +438,22 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			ExpiresAt: router.deps.Clock.Now().UTC().Add(jwtLifetime),
 		})
 		if err != nil {
+			router.recordKnownAuthenticationFailure(
+				request, auth.actor, "auth.refresh",
+				auth.human.UserID, "REFRESH_FAILED",
+			)
 			writeAPIError(
 				writer, request, http.StatusInternalServerError,
 				"INTERNAL_ERROR", false, nil,
+			)
+			return
+		}
+		if err := router.recordAuthentication(
+			request.Context(), auth.actor, "auth.refresh", "user", auth.human.UserID,
+		); err != nil {
+			writeAPIError(
+				writer, request, http.StatusServiceUnavailable,
+				"STORAGE_UNAVAILABLE", true, nil,
 			)
 			return
 		}
@@ -326,7 +473,20 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 		if err := router.deps.Identity.Logout(
 			request.Context(), auth.rawSession,
 		); err != nil {
+			router.recordKnownAuthenticationFailure(
+				request, auth.actor, "auth.logout",
+				auth.human.UserID, "LOGOUT_FAILED",
+			)
 			writeDomainError(writer, request, err)
+			return
+		}
+		if err := router.recordAuthentication(
+			request.Context(), auth.actor, "auth.logout", "user", auth.human.UserID,
+		); err != nil {
+			writeAPIError(
+				writer, request, http.StatusServiceUnavailable,
+				"STORAGE_UNAVAILABLE", true, nil,
+			)
 			return
 		}
 		writer.WriteHeader(http.StatusNoContent)
@@ -335,6 +495,22 @@ func (router *Router) handleAuth(writer http.ResponseWriter, request *http.Reque
 			writer, request, http.StatusNotFound,
 			"NOT_FOUND", false, nil,
 		)
+	}
+}
+
+func (router *Router) penalizeLoginFailure(
+	request *http.Request,
+	_ string,
+	authenticationFailure bool,
+) {
+	if !authenticationFailure {
+		return
+	}
+	reservation, _ := request.Context().Value(
+		loginReservationContextKey{},
+	).(*loginReservation)
+	if reservation != nil {
+		reservation.committed = true
 	}
 }
 

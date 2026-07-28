@@ -36,6 +36,42 @@ func TestLimiterSeparatesSubjectsAndOperations(t *testing.T) {
 	}
 }
 
+func TestLimiterReservationPreventsConcurrentBurstAndCanBeRefunded(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{OperationAuthFailure: 1},
+		RefillPerSecond: map[Operation]float64{
+			OperationAuthFailure: 0.000001,
+		},
+	})
+	if !limiter.Allow("login-ip", OperationAuthFailure, now).Allowed {
+		t.Fatal("initial reservation denied")
+	}
+	const attempts = 64
+	results := make(chan bool, attempts)
+	var workers sync.WaitGroup
+	for range attempts {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			results <- limiter.Allow(
+				"login-ip", OperationAuthFailure, now,
+			).Allowed
+		}()
+	}
+	workers.Wait()
+	close(results)
+	for allowed := range results {
+		if allowed {
+			t.Fatal("concurrent burst escaped the outstanding reservation")
+		}
+	}
+	limiter.Refund("login-ip", OperationAuthFailure, now)
+	if !limiter.Allow("login-ip", OperationAuthFailure, now).Allowed {
+		t.Fatal("refunded non-failure did not restore capacity")
+	}
+}
+
 func TestLimiterIsBoundedRaceSafeAndTimeRollbackFailsSafe(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	limiter := NewLimiter(LimiterConfig{

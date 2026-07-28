@@ -1,9 +1,13 @@
 package identity
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"net/netip"
 	"time"
+
+	"opswarden/internal/audit"
 )
 
 const (
@@ -40,18 +44,29 @@ var (
 
 type Config struct {
 	InternalCIDRs []netip.Prefix
+	Audit         interface {
+		AppendTx(context.Context, *sql.Tx, audit.Event) error
+	}
 }
 
 type CreateOwnerInput struct {
-	Email    string
-	Password string
-	TOTPSeed string
-	SourceIP netip.Addr
+	Email     string
+	Password  string
+	TOTPSeed  string
+	SourceIP  netip.Addr
+	RequestID string
+	UserAgent string
 }
 
 type CreateOwnerResult struct {
 	UserID        string
 	RecoveryCodes []string
+}
+
+type AuthenticationContext struct {
+	RequestID string
+	SourceIP  string
+	UserAgent string
 }
 
 type LoginChallenge struct {

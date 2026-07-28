@@ -102,6 +102,8 @@ func (s *Service) List(ctx context.Context, filter Filter) ([]Event, Cursor, err
 		query.WriteString(` AND actor_user_id IS NOT NULL`)
 	case ActorAgent:
 		query.WriteString(` AND actor_agent_id IS NOT NULL`)
+	case ActorAnonymous:
+		query.WriteString(` AND actor_user_id IS NULL AND actor_agent_id IS NULL`)
 	}
 	if filter.ActorID != "" {
 		if filter.ActorType == ActorUser {
@@ -229,6 +231,9 @@ func scanEvent(row rowScanner) (Event, error) {
 		event.Actor.ID = actorUserID.String
 	case actorAgentID.Valid && !actorUserID.Valid && metadata.ActorType == ActorAgent:
 		event.Actor.ID = actorAgentID.String
+	case !actorUserID.Valid && !actorAgentID.Valid &&
+		metadata.ActorType == ActorAnonymous:
+		event.Actor.ID = "anonymous"
 	default:
 		return Event{}, ErrAuditUnavailable
 	}
@@ -255,11 +260,15 @@ func validateFilter(filter Filter) (int, error) {
 	if filter.SpaceID != "" && !validIdentifier(filter.SpaceID, 256) {
 		return 0, ErrInvalidFilter
 	}
-	if filter.ActorType != "" && filter.ActorType != ActorUser && filter.ActorType != ActorAgent {
+	if filter.ActorType != "" && filter.ActorType != ActorUser &&
+		filter.ActorType != ActorAgent && filter.ActorType != ActorAnonymous {
 		return 0, ErrInvalidFilter
 	}
 	if filter.ActorID != "" &&
 		(filter.ActorType == "" || !validIdentifier(filter.ActorID, 256)) {
+		return 0, ErrInvalidFilter
+	}
+	if filter.ActorType == ActorAnonymous && filter.ActorID != "" {
 		return 0, ErrInvalidFilter
 	}
 	if filter.Action != "" && !validAction(filter.Action) {

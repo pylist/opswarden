@@ -94,6 +94,57 @@ func (limiter *Limiter) Allow(
 	operation Operation,
 	now time.Time,
 ) Decision {
+	return limiter.decide(subject, operation, now, true)
+}
+
+// Check reports whether a subject is currently blocked without spending a
+// token or creating a new subject bucket.
+func (limiter *Limiter) Check(
+	subject string,
+	operation Operation,
+	now time.Time,
+) Decision {
+	return limiter.decide(subject, operation, now, false)
+}
+
+// Refund returns one previously reserved token. It is used when a request was
+// admitted pessimistically but did not end in the failure being limited.
+func (limiter *Limiter) Refund(
+	subject string,
+	operation Operation,
+	now time.Time,
+) {
+	if limiter == nil || subject == "" || now.IsZero() {
+		return
+	}
+	capacity, known := limiter.capacity[operation]
+	if !known {
+		return
+	}
+	now = now.UTC()
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	bucket := limiter.buckets[operation][subject]
+	if bucket == nil {
+		return
+	}
+	if !now.Before(bucket.last) {
+		elapsed := now.Sub(bucket.last).Seconds()
+		bucket.tokens = math.Min(
+			capacity, bucket.tokens+elapsed*limiter.refill[operation],
+		)
+		bucket.last = now
+		bucket.lastSeen = now
+	}
+	bucket.tokens = math.Min(capacity, bucket.tokens+1)
+}
+
+func (limiter *Limiter) decide(
+	subject string,
+	operation Operation,
+	now time.Time,
+	consume bool,
+) Decision {
 	if limiter == nil || subject == "" || now.IsZero() {
 		return Decision{}
 	}
@@ -112,6 +163,9 @@ func (limiter *Limiter) Allow(
 	subjects := limiter.buckets[operation]
 	bucket, exists := subjects[subject]
 	if !exists {
+		if !consume {
+			return Decision{Allowed: true}
+		}
 		limiter.removeIdleLocked(operation, now)
 		if len(subjects) >= limiter.maxSubjects {
 			limiter.evictOldestLocked(operation)
@@ -134,7 +188,9 @@ func (limiter *Limiter) Allow(
 			)),
 		}
 	}
-	bucket.tokens--
+	if consume {
+		bucket.tokens--
+	}
 	return Decision{Allowed: true}
 }
 

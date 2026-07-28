@@ -55,7 +55,9 @@ func New(cfg config.Config) (_ *App, err error) {
 		return nil, err
 	}
 	identityService, err := identity.NewService(
-		db, box, clock, identity.Config{},
+		db, box, clock, identity.Config{
+			InternalCIDRs: cfg.InternalCIDRs, Audit: auditRepository,
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -84,14 +86,21 @@ func New(cfg config.Config) (_ *App, err error) {
 		Identity: identityService, Spaces: spaceService,
 		Credentials: credentialService, Assets: assetService,
 		Agents: agentService, Audit: auditService, AuthAudit: auditService,
-		Clock: clock, MasterKey: masterKey, Fallback: webui.Handler(),
+		Clock: clock, MasterKey: masterKey,
+		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
+		Fallback:          webui.Handler(),
 	})
 	application := &App{
 		handler: handler,
 		db:      db,
 		server: &http.Server{
-			Addr:    cfg.ListenAddr,
-			Handler: handler,
+			Addr:              cfg.ListenAddr,
+			Handler:           handler,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    32 << 10,
 		},
 	}
 	application.apiCloser, _ = handler.(interface{ Close() error })

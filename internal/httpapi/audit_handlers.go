@@ -71,7 +71,8 @@ func (router *Router) handleAudit(writer http.ResponseWriter, request *http.Requ
 		return
 	}
 	actorType := audit.ActorType(query["actorType"])
-	if actorType != "" && actorType != audit.ActorUser && actorType != audit.ActorAgent {
+	if actorType != "" && actorType != audit.ActorUser &&
+		actorType != audit.ActorAgent && actorType != audit.ActorAnonymous {
 		writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
 		return
 	}

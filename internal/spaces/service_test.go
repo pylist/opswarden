@@ -85,6 +85,120 @@ func TestAuditedCreateRollsBackWhenAuditAppendFails(t *testing.T) {
 	}
 }
 
+func TestAuditedMembershipMutationsUseVersionsAndRollbackWithAudit(t *testing.T) {
+	h := newSpacesHarness(t)
+	spaceID := h.createSpace(t, "owner")
+	auditRepository, err := audit.NewRepository(h.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := spaces.NewAuditedService(
+		h.db, h.revoker, auditRepository, fixedSpaceClock{now: h.now},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := h.principal("owner")
+	principal.RecentTOTPAt = h.now
+	mutation := spaces.MutationContext{
+		Session: principal,
+		Actor: audit.Actor{
+			Type: audit.ActorUser, ID: "owner",
+			Fingerprint: "0123456789abcdef",
+		},
+		RequestID: "req_members", SourceIP: "127.0.0.1",
+	}
+	member, err := service.AddMemberAudited(
+		h.ctx, mutation, spaceID, "member", spaces.Reader,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Version != 1 || member.Role != spaces.Reader {
+		t.Fatalf("added member=%+v", member)
+	}
+	member, err = service.ChangeRoleAudited(
+		h.ctx, mutation, spaceID, "member", spaces.Editor, member.Version,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.Version != 2 || member.Role != spaces.Editor {
+		t.Fatalf("changed member=%+v", member)
+	}
+	if _, err := service.ChangeRoleAudited(
+		h.ctx, mutation, spaceID, "member", spaces.Reader, 1,
+	); !errors.Is(err, spaces.ErrVersionConflict) {
+		t.Fatalf("stale change error=%v", err)
+	}
+	members, err := service.ListMembers(h.ctx, principal, spaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("members=%+v", members)
+	}
+	var auditCount int
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT count(*) FROM audit_events
+		WHERE space_id = ? AND entity_type = 'membership'
+	`, spaceID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 2 {
+		t.Fatalf("membership audits=%d", auditCount)
+	}
+
+	failing, err := spaces.NewAuditedService(
+		h.db, h.revoker, failingSpaceAudit{}, fixedSpaceClock{now: h.now},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failing.RemoveMemberAudited(
+		h.ctx, mutation, spaceID, "member", member.Version,
+	); !errors.Is(err, audit.ErrAuditUnavailable) {
+		t.Fatalf("remove error=%v", err)
+	}
+	if !h.membershipExists(t, spaceID, "member") {
+		t.Fatal("membership removal escaped failed audit transaction")
+	}
+}
+
+func TestAuditedMembershipMutationRequiresRecentTOTPInsideTransaction(t *testing.T) {
+	h := newSpacesHarness(t)
+	spaceID := h.createSpace(t, "owner")
+	auditRepository, err := audit.NewRepository(h.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := spaces.NewAuditedService(
+		h.db, h.revoker, auditRepository, fixedSpaceClock{now: h.now},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := h.principal("owner")
+	_, err = service.AddMemberAudited(
+		h.ctx,
+		spaces.MutationContext{
+			Session: principal,
+			Actor: audit.Actor{
+				Type: audit.ActorUser, ID: "owner",
+				Fingerprint: "0123456789abcdef",
+			},
+			RequestID: "req_members", SourceIP: "127.0.0.1",
+		},
+		spaceID, "member", spaces.Reader,
+	)
+	if !errors.Is(err, identity.ErrRecentTOTPRequired) {
+		t.Fatalf("add error=%v", err)
+	}
+	if h.membershipExists(t, spaceID, "member") {
+		t.Fatal("member was added without recent TOTP")
+	}
+}
+
 type failingSpaceAudit struct{}
 
 func (failingSpaceAudit) AppendTx(

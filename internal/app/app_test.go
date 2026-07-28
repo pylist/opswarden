@@ -49,6 +49,27 @@ func TestNewRejectsMissingMasterKey(t *testing.T) {
 	}
 }
 
+func TestNewConfiguresDefensiveHTTPServerLimits(t *testing.T) {
+	application, err := New(config.Config{
+		ListenAddr: "127.0.0.1:0", DataDir: t.TempDir(),
+		MasterKeyFile: writeMasterKey(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = application.Close() })
+	server := application.server
+	if server.ReadHeaderTimeout <= 0 || server.ReadTimeout <= 0 ||
+		server.WriteTimeout <= 0 || server.IdleTimeout <= 0 ||
+		server.MaxHeaderBytes <= 0 || server.MaxHeaderBytes > 64<<10 {
+		t.Fatalf(
+			"unsafe server limits: readHeader=%s read=%s write=%s idle=%s headers=%d",
+			server.ReadHeaderTimeout, server.ReadTimeout, server.WriteTimeout,
+			server.IdleTimeout, server.MaxHeaderBytes,
+		)
+	}
+}
+
 func writeMasterKey(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "master.key")

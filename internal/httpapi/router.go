@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -21,15 +22,21 @@ import (
 )
 
 type IdentityService interface {
+	CreateInitialOwner(context.Context, identity.CreateOwnerInput) (identity.CreateOwnerResult, error)
 	BeginLogin(context.Context, string, string) (identity.LoginChallenge, error)
 	CompleteLogin(context.Context, string, string) (identity.Session, error)
 	ResolveSession(context.Context, string) (identity.SessionPrincipal, error)
+	VerifyRecentTOTPAudited(context.Context, string, string, identity.AuthenticationContext) (identity.SessionPrincipal, error)
 	Logout(context.Context, string) error
 }
 
 type SpaceService interface {
 	CreateAudited(context.Context, spaces.MutationContext, spaces.CreateInput) (spaces.Space, error)
 	ListForUser(context.Context, identity.SessionPrincipal) ([]spaces.Space, error)
+	ListMembers(context.Context, identity.SessionPrincipal, string) ([]spaces.Member, error)
+	AddMemberAudited(context.Context, spaces.MutationContext, string, string, spaces.Role) (spaces.Member, error)
+	ChangeRoleAudited(context.Context, spaces.MutationContext, string, string, spaces.Role, uint64) (spaces.Member, error)
+	RemoveMemberAudited(context.Context, spaces.MutationContext, string, string, uint64) error
 	ResolveAuthorizationPrincipal(
 		context.Context,
 		identity.SessionPrincipal,
@@ -78,18 +85,19 @@ type AuthenticationAuditRecorder interface {
 }
 
 type Dependencies struct {
-	Identity    IdentityService
-	Spaces      SpaceService
-	Credentials CredentialService
-	Assets      AssetService
-	Agents      AgentService
-	Audit       AuditService
-	AuthAudit   AuthenticationAuditRecorder
-	Limiter     *agents.Limiter
-	Clock       platform.Clock
-	Logger      *slog.Logger
-	MasterKey   [sha256.Size]byte
-	Fallback    http.Handler
+	Identity          IdentityService
+	Spaces            SpaceService
+	Credentials       CredentialService
+	Assets            AssetService
+	Agents            AgentService
+	Audit             AuditService
+	AuthAudit         AuthenticationAuditRecorder
+	Limiter           *agents.Limiter
+	Clock             platform.Clock
+	Logger            *slog.Logger
+	MasterKey         [sha256.Size]byte
+	TrustedProxyCIDRs []netip.Prefix
+	Fallback          http.Handler
 }
 
 type Router struct {
@@ -158,12 +166,18 @@ func (router *Router) dispatch(writer http.ResponseWriter, request *http.Request
 		writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
 		return
 	}
+	if request.URL.RawQuery != "" && !routeAllowsQuery(request) {
+		writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+		return
+	}
 	if strings.HasPrefix(request.URL.Path, "/api/") &&
 		!strings.HasPrefix(request.URL.Path, "/api/v1/") {
 		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
 		return
 	}
 	switch {
+	case request.URL.Path == "/api/v1/bootstrap/initial-owner":
+		router.handleBootstrap(writer, request)
 	case strings.HasPrefix(request.URL.Path, "/api/v1/auth/"):
 		router.handleAuth(writer, request)
 	case request.URL.Path == "/api/v1/me":
@@ -186,6 +200,24 @@ func (router *Router) dispatch(writer http.ResponseWriter, request *http.Request
 		}
 		http.NotFound(writer, request)
 	}
+}
+
+func routeAllowsQuery(request *http.Request) bool {
+	if request.Method != http.MethodGet {
+		return false
+	}
+	if request.URL.Path == "/api/v1/audit-events" {
+		return true
+	}
+	segments := pathSegments(request.URL.Path)
+	if len(segments) == 5 && segments[0] == "api" && segments[1] == "v1" &&
+		segments[2] == "spaces" &&
+		(segments[4] == "credentials" || segments[4] == "assets") {
+		return true
+	}
+	return len(segments) == 7 && segments[0] == "api" &&
+		segments[1] == "v1" && segments[2] == "spaces" &&
+		segments[4] == "assets" && segments[6] == "credentials"
 }
 
 func (router *Router) principal(
@@ -237,6 +269,20 @@ func (router *Router) recordAuthentication(
 	resourceType string,
 	resourceID string,
 ) error {
+	return router.recordAuthenticationOutcome(
+		ctx, actor, action, resourceType, resourceID, true, "",
+	)
+}
+
+func (router *Router) recordAuthenticationOutcome(
+	ctx context.Context,
+	actor audit.Actor,
+	action string,
+	resourceType string,
+	resourceID string,
+	success bool,
+	errorCode string,
+) error {
 	if router.deps.AuthAudit == nil {
 		return nil
 	}
@@ -246,7 +292,65 @@ func (router *Router) recordAuthentication(
 		RequestID: metadata.requestID, CreatedAt: router.deps.Clock.Now().UTC(),
 		Actor: actor, Action: action, ResourceType: resourceType,
 		ResourceID: resourceID, SourceIP: metadata.sourceIP,
-		UserAgent: metadata.userAgent, Success: true,
+		UserAgent: metadata.userAgent, Success: success, ErrorCode: errorCode,
 	}
 	return router.deps.AuthAudit.RecordReadBeforeReturn(ctx, event)
+}
+
+func anonymousAuthenticationActor() audit.Actor {
+	return audit.Actor{
+		Type: audit.ActorAnonymous, ID: "anonymous",
+		Fingerprint: humanFingerprint("opswarden/anonymous-auth/v1"),
+	}
+}
+
+func (router *Router) recordAuthenticationFailure(
+	request *http.Request,
+	action string,
+	errorCode string,
+) {
+	if err := router.recordAuthenticationOutcome(
+		request.Context(), anonymousAuthenticationActor(), action,
+		"authentication", "", false, errorCode,
+	); err != nil {
+		router.logger.Error(
+			"authentication audit unavailable",
+			slog.String("request_id", requestID(request.Context())),
+			slog.String("action", action),
+		)
+	}
+}
+
+func (router *Router) recordKnownAuthenticationFailure(
+	request *http.Request,
+	actor audit.Actor,
+	action, resourceID, errorCode string,
+) {
+	if err := router.recordAuthenticationOutcome(
+		request.Context(), actor, action, "user", resourceID, false, errorCode,
+	); err != nil {
+		router.logger.Error(
+			"authentication audit unavailable",
+			slog.String("request_id", requestID(request.Context())),
+			slog.String("action", action),
+		)
+	}
+}
+
+func (router *Router) recordProtectedAuthRouteFailure(
+	request *http.Request,
+	errorCode string,
+) {
+	var action string
+	switch request.URL.Path {
+	case "/api/v1/auth/refresh":
+		action = "auth.refresh"
+	case "/api/v1/auth/logout":
+		action = "auth.logout"
+	case "/api/v1/auth/reverify":
+		action = "auth.totp.reverify"
+	default:
+		return
+	}
+	router.recordAuthenticationFailure(request, action, errorCode)
 }

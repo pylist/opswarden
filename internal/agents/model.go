@@ -30,6 +30,8 @@ var (
 	ErrUnauthenticated           = errors.New("agent operation is unauthenticated")
 	ErrForbidden                 = errors.New("agent operation is forbidden")
 	ErrAuditUnavailable          = audit.ErrAuditUnavailable
+	ErrIdempotencyRequired       = errors.New("agent management idempotency key is required")
+	ErrIdempotencyConflict       = errors.New("agent management idempotency conflict")
 )
 
 type authenticationError struct {
@@ -64,6 +66,7 @@ type IssuedToken struct {
 	Prefix    string
 	Raw       string
 	ExpiresAt time.Time
+	Replayed  bool
 }
 
 type Grant struct {
@@ -109,11 +112,12 @@ type Authenticator interface {
 }
 
 type MutationContext struct {
-	Session   identity.SessionPrincipal
-	Actor     audit.Actor
-	RequestID string
-	SourceIP  string
-	UserAgent string
+	Session        identity.SessionPrincipal
+	Actor          audit.Actor
+	RequestID      string
+	SourceIP       string
+	UserAgent      string
+	IdempotencyKey string
 }
 
 type Usage struct {

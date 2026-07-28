@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
@@ -19,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"opswarden/internal/audit"
 	"opswarden/internal/cryptobox"
 	"opswarden/internal/storage"
 )
@@ -89,6 +91,49 @@ func TestCreateInitialOwnerRestrictsSourceAndPersistsApprovedArgonParameters(t *
 	if !errors.Is(err, ErrInitialOwnerExists) {
 		t.Fatalf("second owner error = %v", err)
 	}
+}
+
+func TestCreateInitialOwnerRollsBackWhenAuditFails(t *testing.T) {
+	h := newIdentityHarnessWithoutOwner(t)
+	service, err := NewService(
+		h.db, cryptobox.New([32]byte{1, 2, 3, 4}), h.clock,
+		Config{
+			InternalCIDRs: []netip.Prefix{
+				netip.MustParsePrefix("10.23.0.0/16"),
+			},
+			Audit: failingIdentityAudit{},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.CreateInitialOwner(h.ctx, CreateOwnerInput{
+		Email: testEmail, Password: testPassword, TOTPSeed: testTOTPSeed,
+		SourceIP:  netip.MustParseAddr("127.0.0.1"),
+		RequestID: "req_bootstrap",
+	})
+	if !errors.Is(err, audit.ErrAuditUnavailable) {
+		t.Fatalf("create error=%v", err)
+	}
+	var count int
+	if err := h.db.Reader.QueryRowContext(
+		h.ctx, `SELECT count(*) FROM users`,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("users after failed bootstrap audit=%d", count)
+	}
+}
+
+type failingIdentityAudit struct{}
+
+func (failingIdentityAudit) AppendTx(
+	context.Context,
+	*sql.Tx,
+	audit.Event,
+) error {
+	return audit.ErrAuditUnavailable
 }
 
 func TestBeginLoginUsesUnifiedCredentialError(t *testing.T) {
@@ -458,6 +503,47 @@ func TestSessionIdleAbsoluteRecentTOTPAndRevocation(t *testing.T) {
 			t.Fatalf("logout error = %v", err)
 		}
 	})
+}
+
+func TestAuditedRecentTOTPVerificationRollsBackPrivilegeOnAuditFailure(t *testing.T) {
+	h := newIdentityHarness(t)
+	session := h.login(t)
+	before, err := h.service.ResolveSession(h.ctx, session.RawToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(TOTPPeriod)
+	service, err := NewService(
+		h.db, cryptobox.New([32]byte{1, 2, 3, 4}), h.clock,
+		Config{
+			InternalCIDRs: []netip.Prefix{
+				netip.MustParsePrefix("10.23.0.0/16"),
+			},
+			Audit: failingIdentityAudit{},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.VerifyRecentTOTPAudited(
+		h.ctx, session.RawToken, h.totpAt(h.clock.Now()),
+		AuthenticationContext{
+			RequestID: "req_reverify", SourceIP: "127.0.0.1",
+		},
+	)
+	if !errors.Is(err, audit.ErrAuditUnavailable) {
+		t.Fatalf("reverify error=%v", err)
+	}
+	after, err := h.service.ResolveSession(h.ctx, session.RawToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.RecentTOTPAt.Equal(before.RecentTOTPAt) {
+		t.Fatalf(
+			"recent TOTP escaped audit rollback: before=%v after=%v",
+			before.RecentTOTPAt, after.RecentTOTPAt,
+		)
+	}
 }
 
 func TestResetPasswordRevokesSessionsAndChangesCredential(t *testing.T) {

@@ -42,6 +42,7 @@ type issuedTokenResponse struct {
 	Prefix    string `json:"prefix"`
 	Token     string `json:"token"`
 	ExpiresAt any    `json:"expiresAt,omitempty"`
+	Replayed  bool   `json:"replayed"`
 }
 
 func (router *Router) handleAgents(writer http.ResponseWriter, request *http.Request) {
@@ -131,6 +132,7 @@ func (router *Router) handleAgents(writer http.ResponseWriter, request *http.Req
 		}
 		response := issuedTokenResponse{
 			ID: token.ID, Prefix: token.Prefix, Token: token.Raw,
+			Replayed: token.Replayed,
 		}
 		if !token.ExpiresAt.IsZero() {
 			response.ExpiresAt = token.ExpiresAt
@@ -187,10 +189,18 @@ func (router *Router) agentMutationContext(
 	return agents.MutationContext{
 		Session: session, Actor: auth.actor, RequestID: metadata.requestID,
 		SourceIP: metadata.sourceIP, UserAgent: metadata.userAgent,
+		IdempotencyKey: idempotencyHeader(request),
 	}
 }
 
 func requireIdempotencyHeader(request *http.Request) bool {
+	return idempotencyHeader(request) != ""
+}
+
+func idempotencyHeader(request *http.Request) string {
 	values := request.Header.Values("Idempotency-Key")
-	return len(values) == 1 && values[0] != "" && len(values[0]) <= 256
+	if len(values) != 1 || values[0] == "" || len(values[0]) > 256 {
+		return ""
+	}
+	return values[0]
 }

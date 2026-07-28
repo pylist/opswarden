@@ -219,6 +219,72 @@ func (r repository) membershipRoleTx(
 	return role, nil
 }
 
+func (r repository) membershipTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	spaceID, userID string,
+) (Member, error) {
+	var member Member
+	var createdAt string
+	err := tx.QueryRowContext(ctx, `
+		SELECT m.user_id, u.email, m.role, m.version, m.created_at
+		FROM space_memberships m
+		JOIN users u ON u.id = m.user_id
+		WHERE m.space_id = ? AND m.user_id = ? AND u.deleted_at IS NULL
+	`, spaceID, userID).Scan(
+		&member.UserID, &member.Email, &member.Role, &member.Version, &createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Member{}, ErrMembershipNotFound
+	}
+	if err != nil {
+		return Member{}, fmt.Errorf("read Space membership: %w", err)
+	}
+	member.CreatedAt, err = parseTime(createdAt)
+	if err != nil {
+		return Member{}, err
+	}
+	return member, nil
+}
+
+func (r repository) listMembersTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	spaceID string,
+) ([]Member, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT m.user_id, u.email, m.role, m.version, m.created_at
+		FROM space_memberships m
+		JOIN users u ON u.id = m.user_id
+		WHERE m.space_id = ? AND u.deleted_at IS NULL
+		ORDER BY lower(u.email), m.user_id
+	`, spaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list Space memberships: %w", err)
+	}
+	defer rows.Close()
+	members := make([]Member, 0)
+	for rows.Next() {
+		var member Member
+		var createdAt string
+		if err := rows.Scan(
+			&member.UserID, &member.Email, &member.Role,
+			&member.Version, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan Space membership: %w", err)
+		}
+		member.CreatedAt, err = parseTime(createdAt)
+		if err != nil {
+			return nil, err
+		}
+		members = append(members, member)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate Space memberships: %w", err)
+	}
+	return members, nil
+}
+
 func (r repository) addMembershipTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -263,6 +329,30 @@ func (r repository) changeMembershipRoleTx(
 	return nil
 }
 
+func (r repository) changeMembershipRoleVersionTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	spaceID, userID string,
+	role Role,
+	expectedVersion uint64,
+) error {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE space_memberships SET role = ?, version = version + 1
+		WHERE space_id = ? AND user_id = ? AND version = ?
+	`, role, spaceID, userID, expectedVersion)
+	if err != nil {
+		return fmt.Errorf("change Space membership role: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read Space role change result: %w", err)
+	}
+	if changed != 1 {
+		return ErrVersionConflict
+	}
+	return nil
+}
+
 func (r repository) removeMembershipTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -280,6 +370,29 @@ func (r repository) removeMembershipTx(
 	}
 	if changed != 1 {
 		return ErrMembershipNotFound
+	}
+	return nil
+}
+
+func (r repository) removeMembershipVersionTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	spaceID, userID string,
+	expectedVersion uint64,
+) error {
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM space_memberships
+		WHERE space_id = ? AND user_id = ? AND version = ?
+	`, spaceID, userID, expectedVersion)
+	if err != nil {
+		return fmt.Errorf("remove Space membership: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read Space membership removal result: %w", err)
+	}
+	if changed != 1 {
+		return ErrVersionConflict
 	}
 	return nil
 }

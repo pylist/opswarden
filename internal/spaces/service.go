@@ -206,6 +206,81 @@ func (s *Service) AddMember(
 	})
 }
 
+func (s *Service) ListMembers(
+	ctx context.Context,
+	principal identity.SessionPrincipal,
+	spaceID string,
+) ([]Member, error) {
+	if spaceID == "" {
+		return nil, ErrNotFound
+	}
+	var members []Member
+	err := s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if err := s.repository.requireActiveSpaceTx(ctx, tx, spaceID); err != nil {
+			return err
+		}
+		if err := s.authorizeMemberManagement(
+			ctx, tx, principal, spaceID, authorization.ListMembers,
+		); err != nil {
+			return err
+		}
+		var err error
+		members, err = s.repository.listMembersTx(ctx, tx, spaceID)
+		return err
+	})
+	return members, err
+}
+
+func (s *Service) AddMemberAudited(
+	ctx context.Context,
+	mutation MutationContext,
+	spaceID, userID string,
+	role Role,
+) (Member, error) {
+	if !role.Valid() {
+		return Member{}, ErrInvalidRole
+	}
+	if spaceID == "" {
+		return Member{}, ErrNotFound
+	}
+	if userID == "" {
+		return Member{}, ErrUserNotFound
+	}
+	if err := s.validateAuditedMutation(mutation); err != nil {
+		return Member{}, err
+	}
+	var member Member
+	err := s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if err := s.requireRecentMutationTx(
+			ctx, tx, mutation, spaceID, authorization.AddMember,
+		); err != nil {
+			return err
+		}
+		exists, err := s.repository.activeUserExistsTx(ctx, tx, userID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrUserNotFound
+		}
+		now := s.clock.Now().UTC()
+		if err := s.repository.addMembershipTx(
+			ctx, tx, spaceID, userID, role, now,
+		); err != nil {
+			return err
+		}
+		member, err = s.repository.membershipTx(ctx, tx, spaceID, userID)
+		if err != nil {
+			return err
+		}
+		return s.appendMembershipAudit(
+			ctx, tx, mutation, "membership.add", spaceID, userID,
+			audit.ChangeFields{audit.FieldRole},
+		)
+	})
+	return member, err
+}
+
 func (s *Service) ChangeRole(
 	ctx context.Context,
 	principal identity.SessionPrincipal,
@@ -251,6 +326,71 @@ func (s *Service) ChangeRole(
 	})
 }
 
+func (s *Service) ChangeRoleAudited(
+	ctx context.Context,
+	mutation MutationContext,
+	spaceID, userID string,
+	role Role,
+	expectedVersion uint64,
+) (Member, error) {
+	if !role.Valid() {
+		return Member{}, ErrInvalidRole
+	}
+	if spaceID == "" {
+		return Member{}, ErrNotFound
+	}
+	if userID == "" {
+		return Member{}, ErrMembershipNotFound
+	}
+	if expectedVersion == 0 {
+		return Member{}, ErrVersionConflict
+	}
+	if err := s.validateAuditedMutation(mutation); err != nil {
+		return Member{}, err
+	}
+	var member Member
+	err := s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if err := s.requireRecentMutationTx(
+			ctx, tx, mutation, spaceID, authorization.ChangeMemberRole,
+		); err != nil {
+			return err
+		}
+		current, err := s.repository.membershipTx(ctx, tx, spaceID, userID)
+		if err != nil {
+			return err
+		}
+		if current.Version != expectedVersion {
+			return ErrVersionConflict
+		}
+		if current.Role == role {
+			member = current
+			return nil
+		}
+		if current.Role == Owner && role != Owner {
+			if err := s.requireAnotherOwner(ctx, tx, spaceID, userID); err != nil {
+				return err
+			}
+		}
+		if err := s.repository.changeMembershipRoleVersionTx(
+			ctx, tx, spaceID, userID, role, expectedVersion,
+		); err != nil {
+			return err
+		}
+		if err := s.revoker.RevokeUserSessionsTx(ctx, tx, userID); err != nil {
+			return err
+		}
+		member, err = s.repository.membershipTx(ctx, tx, spaceID, userID)
+		if err != nil {
+			return err
+		}
+		return s.appendMembershipAudit(
+			ctx, tx, mutation, "membership.role.change", spaceID, userID,
+			audit.ChangeFields{audit.FieldRole, audit.FieldVersion},
+		)
+	})
+	return member, err
+}
+
 func (s *Service) RemoveMember(
 	ctx context.Context,
 	principal identity.SessionPrincipal,
@@ -286,6 +426,57 @@ func (s *Service) RemoveMember(
 			return err
 		}
 		return s.revoker.RevokeUserSessionsTx(ctx, tx, userID)
+	})
+}
+
+func (s *Service) RemoveMemberAudited(
+	ctx context.Context,
+	mutation MutationContext,
+	spaceID, userID string,
+	expectedVersion uint64,
+) error {
+	if spaceID == "" {
+		return ErrNotFound
+	}
+	if userID == "" {
+		return ErrMembershipNotFound
+	}
+	if expectedVersion == 0 {
+		return ErrVersionConflict
+	}
+	if err := s.validateAuditedMutation(mutation); err != nil {
+		return err
+	}
+	return s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if err := s.requireRecentMutationTx(
+			ctx, tx, mutation, spaceID, authorization.RemoveMember,
+		); err != nil {
+			return err
+		}
+		current, err := s.repository.membershipTx(ctx, tx, spaceID, userID)
+		if err != nil {
+			return err
+		}
+		if current.Version != expectedVersion {
+			return ErrVersionConflict
+		}
+		if current.Role == Owner {
+			if err := s.requireAnotherOwner(ctx, tx, spaceID, userID); err != nil {
+				return err
+			}
+		}
+		if err := s.repository.removeMembershipVersionTx(
+			ctx, tx, spaceID, userID, expectedVersion,
+		); err != nil {
+			return err
+		}
+		if err := s.revoker.RevokeUserSessionsTx(ctx, tx, userID); err != nil {
+			return err
+		}
+		return s.appendMembershipAudit(
+			ctx, tx, mutation, "membership.remove", spaceID, userID,
+			audit.ChangeFields{audit.FieldRole, audit.FieldVersion},
+		)
 	})
 }
 
@@ -342,6 +533,64 @@ func (s *Service) authorizeMemberManagement(
 		authorization.Resource{SpaceID: spaceID},
 		action,
 	))
+}
+
+func (s *Service) validateAuditedMutation(mutation MutationContext) error {
+	if s.audit == nil || s.clock == nil {
+		return audit.ErrAuditUnavailable
+	}
+	if mutation.Session.UserID == "" || mutation.Session.SessionID == "" ||
+		mutation.Actor.Type != audit.ActorUser ||
+		mutation.Actor.ID != mutation.Session.UserID {
+		return ErrUnauthenticated
+	}
+	return nil
+}
+
+func (s *Service) requireRecentMutationTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	mutation MutationContext,
+	spaceID string,
+	action authorization.Action,
+) error {
+	if err := s.repository.requireActiveSpaceTx(ctx, tx, spaceID); err != nil {
+		return err
+	}
+	if err := s.authorizeMemberManagement(
+		ctx, tx, mutation.Session, spaceID, action,
+	); err != nil {
+		return err
+	}
+	if !mutation.Session.HasRecentTOTP(s.clock.Now().UTC()) {
+		return identity.ErrRecentTOTPRequired
+	}
+	return nil
+}
+
+func (s *Service) appendMembershipAudit(
+	ctx context.Context,
+	tx *sql.Tx,
+	mutation MutationContext,
+	action, spaceID, userID string,
+	fields audit.ChangeFields,
+) error {
+	eventID, err := randomID()
+	if err != nil {
+		return audit.ErrAuditUnavailable
+	}
+	event := audit.Event{
+		ID:        strings.Replace(eventID, "spc_", "aud_", 1),
+		RequestID: mutation.RequestID, CreatedAt: s.clock.Now().UTC(),
+		Actor: mutation.Actor, Action: action, SpaceID: spaceID,
+		ResourceType: "membership", ResourceID: userID,
+		SourceIP: mutation.SourceIP, UserAgent: mutation.UserAgent,
+		Success: true, ChangeFields: fields,
+	}
+	if err := s.audit.AppendTx(ctx, tx, event); err != nil {
+		return audit.ErrAuditUnavailable
+	}
+	return nil
 }
 
 func (s *Service) requireAnotherOwner(

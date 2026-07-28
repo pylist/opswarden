@@ -98,13 +98,103 @@ func newAgentHarness(t *testing.T) *agentHarness {
 
 func mutationContext(userID string) MutationContext {
 	return MutationContext{
-		Session: identity.SessionPrincipal{UserID: userID, SessionID: "ses_" + userID},
+		Session: identity.SessionPrincipal{
+			UserID: userID, SessionID: "ses_" + userID,
+			RecentTOTPAt: time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC),
+		},
 		Actor: audit.Actor{
 			Type: audit.ActorUser, ID: userID, Fingerprint: "0123456789abcdef",
 		},
-		RequestID: "req_" + userID,
-		SourceIP:  "127.0.0.1",
-		UserAgent: "agent-service-test",
+		RequestID:      "req_" + userID,
+		SourceIP:       "127.0.0.1",
+		UserAgent:      "agent-service-test",
+		IdempotencyKey: "default-key-" + userID,
+	}
+}
+
+func TestSetGrantRequiresRecentTOTPInDomain(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	stolen := h.owner
+	stolen.Session.RecentTOTPAt = h.clock.now.Add(-identity.RecentTOTPLifetime)
+	err := h.service.SetGrant(h.ctx, stolen, agent.ID, Grant{
+		SpaceID: h.spaceID,
+		Scopes:  []authorization.Scope{authorization.ScopeCredentialList},
+	})
+	if !errors.Is(err, identity.ErrRecentTOTPRequired) {
+		t.Fatalf("set grant error=%v", err)
+	}
+}
+
+func TestAgentManagementMutationRequiresIdempotencyKeyInDomain(t *testing.T) {
+	h := newAgentHarness(t)
+	principal := h.owner
+	principal.IdempotencyKey = ""
+	if _, err := h.service.Create(
+		h.ctx, principal, CreateInput{Name: "Hermes"},
+	); !errors.Is(err, ErrIdempotencyRequired) {
+		t.Fatalf("create error=%v", err)
+	}
+	var count int
+	if err := h.db.Reader.QueryRowContext(
+		h.ctx, `SELECT count(*) FROM agents`,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("agents created without idempotency key=%d", count)
+	}
+}
+
+func TestHumanAgentCreateIdempotencyPersistsStableResult(t *testing.T) {
+	h := newAgentHarness(t)
+	principal := h.owner
+	principal.IdempotencyKey = "create-agent-once"
+	first, err := h.service.Create(h.ctx, principal, CreateInput{Name: "Hermes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := h.service.Create(h.ctx, principal, CreateInput{Name: "Hermes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID != second.ID {
+		t.Fatalf("replay IDs=(%s,%s)", first.ID, second.ID)
+	}
+	_, err = h.service.Create(h.ctx, principal, CreateInput{Name: "Different"})
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("different request error=%v", err)
+	}
+}
+
+func TestHumanAgentTokenIssueReplayNeverReturnsOrCreatesAnotherRawToken(t *testing.T) {
+	h := newAgentHarness(t)
+	agent := h.createAgent(t)
+	principal := h.owner
+	principal.IdempotencyKey = "issue-token-once"
+	first, err := h.service.IssueToken(
+		h.ctx, principal, agent.ID, h.clock.now.Add(time.Hour),
+	)
+	if err != nil || first.Raw == "" || first.Replayed {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	second, err := h.service.IssueToken(
+		h.ctx, principal, agent.ID, h.clock.now.Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID || second.Raw != "" || !second.Replayed {
+		t.Fatalf("unsafe replay: first=%+v second=%+v", first, second)
+	}
+	var count int
+	if err := h.db.Reader.QueryRow(
+		`SELECT count(*) FROM agent_tokens WHERE agent_id = ?`, agent.ID,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("issued tokens=%d", count)
 	}
 }
 
@@ -172,8 +262,10 @@ func TestRevocationAndAgentDisableTakeEffectOnNextRequest(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 
+	secondIssue := h.owner
+	secondIssue.IdempotencyKey = "second-token"
 	issued, err = h.service.IssueToken(
-		h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+		h.ctx, secondIssue, agent.ID, h.clock.now.Add(time.Hour),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -240,7 +332,9 @@ func TestGrantValidationAndFreshAuthentication(t *testing.T) {
 		principal.Grants[0].Scopes[0] != authorization.ScopeCredentialList {
 		t.Fatalf("grant not canonicalized: %+v", principal.Grants)
 	}
-	if err := h.service.SetGrant(h.ctx, h.member, agent.ID, Grant{
+	secondGrant := h.member
+	secondGrant.IdempotencyKey = "second-grant"
+	if err := h.service.SetGrant(h.ctx, secondGrant, agent.ID, Grant{
 		SpaceID: h.spaceID,
 		Scopes:  []authorization.Scope{authorization.ScopeAssetRead},
 	}); err != nil {
@@ -289,8 +383,10 @@ func TestTokenAndGrantMutationsRollbackWithAudit(t *testing.T) {
 	}
 
 	h.audit.fail = true
+	failedIssueContext := h.owner
+	failedIssueContext.IdempotencyKey = "failed-issue"
 	failedIssue, err := h.service.IssueToken(
-		h.ctx, h.owner, agent.ID, h.clock.now.Add(time.Hour),
+		h.ctx, failedIssueContext, agent.ID, h.clock.now.Add(time.Hour),
 	)
 	if !errors.Is(err, ErrAuditUnavailable) || failedIssue.Raw != "" {
 		t.Fatalf("issued=%+v err=%v", failedIssue, err)

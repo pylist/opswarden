@@ -58,6 +58,7 @@ func (r *repository) createInitialOwner(
 	passwordHash, encryptedTOTP []byte,
 	recoveryCodes []recoveryCodeRecord,
 	now time.Time,
+	beforeCommit func(*sql.Tx) error,
 ) error {
 	return storage.WithTx(ctx, r.db, func(tx *sql.Tx) error {
 		var count int
@@ -87,6 +88,11 @@ func (r *repository) createInitialOwner(
 				VALUES (?, ?, ?, ?)
 			`, code.ID, userID, code.Hash, timestamp); err != nil {
 				return fmt.Errorf("insert recovery code: %w", err)
+			}
+		}
+		if beforeCommit != nil {
+			if err := beforeCommit(tx); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -246,6 +252,7 @@ func (r *repository) verifyRecentTOTP(
 	rawToken string,
 	now time.Time,
 	verify func(*sql.Tx, string, []byte, sql.NullInt64) error,
+	beforeCommit func(*sql.Tx, SessionPrincipal) error,
 ) (SessionPrincipal, error) {
 	tokenHash := sha256.Sum256([]byte(rawToken))
 	var principal SessionPrincipal
@@ -281,6 +288,11 @@ func (r *repository) verifyRecentTOTP(
 		}
 		record.RecentTOTPAt = now
 		principal = principalFromSession(record)
+		if beforeCommit != nil {
+			if err := beforeCommit(tx, principal); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	return principal, err

@@ -74,6 +74,8 @@ func writeDomainError(writer http.ResponseWriter, request *http.Request, err err
 		errors.Is(err, identity.ErrInvalidCredentials),
 		errors.Is(err, identity.ErrInvalidChallenge),
 		errors.Is(err, identity.ErrInvalidTOTP),
+		errors.Is(err, identity.ErrTOTPReplay),
+		errors.Is(err, identity.ErrInvalidRecoveryCode),
 		errors.Is(err, agents.ErrAuthenticationFailed),
 		errors.Is(err, agents.ErrUnauthenticated),
 		errors.Is(err, spaces.ErrUnauthenticated):
@@ -85,17 +87,23 @@ func writeDomainError(writer http.ResponseWriter, request *http.Request, err err
 		errors.Is(err, assets.ErrInvalidInput),
 		errors.Is(err, assets.ErrInvalidCursor),
 		errors.Is(err, agents.ErrInvalidInput),
+		errors.Is(err, agents.ErrIdempotencyRequired),
 		errors.Is(err, agents.ErrInvalidGrant),
 		errors.Is(err, agents.ErrInvalidScope),
 		errors.Is(err, spaces.ErrInvalidName),
 		errors.Is(err, spaces.ErrInvalidRole),
+		errors.Is(err, identity.ErrInvalidOwnerInput),
 		errors.Is(err, audit.ErrInvalidFilter),
 		errors.Is(err, audit.ErrInvalidCursor):
 		writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
 	case errors.Is(err, credentials.ErrVersionConflict),
-		errors.Is(err, assets.ErrVersionConflict):
+		errors.Is(err, assets.ErrVersionConflict),
+		errors.Is(err, spaces.ErrVersionConflict),
+		errors.Is(err, spaces.ErrMembershipExists),
+		errors.Is(err, identity.ErrInitialOwnerExists):
 		writeAPIError(writer, request, http.StatusConflict, "VERSION_CONFLICT", false, nil)
-	case errors.Is(err, credentials.ErrIdempotencyConflict):
+	case errors.Is(err, credentials.ErrIdempotencyConflict),
+		errors.Is(err, agents.ErrIdempotencyConflict):
 		writeAPIError(writer, request, http.StatusConflict, "IDEMPOTENCY_CONFLICT", false, nil)
 	case errors.Is(err, credentials.ErrNotFound),
 		errors.Is(err, assets.ErrNotFound),
@@ -110,8 +118,10 @@ func writeDomainError(writer http.ResponseWriter, request *http.Request, err err
 	case errors.Is(err, authorization.ErrDenied),
 		errors.Is(err, identity.ErrForbidden),
 		errors.Is(err, identity.ErrRecentTOTPRequired),
+		errors.Is(err, identity.ErrInitialOwnerSourceDenied),
 		errors.Is(err, agents.ErrForbidden),
-		errors.Is(err, spaces.ErrForbidden):
+		errors.Is(err, spaces.ErrForbidden),
+		errors.Is(err, spaces.ErrLastOwner):
 		writeAPIError(writer, request, http.StatusForbidden, "PERMISSION_DENIED", false, nil)
 	case errors.Is(err, audit.ErrAuditUnavailable),
 		errors.Is(err, assets.ErrUnavailable),

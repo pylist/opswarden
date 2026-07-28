@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -16,14 +17,22 @@ import (
 
 	"opswarden/internal/audit"
 	"opswarden/internal/authorization"
+	"opswarden/internal/identity"
 	"opswarden/internal/platform"
 	"opswarden/internal/storage"
 )
 
 const (
-	maxAgentNameBytes = 256
-	maxGrantLabels    = 64
+	maxAgentNameBytes        = 256
+	maxGrantLabels           = 64
+	humanIdempotencyLifetime = 24 * time.Hour
 )
+
+type humanIdempotencyResult struct {
+	ResourceID string
+	Version    uint64
+	Status     int
+}
 
 type AuditAppender interface {
 	AppendTx(context.Context, *sql.Tx, audit.Event) error
@@ -65,6 +74,12 @@ func (service *Service) Create(
 	if err := validateMutationContext(principal); err != nil {
 		return Agent{}, err
 	}
+	requestHash, err := humanRequestHash(struct {
+		Name string `json:"name"`
+	}{Name: name})
+	if err != nil {
+		return Agent{}, err
+	}
 	id, err := randomID("agt_", 16)
 	if err != nil {
 		return Agent{}, errors.New("create agent")
@@ -74,7 +89,11 @@ func (service *Service) Create(
 		return Agent{}, ErrInvalidInput
 	}
 	agent := Agent{ID: id, Name: name, CreatedAt: now, UpdatedAt: now}
+	var replayed *Agent
 	err = service.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if !principal.Session.HasRecentTOTP(now) {
+			return identity.ErrRecentTOTPRequired
+		}
 		human, err := service.repository.humanPrincipalTx(
 			ctx, tx, principal.Session, "",
 		)
@@ -85,6 +104,33 @@ func (service *Service) Create(
 			human, authorization.Resource{}, authorization.CreateAgent,
 		)); err != nil {
 			return err
+		}
+		result, found, err := checkHumanIdempotency(
+			ctx, tx, principal, "agent.create", requestHash, now,
+		)
+		if err != nil {
+			return err
+		}
+		if found {
+			var existing Agent
+			var createdAt, updatedAt string
+			if err := tx.QueryRowContext(ctx, `
+				SELECT id, name, created_at, updated_at FROM agents WHERE id = ?
+			`, result.ResourceID).Scan(
+				&existing.ID, &existing.Name, &createdAt, &updatedAt,
+			); err != nil {
+				return errors.New("replay agent create")
+			}
+			existing.CreatedAt, err = parseAgentTime(createdAt)
+			if err != nil {
+				return errors.New("replay agent create")
+			}
+			existing.UpdatedAt, err = parseAgentTime(updatedAt)
+			if err != nil {
+				return errors.New("replay agent create")
+			}
+			replayed = &existing
+			return nil
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO agents (
@@ -104,10 +150,18 @@ func (service *Service) Create(
 		if err := service.audit.AppendTx(ctx, tx, event); err != nil {
 			return ErrAuditUnavailable
 		}
-		return nil
+		return saveHumanIdempotency(
+			ctx, tx, principal, "agent.create", requestHash,
+			humanIdempotencyResult{
+				ResourceID: agent.ID, Version: 1, Status: 201,
+			}, now,
+		)
 	})
 	if err != nil {
 		return Agent{}, err
+	}
+	if replayed != nil {
+		return *replayed, nil
 	}
 	return agent, nil
 }
@@ -134,22 +188,19 @@ func (service *Service) IssueToken(
 			return IssuedToken{}, ErrInvalidInput
 		}
 	}
-	tokenID, err := randomID("tok_", 16)
+	requestHash, err := humanRequestHash(struct {
+		AgentID   string `json:"agent_id"`
+		ExpiresAt string `json:"expires_at"`
+	}{AgentID: agentID, ExpiresAt: expiresAt.Format(time.RFC3339Nano)})
 	if err != nil {
-		return IssuedToken{}, errors.New("issue agent token")
+		return IssuedToken{}, err
 	}
-	var entropy [32]byte
-	if _, err := rand.Read(entropy[:]); err != nil {
-		return IssuedToken{}, errors.New("issue agent token")
-	}
-	raw := "owat_" + base64.RawURLEncoding.EncodeToString(entropy[:])
-	clear(entropy[:])
-	prefix := raw[:len("owat_")+8]
-	hash := sha256.Sum256([]byte(raw))
-	issued := IssuedToken{
-		ID: tokenID, Prefix: prefix, Raw: raw, ExpiresAt: expiresAt,
-	}
+	var issued IssuedToken
+	var replayed *IssuedToken
 	err = service.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if !principal.Session.HasRecentTOTP(now) {
+			return identity.ErrRecentTOTPRequired
+		}
 		human, err := service.repository.humanPrincipalTx(
 			ctx, tx, principal.Session, "",
 		)
@@ -164,6 +215,49 @@ func (service *Service) IssueToken(
 		}
 		if err := service.repository.requireActiveAgentTx(ctx, tx, agentID); err != nil {
 			return err
+		}
+		result, found, err := checkHumanIdempotency(
+			ctx, tx, principal, "agent.token.issue/"+agentID, requestHash, now,
+		)
+		if err != nil {
+			return err
+		}
+		if found {
+			var existing IssuedToken
+			var expiry sql.NullString
+			if err := tx.QueryRowContext(ctx, `
+				SELECT id, token_prefix, expires_at
+				FROM agent_tokens WHERE id = ? AND agent_id = ?
+			`, result.ResourceID, agentID).Scan(
+				&existing.ID, &existing.Prefix, &expiry,
+			); err != nil {
+				return errors.New("replay agent token issue")
+			}
+			if expiry.Valid {
+				existing.ExpiresAt, err = parseAgentTime(expiry.String)
+				if err != nil {
+					return errors.New("replay agent token issue")
+				}
+			}
+			existing.Replayed = true
+			replayed = &existing
+			return nil
+		}
+		tokenID, err := randomID("tok_", 16)
+		if err != nil {
+			return errors.New("issue agent token")
+		}
+		var entropy [32]byte
+		if _, err := rand.Read(entropy[:]); err != nil {
+			return errors.New("issue agent token")
+		}
+		raw := "owat_" + base64.RawURLEncoding.EncodeToString(entropy[:])
+		clear(entropy[:])
+		prefix := raw[:len("owat_")+8]
+		hash := sha256.Sum256([]byte(raw))
+		defer clear(hash[:])
+		issued = IssuedToken{
+			ID: tokenID, Prefix: prefix, Raw: raw, ExpiresAt: expiresAt,
 		}
 		var expiry any
 		if !expiresAt.IsZero() {
@@ -186,12 +280,20 @@ func (service *Service) IssueToken(
 		if err := service.audit.AppendTx(ctx, tx, event); err != nil {
 			return ErrAuditUnavailable
 		}
-		return nil
+		return saveHumanIdempotency(
+			ctx, tx, principal, "agent.token.issue/"+agentID, requestHash,
+			humanIdempotencyResult{
+				ResourceID: issued.ID, Version: 1, Status: 201,
+			}, now,
+		)
 	})
-	clear(hash[:])
 	if err != nil {
 		issued.Raw = ""
 		return IssuedToken{}, err
+	}
+	if replayed != nil {
+		issued.Raw = ""
+		return *replayed, nil
 	}
 	return issued, nil
 }
@@ -207,8 +309,17 @@ func (service *Service) RevokeToken(
 	if err := validateMutationContext(principal); err != nil {
 		return err
 	}
+	requestHash, err := humanRequestHash(struct {
+		TokenID string `json:"token_id"`
+	}{TokenID: tokenID})
+	if err != nil {
+		return err
+	}
 	now := service.clock.Now().UTC()
 	return service.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if !principal.Session.HasRecentTOTP(now) {
+			return identity.ErrRecentTOTPRequired
+		}
 		human, err := service.repository.humanPrincipalTx(
 			ctx, tx, principal.Session, "",
 		)
@@ -219,6 +330,12 @@ func (service *Service) RevokeToken(
 			human, authorization.Resource{ResourceID: tokenID},
 			authorization.RevokeAgentToken,
 		)); err != nil {
+			return err
+		}
+		_, found, err := checkHumanIdempotency(
+			ctx, tx, principal, "agent.token.revoke/"+tokenID, requestHash, now,
+		)
+		if err != nil || found {
 			return err
 		}
 		var agentID string
@@ -250,7 +367,12 @@ func (service *Service) RevokeToken(
 		if err := service.audit.AppendTx(ctx, tx, event); err != nil {
 			return ErrAuditUnavailable
 		}
-		return nil
+		return saveHumanIdempotency(
+			ctx, tx, principal, "agent.token.revoke/"+tokenID, requestHash,
+			humanIdempotencyResult{
+				ResourceID: tokenID, Version: 1, Status: 204,
+			}, now,
+		)
 	})
 }
 
@@ -274,8 +396,18 @@ func (service *Service) SetGrant(
 	if err != nil {
 		return err
 	}
+	requestHash, err := humanRequestHash(struct {
+		AgentID string `json:"agent_id"`
+		Grant   Grant  `json:"grant"`
+	}{AgentID: agentID, Grant: normalized})
+	if err != nil {
+		return err
+	}
 	now := service.clock.Now().UTC()
 	return service.repository.withTx(ctx, func(tx *sql.Tx) error {
+		if !principal.Session.HasRecentTOTP(now) {
+			return identity.ErrRecentTOTPRequired
+		}
 		human, err := service.repository.humanPrincipalTx(
 			ctx, tx, principal.Session, normalized.SpaceID,
 		)
@@ -295,6 +427,13 @@ func (service *Service) SetGrant(
 		if err := service.repository.requireActiveSpaceTx(
 			ctx, tx, normalized.SpaceID,
 		); err != nil {
+			return err
+		}
+		endpoint := "agent.grant.set/" + agentID + "/" + normalized.SpaceID
+		_, found, err := checkHumanIdempotency(
+			ctx, tx, principal, endpoint, requestHash, now,
+		)
+		if err != nil || found {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `
@@ -319,7 +458,12 @@ func (service *Service) SetGrant(
 		if err := service.audit.AppendTx(ctx, tx, event); err != nil {
 			return ErrAuditUnavailable
 		}
-		return nil
+		return saveHumanIdempotency(
+			ctx, tx, principal, endpoint, requestHash,
+			humanIdempotencyResult{
+				ResourceID: agentID, Version: 1, Status: 204,
+			}, now,
+		)
 	})
 }
 
@@ -441,7 +585,7 @@ func (service *Service) ListUsage(
 	ctx context.Context,
 	principal MutationContext,
 ) ([]Usage, error) {
-	if err := validateMutationContext(principal); err != nil {
+	if err := validateHumanContext(principal); err != nil {
 		return nil, err
 	}
 	var usage []Usage
@@ -527,7 +671,110 @@ func (service *Service) auditEvent(
 	return event, nil
 }
 
+func humanRequestHash(value any) (string, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", ErrInvalidInput
+	}
+	sum := sha256.Sum256(encoded)
+	clear(encoded)
+	result := hex.EncodeToString(sum[:])
+	clear(sum[:])
+	return result, nil
+}
+
+func checkHumanIdempotency(
+	ctx context.Context,
+	tx *sql.Tx,
+	principal MutationContext,
+	endpoint string,
+	requestHash string,
+	now time.Time,
+) (humanIdempotencyResult, bool, error) {
+	if principal.IdempotencyKey == "" {
+		return humanIdempotencyResult{}, false, ErrIdempotencyRequired
+	}
+	keyHash := sha256.Sum256([]byte(principal.IdempotencyKey))
+	defer clear(keyHash[:])
+	var result humanIdempotencyResult
+	var storedHash string
+	var expiresAt string
+	err := tx.QueryRowContext(ctx, `
+		SELECT request_hash, resource_id, resource_version, response_status, expires_at
+		FROM human_agent_idempotency_records
+		WHERE user_id = ? AND endpoint = ? AND key_hash = ?
+	`, principal.Session.UserID, endpoint, keyHash[:]).Scan(
+		&storedHash, &result.ResourceID, &result.Version,
+		&result.Status, &expiresAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return humanIdempotencyResult{}, false, nil
+	}
+	if err != nil {
+		return humanIdempotencyResult{}, false, errors.New("read agent idempotency")
+	}
+	expiry, err := time.Parse(time.RFC3339Nano, expiresAt)
+	if err != nil {
+		return humanIdempotencyResult{}, false, errors.New("read agent idempotency")
+	}
+	if !now.Before(expiry) {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM human_agent_idempotency_records
+			WHERE user_id = ? AND endpoint = ? AND key_hash = ?
+		`, principal.Session.UserID, endpoint, keyHash[:]); err != nil {
+			return humanIdempotencyResult{}, false, errors.New("expire agent idempotency")
+		}
+		return humanIdempotencyResult{}, false, nil
+	}
+	if storedHash != requestHash {
+		return humanIdempotencyResult{}, false, ErrIdempotencyConflict
+	}
+	return result, true, nil
+}
+
+func saveHumanIdempotency(
+	ctx context.Context,
+	tx *sql.Tx,
+	principal MutationContext,
+	endpoint string,
+	requestHash string,
+	result humanIdempotencyResult,
+	now time.Time,
+) error {
+	if principal.IdempotencyKey == "" {
+		return ErrIdempotencyRequired
+	}
+	id, err := randomID("hid_", 16)
+	if err != nil {
+		return errors.New("store agent idempotency")
+	}
+	keyHash := sha256.Sum256([]byte(principal.IdempotencyKey))
+	defer clear(keyHash[:])
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO human_agent_idempotency_records (
+			id, user_id, endpoint, key_hash, request_hash, resource_id,
+			resource_version, response_status, created_at, expires_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, principal.Session.UserID, endpoint, keyHash[:], requestHash,
+		result.ResourceID, result.Version, result.Status, formatAgentTime(now),
+		formatAgentTime(now.Add(humanIdempotencyLifetime))); err != nil {
+		return errors.New("store agent idempotency")
+	}
+	return nil
+}
+
 func validateMutationContext(principal MutationContext) error {
+	if err := validateHumanContext(principal); err != nil {
+		return err
+	}
+	if principal.IdempotencyKey == "" ||
+		!validText(principal.IdempotencyKey, 256, false) {
+		return ErrIdempotencyRequired
+	}
+	return nil
+}
+
+func validateHumanContext(principal MutationContext) error {
 	if principal.Session.UserID == "" || principal.Session.SessionID == "" {
 		return ErrUnauthenticated
 	}

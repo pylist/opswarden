@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -56,6 +57,9 @@ func decodeJSONBody(
 	if err := rejectDuplicateJSONKeys(encoded); err != nil {
 		return err
 	}
+	if err := validateCanonicalTopLevelFields(encoded, destination); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
@@ -64,6 +68,38 @@ func decodeJSONBody(
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return errors.New("request body must contain one JSON document")
+	}
+	return nil
+}
+
+func validateCanonicalTopLevelFields(encoded []byte, destination any) error {
+	value := reflect.ValueOf(destination)
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		return errors.New("JSON destination must be a pointer")
+	}
+	typ := value.Elem().Type()
+	if typ.Kind() != reflect.Struct {
+		return errors.New("JSON destination must point to a struct")
+	}
+	allowed := make(map[string]struct{}, typ.NumField())
+	for index := 0; index < typ.NumField(); index++ {
+		field := typ.Field(index)
+		tag := strings.Split(field.Tag.Get("json"), ",")[0]
+		if tag == "" {
+			tag = field.Name
+		}
+		if tag != "-" {
+			allowed[tag] = struct{}{}
+		}
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil || fields == nil {
+		return errors.New("JSON body must be an object")
+	}
+	for key := range fields {
+		if _, ok := allowed[key]; !ok {
+			return errors.New("unknown or non-canonical JSON field")
+		}
 	}
 	return nil
 }

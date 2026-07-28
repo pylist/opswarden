@@ -11,6 +11,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 
 	"golang.org/x/crypto/argon2"
 
+	"opswarden/internal/audit"
 	"opswarden/internal/cryptobox"
 	"opswarden/internal/platform"
 	"opswarden/internal/storage"
@@ -60,8 +62,11 @@ type Service struct {
 	box           *cryptobox.Box
 	clock         platform.Clock
 	internalCIDRs []netip.Prefix
-	dummyHash     []byte
-	kdf           passwordKDF
+	audit         interface {
+		AppendTx(context.Context, *sql.Tx, audit.Event) error
+	}
+	dummyHash []byte
+	kdf       passwordKDF
 
 	challengesMu sync.Mutex
 	challenges   map[string]loginChallengeState
@@ -104,6 +109,7 @@ func newServiceWithKDF(
 		box:           box,
 		clock:         clock,
 		internalCIDRs: append([]netip.Prefix(nil), config.InternalCIDRs...),
+		audit:         config.Audit,
 		dummyHash:     dummyHash,
 		kdf:           kdf,
 		challenges:    make(map[string]loginChallengeState),
@@ -164,9 +170,29 @@ func (s *Service) CreateInitialOwner(
 		recoveryRecords = append(recoveryRecords, recoveryCodeRecord{ID: id, Hash: sum[:]})
 	}
 	now := s.now()
+	auditID, err := randomID(16)
+	if err != nil {
+		return CreateOwnerResult{}, err
+	}
+	bootstrapFingerprint := sha256.Sum256([]byte("opswarden/bootstrap/v1"))
 	if err := s.repository.createInitialOwner(
 		ctx, userID, email, normalizedEmail, passwordHash, encryptedTOTP,
-		recoveryRecords, now,
+		recoveryRecords, now, func(tx *sql.Tx) error {
+			if s.audit == nil {
+				return nil
+			}
+			return s.audit.AppendTx(ctx, tx, audit.Event{
+				Actor: audit.Actor{
+					Type: audit.ActorUser, ID: userID,
+					Fingerprint: hex.EncodeToString(bootstrapFingerprint[:8]),
+				},
+				ID: auditID, CreatedAt: now, Success: true,
+				Action: "identity.initial_owner.create", ResourceType: "user",
+				ResourceID: userID, RequestID: input.RequestID,
+				SourceIP: input.SourceIP.String(), UserAgent: input.UserAgent,
+				ChangeFields: audit.ChangeFields{audit.FieldSystemRole},
+			})
+		},
 	); err != nil {
 		return CreateOwnerResult{}, err
 	}
@@ -272,19 +298,65 @@ func (s *Service) VerifyRecentTOTP(
 	ctx context.Context,
 	rawToken, code string,
 ) (SessionPrincipal, error) {
+	return s.verifyRecentTOTP(ctx, rawToken, code, AuthenticationContext{}, false)
+}
+
+func (s *Service) VerifyRecentTOTPAudited(
+	ctx context.Context,
+	rawToken, code string,
+	authentication AuthenticationContext,
+) (SessionPrincipal, error) {
+	return s.verifyRecentTOTP(ctx, rawToken, code, authentication, true)
+}
+
+func (s *Service) verifyRecentTOTP(
+	ctx context.Context,
+	rawToken, code string,
+	authentication AuthenticationContext,
+	requireAudit bool,
+) (SessionPrincipal, error) {
 	if rawToken == "" {
 		return SessionPrincipal{}, ErrInvalidSession
 	}
 	if !isTOTPCode(code) {
 		return SessionPrincipal{}, ErrInvalidTOTP
 	}
+	if requireAudit && s.audit == nil {
+		return SessionPrincipal{}, audit.ErrAuditUnavailable
+	}
 	now := s.now()
+	var auditID string
+	if requireAudit {
+		var err error
+		auditID, err = randomID(16)
+		if err != nil {
+			return SessionPrincipal{}, err
+		}
+	}
+	sessionFingerprint := sha256.Sum256([]byte(rawToken))
+	defer clear(sessionFingerprint[:])
 	return s.repository.verifyRecentTOTP(
 		ctx, rawToken, now,
 		func(tx *sql.Tx, userID string, encodedSecret []byte, lastCounter sql.NullInt64) error {
 			return s.verifyAndConsumeTOTP(
 				ctx, tx, userID, encodedSecret, lastCounter, code, now,
 			)
+		},
+		func(tx *sql.Tx, principal SessionPrincipal) error {
+			if !requireAudit {
+				return nil
+			}
+			return s.audit.AppendTx(ctx, tx, audit.Event{
+				ID: auditID, RequestID: authentication.RequestID,
+				CreatedAt: now,
+				Actor: audit.Actor{
+					Type: audit.ActorUser, ID: principal.UserID,
+					Fingerprint: hex.EncodeToString(sessionFingerprint[:8]),
+				},
+				Action: "auth.totp.reverify", ResourceType: "user",
+				ResourceID: principal.UserID, SourceIP: authentication.SourceIP,
+				UserAgent: authentication.UserAgent, Success: true,
+			})
 		},
 	)
 }

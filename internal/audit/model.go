@@ -13,8 +13,9 @@ const MaxAuditTextBytes = 512
 type ActorType string
 
 const (
-	ActorUser  ActorType = "user"
-	ActorAgent ActorType = "agent"
+	ActorUser      ActorType = "user"
+	ActorAgent     ActorType = "agent"
+	ActorAnonymous ActorType = "anonymous"
 )
 
 const (
@@ -139,7 +140,8 @@ func Validate(event Event) error {
 }
 
 func validateActor(actor Actor) error {
-	if actor.Type != ActorUser && actor.Type != ActorAgent {
+	if actor.Type != ActorUser && actor.Type != ActorAgent &&
+		actor.Type != ActorAnonymous {
 		return ErrInvalidActor
 	}
 	if !validIdentifier(actor.ID, 256) {

@@ -27,6 +27,7 @@ var (
 	ErrMembershipExists   = errors.New("Space membership already exists")
 	ErrMembershipNotFound = errors.New("Space membership not found")
 	ErrLastOwner          = errors.New("at least one Space Owner is required")
+	ErrVersionConflict    = errors.New("Space membership version conflict")
 )
 
 type Space struct {
@@ -39,6 +40,14 @@ type Space struct {
 
 type CreateInput struct {
 	Name string
+}
+
+type Member struct {
+	UserID    string
+	Email     string
+	Role      Role
+	Version   uint64
+	CreatedAt time.Time
 }
 
 type MutationContext struct {

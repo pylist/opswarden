@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"opswarden/internal/credentials"
+	"opswarden/internal/identity"
 	"opswarden/internal/spaces"
 )
 
@@ -56,6 +57,28 @@ type spaceResponse struct {
 type mutationResponse struct {
 	ID      string `json:"id"`
 	Version uint64 `json:"version"`
+}
+
+type memberCreateRequest struct {
+	UserID string      `json:"userId"`
+	Role   spaces.Role `json:"role"`
+}
+
+type memberRoleRequest struct {
+	Role            spaces.Role `json:"role"`
+	ExpectedVersion uint64      `json:"expectedVersion"`
+}
+
+type memberDeleteRequest struct {
+	ExpectedVersion uint64 `json:"expectedVersion"`
+}
+
+type memberResponse struct {
+	UserID    string      `json:"userId"`
+	Email     string      `json:"email"`
+	Role      spaces.Role `json:"role"`
+	Version   uint64      `json:"version"`
+	CreatedAt any         `json:"createdAt"`
 }
 
 func (router *Router) handleSpaces(writer http.ResponseWriter, request *http.Request) {
@@ -128,8 +151,114 @@ func (router *Router) handleSpaceResource(
 		router.handleCredentials(writer, request, spaceID, segments[5:])
 	case "assets":
 		router.handleAssets(writer, request, spaceID, segments[5:])
+	case "members":
+		router.handleMembers(writer, request, spaceID, segments[5:])
 	default:
 		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
+	}
+}
+
+func (router *Router) handleMembers(
+	writer http.ResponseWriter,
+	request *http.Request,
+	spaceID string,
+	rest []string,
+) {
+	if router.deps.Spaces == nil {
+		writeAPIError(writer, request, http.StatusServiceUnavailable, "STORAGE_UNAVAILABLE", true, nil)
+		return
+	}
+	auth, ok := request.Context().Value(authenticationKey).(authentication)
+	if !ok || auth.human == nil {
+		writeAPIError(writer, request, http.StatusUnauthorized, "UNAUTHENTICATED", false, nil)
+		return
+	}
+	mutation := router.spaceMutationContext(request, *auth.human)
+	switch {
+	case len(rest) == 0 && request.Method == http.MethodGet:
+		members, err := router.deps.Spaces.ListMembers(
+			request.Context(), *auth.human, spaceID,
+		)
+		if err != nil {
+			writeDomainError(writer, request, err)
+			return
+		}
+		response := make([]memberResponse, 0, len(members))
+		for _, member := range members {
+			response = append(response, memberDTO(member))
+		}
+		writeJSON(writer, http.StatusOK, struct {
+			Items []memberResponse `json:"items"`
+		}{Items: response})
+	case len(rest) == 0 && request.Method == http.MethodPost:
+		var input memberCreateRequest
+		if err := decodeJSONBody(
+			writer, request, defaultBodyLimit, &input,
+		); err != nil {
+			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			return
+		}
+		member, err := router.deps.Spaces.AddMemberAudited(
+			request.Context(), mutation, spaceID, input.UserID, input.Role,
+		)
+		if err != nil {
+			writeDomainError(writer, request, err)
+			return
+		}
+		writeJSON(writer, http.StatusCreated, memberDTO(member))
+	case len(rest) == 1 && rest[0] != "" && request.Method == http.MethodPatch:
+		var input memberRoleRequest
+		if err := decodeJSONBody(
+			writer, request, defaultBodyLimit, &input,
+		); err != nil {
+			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			return
+		}
+		member, err := router.deps.Spaces.ChangeRoleAudited(
+			request.Context(), mutation, spaceID, rest[0],
+			input.Role, input.ExpectedVersion,
+		)
+		if err != nil {
+			writeDomainError(writer, request, err)
+			return
+		}
+		writeJSON(writer, http.StatusOK, memberDTO(member))
+	case len(rest) == 1 && rest[0] != "" && request.Method == http.MethodDelete:
+		var input memberDeleteRequest
+		if err := decodeJSONBody(
+			writer, request, defaultBodyLimit, &input,
+		); err != nil {
+			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			return
+		}
+		if err := router.deps.Spaces.RemoveMemberAudited(
+			request.Context(), mutation, spaceID, rest[0], input.ExpectedVersion,
+		); err != nil {
+			writeDomainError(writer, request, err)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	default:
+		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
+	}
+}
+
+func (router *Router) spaceMutationContext(
+	request *http.Request,
+	session identity.SessionPrincipal,
+) spaces.MutationContext {
+	auth, _ := request.Context().Value(authenticationKey).(authentication)
+	metadata := requestMetadataFromContext(request.Context())
+	return spaces.MutationContext{
+		Session: session, Actor: auth.actor, RequestID: metadata.requestID,
+		SourceIP: metadata.sourceIP, UserAgent: metadata.userAgent,
+	}
+}
+
+func memberDTO(member spaces.Member) memberResponse {
+	return memberResponse{
+		UserID: member.UserID, Email: member.Email, Role: member.Role,
+		Version: member.Version, CreatedAt: member.CreatedAt,
 	}
 }
 
