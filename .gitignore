@@ -29,3 +29,9 @@ coverage/
 bin/
 node_modules/
 *.tsbuildinfo
+
+# Hermetic acceptance-test output
+/.artifacts/
+/.tmp/
+/tests/e2e/test-results/
+/tests/e2e/playwright-report/

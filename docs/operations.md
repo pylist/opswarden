@@ -733,3 +733,40 @@ export 必须以非 root isolated Python 执行固定 exporter；privileged
 install-manifest/seal-env/seal-release/preflight 只能执行固定 root-owned helper，
 且 root helper 自身绝不运行 Git。任何一步失败都不得安装辅助程序、启动 Compose
 或接触生产 DNS。
+
+## 11. 一键发布验证
+
+发布候选必须从仓库根目录执行 `make verify`。前置条件是 Go 1.24、Node.js 22、
+npm、Python 3、可用的 Docker/Compose，以及可访问 Playwright 和已锁定基础镜像的
+网络；首次运行会按 `tests/e2e/package-lock.json` 安装测试依赖和对应 Chromium。
+不要预先创建 `.tmp/e2e` 或 `.artifacts/e2e`，harness 只会清理并重建这两个仓库内
+专用目录。
+
+验证顺序固定为 Go vet/race 与部署辅助程序测试、React 单测和生产构建、Compose
+解析、固定参数镜像构建、三个串行 Playwright 场景及敏感值扫描。场景覆盖：
+
+- 浏览器创建凭据，Hermes 风格 MCP Agent 读取、更新、软删除，随后在 UI 回收站和
+  审计事件中验证同一资源；
+- 对当前 Space 中不存在的 ID 与另一个 Space 中真实 ID 比较一致的 404 安全响应；
+- 使用 SQLite 在线 Backup API 产生一致快照，将快照和独立保存的匹配 key 副本放入
+  独立 Compose project，验证解密，再离线吊销恢复环境中的浏览器会话和 Agent Token。
+
+成功时最后一行是
+`sensitive fixture scan: clean (7 required artifact classes)`。扫描器以 `grep -q`
+读取仅限当前用户的随机值文件，不会把密码、Token、私钥片段、连接串、TOTP seed、
+session ID 或主密钥写入参数和输出；它检查运行中 SQLite、在线备份、应用/恢复日志、
+审计导出、浏览器存储和捕获的 REST/MCP 错误体，并额外检查 Git 跟踪文件。
+
+失败时先保留 `.artifacts/e2e` 和 `.tmp/e2e` 调查：
+
+- `application.log` 用于本地测试服务启动问题；
+- `restore-compose.log` 用于恢复容器、权限或 key 不匹配问题；
+- Playwright trace 位于 `tests/e2e/test-results`；
+- 扫描失败只报告“发现泄漏”，不会打印匹配内容。此时把整套产物视为敏感材料，
+  不要上传 CI artifact 或粘贴日志，定位后删除专用目录并重新运行。
+
+Playwright 的 webServer 退出时会终止本地服务；恢复测试的 `finally` 无条件执行
+`docker compose down --volumes --remove-orphans`。若进程被强制杀死，可用
+`docker compose -p opswarden-e2e-restore down --volumes --remove-orphans` 清理，
+确认没有 `opswarden-e2e-restore` 容器或网络后，再删除 `.tmp/e2e` 和
+`.artifacts/e2e`。

@@ -90,7 +90,7 @@ export function RecycleBinPage({
     try {
       const value = await api.request<unknown>(
         apiPath(["spaces", space.id, "credentials"], {
-          deletedOnly: 1,
+          deletedOnly: "true",
           limit: 100,
           ...(after ? { after } : {}),
         }),

@@ -656,7 +656,7 @@ describe("credential workflows", () => {
   it("restores a soft-deleted credential with its current version", async () => {
     let restored = false;
     const api = apiFor(async (path, options) => {
-      if (path.endsWith("/credentials?deletedOnly=1&limit=100")) {
+      if (path.endsWith("/credentials?deletedOnly=true&limit=100")) {
         return restored
           ? { items: [] }
           : { items: [{ ...metadata, deletedAt: "2026-07-01T00:00:00Z" }] };
@@ -693,10 +693,10 @@ describe("credential workflows", () => {
   it("paginates the recycle bin", async () => {
     const deleted = { ...metadata, deletedAt: "2026-07-01T00:00:00Z" };
     const api = apiFor(async (path) => {
-      if (path.endsWith("/credentials?deletedOnly=1&limit=100")) {
+      if (path.endsWith("/credentials?deletedOnly=true&limit=100")) {
         return { items: [deleted], nextCursor: "deleted_1" };
       }
-      if (path.endsWith("/credentials?deletedOnly=1&limit=100&after=deleted_1")) {
+      if (path.endsWith("/credentials?deletedOnly=true&limit=100&after=deleted_1")) {
         return {
           items: [{ ...deleted, id: "crd_deleted_2", displayName: "deleted second" }],
         };
@@ -729,16 +729,16 @@ describe("credential workflows", () => {
         };
         return { items: [other, other] };
       }
-      if (path.endsWith("/credentials?deletedOnly=1&limit=100")) {
+      if (path.endsWith("/credentials?deletedOnly=true&limit=100")) {
         return { items: [deleted, deleted], nextCursor: "deleted_1" };
       }
-      if (path.endsWith("/credentials?deletedOnly=1&limit=100&after=deleted_1")) {
+      if (path.endsWith("/credentials?deletedOnly=true&limit=100&after=deleted_1")) {
         firstContinuation += 1;
         if (firstContinuation === 1) throw new Error("transient");
         const second = { ...deleted, id: "crd_deleted_2", displayName: "deleted two" };
         return { items: [deleted, second, second], nextCursor: "deleted_2" };
       }
-      if (path.endsWith("/credentials?deletedOnly=1&limit=100&after=deleted_2")) {
+      if (path.endsWith("/credentials?deletedOnly=true&limit=100&after=deleted_2")) {
         secondContinuation += 1;
         if (secondContinuation === 1) {
           return {
@@ -787,7 +787,7 @@ describe("credential workflows", () => {
   it("renews the JWT before a single exact permanent-purge request", async () => {
     let listed = false;
     const request = vi.fn(async (path: string, options?: unknown) => {
-      if (path.endsWith("/credentials?deletedOnly=1&limit=100")) {
+      if (path.endsWith("/credentials?deletedOnly=true&limit=100")) {
         if (listed) return { items: [] };
         listed = true;
         return {
@@ -843,7 +843,7 @@ describe("credential workflows", () => {
     async (mode) => {
       const verification = deferred<void>();
       const request = vi.fn(async (path: string) => {
-        if (path.includes("/credentials?deletedOnly=1&limit=100")) {
+        if (path.includes("/credentials?deletedOnly=true&limit=100")) {
           return {
             items: [{
               ...metadata,
@@ -901,7 +901,7 @@ describe("credential workflows", () => {
     const first = deferred<void>();
     const second = deferred<void>();
     const request = vi.fn(async (path: string) => {
-      if (path.endsWith("/credentials?deletedOnly=1&limit=100")) {
+      if (path.endsWith("/credentials?deletedOnly=true&limit=100")) {
         return {
           items: [{ ...metadata, deletedAt: "2026-07-01T00:00:00Z" }],
         };

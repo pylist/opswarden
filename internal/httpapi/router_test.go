@@ -1120,6 +1120,34 @@ func TestStateChangeRequiresAuthorizationHeaderEvenWithCookie(t *testing.T) {
 	}
 }
 
+func TestSpaceCreateAcceptsOnlyCanonicalLowercaseName(t *testing.T) {
+	handler, token, _ := authenticatedTestHandler(
+		t, &fakeCredentialService{}, nil,
+	)
+	canonical := serveAuthorized(
+		handler, token, http.MethodPost, "/api/v1/spaces",
+		strings.NewReader(`{"name":"E2E Space"}`),
+	)
+	if canonical.Code != http.StatusCreated ||
+		!strings.Contains(canonical.Body.String(), `"name":"E2E Space"`) {
+		t.Fatalf(
+			"canonical status=%d body=%s",
+			canonical.Code, canonical.Body.String(),
+		)
+	}
+	nonCanonical := serveAuthorized(
+		handler, token, http.MethodPost, "/api/v1/spaces",
+		strings.NewReader(`{"Name":"E2E Space"}`),
+	)
+	if nonCanonical.Code != http.StatusBadRequest ||
+		!strings.Contains(nonCanonical.Body.String(), `"code":"INVALID_REQUEST"`) {
+		t.Fatalf(
+			"noncanonical status=%d body=%s",
+			nonCanonical.Code, nonCanonical.Body.String(),
+		)
+	}
+}
+
 type fakeSpaceService struct{ systemRole string }
 
 func (fakeSpaceService) CreateAudited(

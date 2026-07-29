@@ -39,7 +39,7 @@ type Space struct {
 }
 
 type CreateInput struct {
-	Name string
+	Name string `json:"name"`
 }
 
 type Member struct {
