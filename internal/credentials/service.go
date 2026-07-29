@@ -195,7 +195,19 @@ func (s *Service) GetAt(
 	principal Principal,
 	credentialID string,
 	now time.Time,
-) (Decrypted, error) {
+) (result Decrypted, returnErr error) {
+	failureMetadata := Metadata{}
+	defer func() {
+		if returnErr == nil {
+			return
+		}
+		if err := s.appendCredentialFailure(
+			ctx, principal, "credential.read", failureMetadata, returnErr, now,
+		); err != nil {
+			result = Decrypted{}
+			returnErr = err
+		}
+	}()
 	if credentialID == "" {
 		return Decrypted{}, ErrNotFound
 	}
@@ -205,6 +217,7 @@ func (s *Service) GetAt(
 	if err != nil {
 		return Decrypted{}, err
 	}
+	failureMetadata = record.metadata
 	if err := authorize(
 		principal, resourceForMetadata(record.metadata), authorization.ReadCredential,
 	); err != nil {
@@ -260,7 +273,19 @@ func (s *Service) CreateAt(
 	input CreateInput,
 	writeContext WriteContext,
 	now time.Time,
-) (MutationResult, error) {
+) (result MutationResult, returnErr error) {
+	failureMetadata := Metadata{}
+	defer func() {
+		if returnErr == nil {
+			return
+		}
+		if err := s.appendCredentialFailure(
+			ctx, principal, "credential.create", failureMetadata, returnErr, now,
+		); err != nil {
+			result = MutationResult{}
+			returnErr = err
+		}
+	}()
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 	if err := validateCreateInput(input); err != nil {
 		return MutationResult{}, err
@@ -331,6 +356,7 @@ func (s *Service) CreateAt(
 		if err := requireActiveSpace(ctx, tx, metadata.SpaceID); err != nil {
 			return err
 		}
+		failureMetadata = Metadata{SpaceID: metadata.SpaceID}
 		if len(metadata.AssetIDs) > 0 {
 			if err := authorizeAssetLinksTx(
 				ctx, tx, principal, metadata.ID, metadata.SpaceID, metadata.AssetIDs,
@@ -406,7 +432,19 @@ func (s *Service) UpdateAt(
 	input UpdateInput,
 	writeContext WriteContext,
 	now time.Time,
-) (MutationResult, error) {
+) (result MutationResult, returnErr error) {
+	failureMetadata := Metadata{}
+	defer func() {
+		if returnErr == nil {
+			return
+		}
+		if err := s.appendCredentialFailure(
+			ctx, principal, "credential.update", failureMetadata, returnErr, now,
+		); err != nil {
+			result = MutationResult{}
+			returnErr = err
+		}
+	}()
 	if input.ExpectedVersion == 0 {
 		return MutationResult{}, ErrVersionConflict
 	}
@@ -432,6 +470,7 @@ func (s *Service) UpdateAt(
 	if err != nil {
 		return MutationResult{}, err
 	}
+	failureMetadata = current.metadata
 	if err := authorize(
 		principal, resourceForMetadata(current.metadata), authorization.UpdateCredential,
 	); err != nil {
@@ -628,7 +667,18 @@ func (s *Service) DeleteAt(
 	expectedVersion uint64,
 	writeContext WriteContext,
 	now time.Time,
-) error {
+) (returnErr error) {
+	failureMetadata := Metadata{}
+	defer func() {
+		if returnErr == nil {
+			return
+		}
+		if err := s.appendCredentialFailure(
+			ctx, principal, "credential.delete", failureMetadata, returnErr, now,
+		); err != nil {
+			returnErr = err
+		}
+	}()
 	if expectedVersion == 0 {
 		return ErrVersionConflict
 	}
@@ -653,6 +703,7 @@ func (s *Service) DeleteAt(
 		if err != nil {
 			return err
 		}
+		failureMetadata = metadata
 		if err := authorize(
 			principal, resourceForMetadata(metadata), authorization.DeleteCredential,
 		); err != nil {
@@ -710,7 +761,20 @@ func (s *Service) Restore(
 	credentialID string,
 	expectedVersion uint64,
 	writeContext WriteContext,
-) (Metadata, error) {
+) (result Metadata, returnErr error) {
+	now := s.clock.Now().UTC()
+	failureMetadata := Metadata{}
+	defer func() {
+		if returnErr == nil {
+			return
+		}
+		if err := s.appendCredentialFailure(
+			ctx, principal, "credential.restore", failureMetadata, returnErr, now,
+		); err != nil {
+			result = Metadata{}
+			returnErr = err
+		}
+	}()
 	if credentialID == "" {
 		return Metadata{}, ErrNotFound
 	}
@@ -720,13 +784,13 @@ func (s *Service) Restore(
 	if err := validateMutationContext(principal, writeContext); err != nil {
 		return Metadata{}, err
 	}
-	now := s.clock.Now().UTC()
 	var restored Metadata
 	err := s.repository.withTx(ctx, func(tx *sql.Tx) error {
 		metadata, err := s.repository.metadataByID(ctx, tx, credentialID, true)
 		if err != nil {
 			return err
 		}
+		failureMetadata = metadata
 		if metadata.DeletedAt == nil {
 			return ErrNotFound
 		}
@@ -782,7 +846,19 @@ func (s *Service) Purge(
 	credentialID string,
 	expectedVersion uint64,
 	writeContext WriteContext,
-) error {
+) (returnErr error) {
+	failureTime := s.clock.Now().UTC()
+	failureMetadata := Metadata{}
+	defer func() {
+		if returnErr == nil {
+			return
+		}
+		if err := s.appendCredentialFailure(
+			ctx, principal, "credential.purge", failureMetadata, returnErr, failureTime,
+		); err != nil {
+			returnErr = err
+		}
+	}()
 	if spaceID == "" || credentialID == "" {
 		return ErrNotFound
 	}
@@ -797,6 +873,7 @@ func (s *Service) Purge(
 		if err != nil {
 			return err
 		}
+		failureMetadata = metadata
 		if metadata.SpaceID != spaceID {
 			return ErrNotFound
 		}
@@ -806,6 +883,7 @@ func (s *Service) Purge(
 			return err
 		}
 		operationTime := s.clock.Now().UTC()
+		failureTime = operationTime
 		if err := verifyAuthoritativePurgeSession(
 			ctx, tx, principal, operationTime,
 		); err != nil {
@@ -848,6 +926,35 @@ func (s *Service) Purge(
 		}
 		return nil
 	})
+}
+
+// RecordInvalidAttempt records an authenticated request rejected by a
+// transport/schema boundary before it can enter a credential operation.
+func (s *Service) RecordInvalidAttempt(
+	ctx context.Context,
+	principal Principal,
+	operation Operation,
+) error {
+	return s.RecordInvalidAttemptAt(
+		ctx, principal, operation, s.clock.Now().UTC(),
+	)
+}
+
+func (s *Service) RecordInvalidAttemptAt(
+	ctx context.Context,
+	principal Principal,
+	operation Operation,
+	now time.Time,
+) error {
+	switch operation {
+	case OperationList, OperationRead, OperationCreate, OperationUpdate,
+		OperationDelete, OperationRestore, OperationPurge:
+	default:
+		return ErrInvalidInput
+	}
+	return s.appendCredentialFailure(
+		ctx, principal, string(operation), Metadata{}, ErrInvalidInput, now,
+	)
 }
 
 func verifyAuthoritativePurgeSession(
@@ -1251,6 +1358,89 @@ func (s *Service) auditEventAt(
 	}, nil
 }
 
+// appendCredentialFailure records the failed authenticated attempt after the
+// operation's transaction has rolled back. Concealed authorization and lookup
+// failures deliberately omit both identifiers so audit storage cannot become a
+// second resource-enumeration channel.
+func (s *Service) appendCredentialFailure(
+	ctx context.Context,
+	principal Principal,
+	action string,
+	metadata Metadata,
+	operationErr error,
+	now time.Time,
+) error {
+	if !credentialActorIsAuthenticated(principal) {
+		// There is no trustworthy authenticated actor to attach to an event.
+		return nil
+	}
+	errorCode := credentialFailureCode(operationErr)
+	if errorCode == "NOT_FOUND" || errorCode == "UNAUTHENTICATED" {
+		metadata = Metadata{}
+	}
+	event, err := s.auditEventAt(
+		principal, principal.Actor, action, metadata, nil, "", now.UTC(),
+	)
+	if err != nil {
+		return ErrAuditUnavailable
+	}
+	event.Success = false
+	event.ErrorCode = errorCode
+	event.ChangeFields = nil
+	event.Reason = ""
+	if err := s.repository.withTx(ctx, func(tx *sql.Tx) error {
+		return s.audit.AppendTx(ctx, tx, event)
+	}); err != nil {
+		return ErrAuditUnavailable
+	}
+	return nil
+}
+
+func credentialActorIsAuthenticated(principal Principal) bool {
+	switch {
+	case principal.Human != nil && principal.Agent == nil:
+		return principal.Actor.Type == audit.ActorUser &&
+			principal.Actor.ID == principal.Human.Session.UserID
+	case principal.Agent != nil && principal.Human == nil:
+		return principal.Actor.Type == audit.ActorAgent &&
+			principal.Actor.ID == principal.Agent.AgentID
+	default:
+		return false
+	}
+}
+
+func credentialFailureCode(err error) string {
+	switch {
+	case errors.Is(err, ErrNotFound),
+		errors.Is(err, authorization.ErrNotFound):
+		return "NOT_FOUND"
+	case errors.Is(err, authorization.ErrDenied):
+		return "PERMISSION_DENIED"
+	case errors.Is(err, authorization.ErrUnauthenticated):
+		return "UNAUTHENTICATED"
+	case errors.Is(err, ErrInvalidInput), errors.Is(err, ErrInvalidPayload),
+		errors.Is(err, ErrReasonRequired):
+		return "INVALID_INPUT"
+	case errors.Is(err, ErrVersionConflict):
+		return "VERSION_CONFLICT"
+	case errors.Is(err, ErrIdempotencyRequired):
+		return "IDEMPOTENCY_REQUIRED"
+	case errors.Is(err, ErrIdempotencyConflict):
+		return "IDEMPOTENCY_CONFLICT"
+	case errors.Is(err, identity.ErrInvalidSession),
+		errors.Is(err, identity.ErrSessionExpired),
+		errors.Is(err, identity.ErrSessionRevoked),
+		errors.Is(err, identity.ErrRecentTOTPRequired):
+		return "AUTHORIZATION_FAILED"
+	case errors.Is(err, identity.ErrForbidden):
+		return "PERMISSION_DENIED"
+	case errors.Is(err, ErrAuditUnavailable), errors.Is(err, audit.ErrAuditUnavailable):
+		return "AUDIT_UNAVAILABLE"
+	default:
+		return "INTERNAL_ERROR"
+	}
+}
+
 func authorize(
 	principal Principal,
 	resource authorization.Resource,
@@ -1482,7 +1672,7 @@ func validText(value string, maxBytes int, allowEmpty bool) bool {
 }
 
 func normalizedAssetIDs(assetIDs []string) []string {
-	cloned := append([]string(nil), assetIDs...)
+	cloned := append([]string{}, assetIDs...)
 	slices.Sort(cloned)
 	return cloned
 }
@@ -1498,7 +1688,7 @@ func cloneTags(tags map[string]string) map[string]string {
 func cloneMetadata(metadata Metadata) Metadata {
 	cloned := metadata
 	cloned.Tags = cloneTags(metadata.Tags)
-	cloned.AssetIDs = append([]string(nil), metadata.AssetIDs...)
+	cloned.AssetIDs = append([]string{}, metadata.AssetIDs...)
 	if metadata.DeletedAt != nil {
 		deletedAt := *metadata.DeletedAt
 		cloned.DeletedAt = &deletedAt

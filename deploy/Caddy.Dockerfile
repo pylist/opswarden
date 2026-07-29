@@ -4,7 +4,7 @@ FROM caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac523
 USER 0:0
 RUN setcap -r /usr/bin/caddy && test -z "$(getcap /usr/bin/caddy)"
 
-FROM golang:1.24.6-alpine3.22@sha256:c8c5f95d64aa79b6547f3b626eb84b16a7ce18a139e3e9ca19a8c078b85ba80d AS health-build
+FROM golang:1.25.12-alpine3.23@sha256:cc985ef6f9c3bf9ece7488129c9abe0a150388ccdfa428d886fc709dca0b230a AS health-build
 ARG TARGETARCH
 ENV CGO_ENABLED=0 \
     GO111MODULE=off \

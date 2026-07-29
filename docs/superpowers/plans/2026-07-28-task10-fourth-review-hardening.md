@@ -6,7 +6,7 @@
 
 **Architecture:** Replace scan-and-evict limiter subject storage with fixed-cap maps and one fixed overflow bucket per operation; an unknown subject at capacity is charged only to overflow and cannot evict an established subject. Split pre-auth admission into source-first, token-format-specific stages: invalid human JWTs stop after the source quota and signature validation, valid JWTs use signed `sid + sub + route` identity, and Agent tokens use a full SHA-256 token fingerprint.
 
-**Tech Stack:** Go 1.24, `net/http`, existing JWT signer, in-memory `agents.Limiter`, SQLite-backed identity/Agent services.
+**Tech Stack:** Go 1.25.12, `net/http`, existing JWT signer, in-memory `agents.Limiter`, SQLite-backed identity/Agent services.
 
 ## Global Constraints
 

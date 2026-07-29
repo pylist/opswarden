@@ -51,6 +51,7 @@ type SpaceService interface {
 }
 
 type CredentialService interface {
+	RecordInvalidAttempt(context.Context, credentials.Principal, credentials.Operation) error
 	List(context.Context, credentials.Principal, credentials.ListFilter) ([]credentials.Metadata, string, error)
 	Get(context.Context, credentials.Principal, string) (credentials.Decrypted, error)
 	Create(context.Context, credentials.Principal, credentials.CreateInput, credentials.WriteContext) (credentials.MutationResult, error)

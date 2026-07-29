@@ -18,12 +18,15 @@ _verify-locked:
 	/usr/bin/python3 -I scripts/verify_source_tree.py $(E2E_REVISION)
 	go vet ./...
 	go test -race ./...
+	GOTOOLCHAIN=go1.25.12 go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 	/usr/bin/python3 -I deploy/operations_test.py
 	/usr/bin/python3 -I scripts/scan_sensitive_fixtures_test.py
 	/usr/bin/python3 -I scripts/release_gate_security_test.py
 	cd web && npm ci --no-audit --no-fund
+	cd web && npm audit --omit=dev --audit-level=moderate
 	cd web && npm test -- --run
 	cd web && npm run build
+	cd tests/e2e && npm audit --omit=dev --audit-level=moderate
 	docker compose --env-file deploy/.env.example -f deploy/compose.yaml config >/dev/null
 	GIT_NO_REPLACE_OBJECTS=1 git --no-replace-objects archive --format=tar $(E2E_REVISION) | docker build -f deploy/Dockerfile \
 		--build-arg VERSION=$(E2E_VERSION) \

@@ -6,7 +6,7 @@
 
 **Architecture:** Add an atomic multi-bucket reservation primitive to the existing in-memory limiter, then use it for login, reverify, and pre-auth request quotas. Replace the per-key anonymous failure cache with per-operation fixed-budget windows and a non-evicting overflow bucket. Keep formal JWT/session and Agent authentication unchanged after the pre-auth gate so revocation and authorization remain fresh.
 
-**Tech Stack:** Go 1.24, `net/http`, SQLite, existing `agents.Limiter`, identity and audit services.
+**Tech Stack:** Go 1.25.12, `net/http`, SQLite, existing `agents.Limiter`, identity and audit services.
 
 ## Global Constraints
 

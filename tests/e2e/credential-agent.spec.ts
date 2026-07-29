@@ -3,6 +3,7 @@ import { E2EHarness } from "./harness";
 
 test("member and Hermes-style Agent share one credential lifecycle", async ({ page, request }) => {
   const harness = await E2EHarness.startWithPage(page, request);
+  await harness.exerciseReactCredentialAndAssetCRUD();
   const id = await harness.createCredentialInUI();
   expect((await harness.mcpCredentialGet(id)).display_name).toBe("e2e-login");
   const version = await harness.mcpCredentialUpdate(id, "e2e-login-updated");

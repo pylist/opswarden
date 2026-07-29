@@ -34,6 +34,21 @@ type fakeCredentialService struct {
 	createInput  credentials.CreateInput
 	writeContext credentials.WriteContext
 	principal    credentials.Principal
+	invalidCalls int
+	invalidOp    credentials.Operation
+}
+
+func (service *fakeCredentialService) RecordInvalidAttemptAt(
+	_ context.Context,
+	_ credentials.Principal,
+	operation credentials.Operation,
+	_ time.Time,
+) error {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.invalidCalls++
+	service.invalidOp = operation
+	return nil
 }
 
 func (service *fakeCredentialService) List(
@@ -366,6 +381,13 @@ func TestDeleteRequiresExactIDVersionReasonAndIdempotencyKey(t *testing.T) {
 			if !result.IsError ||
 				result.Content[0].(*mcp.TextContent).Text != "INVALID_INPUT" {
 				t.Fatalf("%s: %+v", missing, result)
+			}
+			if service.invalidCalls != 1 ||
+				service.invalidOp != credentials.OperationDelete {
+				t.Fatalf(
+					"%s: invalid audit calls=%d operation=%q",
+					missing, service.invalidCalls, service.invalidOp,
+				)
 			}
 		})
 	}

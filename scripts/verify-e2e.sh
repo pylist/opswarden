@@ -69,31 +69,42 @@ if ((${#network_args[@]} > 0)); then
       --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}'
   )"
 fi
-subnet=""
+subnets=()
+subnet_coordinates=()
 for ((attempt = 0; attempt < 2048; attempt++)); do
   candidate="$(((subnet_index + attempt) % 2048))"
   subnet_second="$((20 + candidate / 256))"
   subnet_third="$((candidate % 256))"
   candidate_subnet="172.${subnet_second}.${subnet_third}.0/29"
   if ! grep -Fqx -- "${candidate_subnet}" <<<"${used_subnets}"; then
-    subnet="${candidate_subnet}"
-    break
+    subnets+=("${candidate_subnet}")
+    subnet_coordinates+=("${subnet_second}:${subnet_third}")
+    ((${#subnets[@]} == 2)) && break
   fi
 done
-[[ -n "${subnet}" ]] || {
-  echo "E2E release gate refused: no isolated backend subnet is available" >&2
+[[ "${#subnets[@]}" -eq 2 ]] || {
+  echo "E2E release gate refused: no isolated backend subnet pair is available" >&2
   exit 75
 }
+subnet="${subnets[0]}"
+restore_subnet="${subnets[1]}"
+IFS=: read -r subnet_second subnet_third <<<"${subnet_coordinates[0]}"
+IFS=: read -r restore_subnet_second restore_subnet_third <<<"${subnet_coordinates[1]}"
 
 export OPSWARDEN_E2E_RUNTIME_DIR="${runtime_dir}"
+export OPSWARDEN_E2E_STATE_RELATIVE="state-root"
 export OPSWARDEN_E2E_ARTIFACT_DIR="${artifact_dir}"
 export OPSWARDEN_E2E_SECRET_FILE="${runtime_dir}/sensitive-patterns"
 export OPSWARDEN_E2E_APP_PORT="${app_port}"
+export OPSWARDEN_E2E_BASE_URL="https://localhost:${app_port}"
 export OPSWARDEN_E2E_RESTORE_PORT="${restore_port}"
 export OPSWARDEN_E2E_PROJECT="${project}"
 export OPSWARDEN_E2E_BACKEND_SUBNET="${subnet}"
 export OPSWARDEN_E2E_APP_IP="172.${subnet_second}.${subnet_third}.2"
 export OPSWARDEN_E2E_CADDY_IP="172.${subnet_second}.${subnet_third}.3"
+export OPSWARDEN_E2E_RESTORE_BACKEND_SUBNET="${restore_subnet}"
+export OPSWARDEN_E2E_RESTORE_APP_IP="172.${restore_subnet_second}.${restore_subnet_third}.2"
+export OPSWARDEN_E2E_RESTORE_CADDY_IP="172.${restore_subnet_second}.${restore_subnet_third}.3"
 export OPSWARDEN_E2E_IMAGE_VERSION="${image_version}"
 
 playwright_status=0
@@ -102,16 +113,18 @@ signal_status=0
 finish() {
   trap - EXIT INT TERM
   set +e
+  cleanup_status=0
+  node "${repo_root}/tests/e2e/cleanup.mjs" || cleanup_status=$?
   "${repo_root}/scripts/scan-sensitive-fixtures.sh"
   scan_status=$?
-  cleanup_status=0
+  secret_cleanup_status=0
   for relative in \
     sensitive-patterns control.json master.key \
     restore/master.key restore-wrong/master.key; do
     /usr/bin/env -i \
       HOME="/nonexistent" PATH="/usr/bin:/bin" LC_ALL=C \
       /usr/bin/python3 -I "${repo_root}/scripts/cleanup_e2e_secrets.py" \
-      "${runtime_dir}" "${relative}" || cleanup_status=$?
+      "${runtime_dir}" "${relative}" || secret_cleanup_status=$?
   done
   if [[ "${signal_status}" -ne 0 ]]; then
     exit "${signal_status}"
@@ -121,6 +134,9 @@ finish() {
   fi
   if [[ "${cleanup_status}" -ne 0 ]]; then
     exit "${cleanup_status}"
+  fi
+  if [[ "${secret_cleanup_status}" -ne 0 ]]; then
+    exit "${secret_cleanup_status}"
   fi
   exit "${scan_status}"
 }

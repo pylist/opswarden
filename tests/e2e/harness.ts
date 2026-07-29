@@ -2,7 +2,13 @@ import { createHmac, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { APIRequestContext, APIResponse, Locator, Page } from "@playwright/test";
+import {
+  expect,
+  type APIRequestContext,
+  type APIResponse,
+  type Locator,
+  type Page,
+} from "@playwright/test";
 
 const root = resolve(import.meta.dirname, "../..");
 const runtime = resolve(process.env.OPSWARDEN_E2E_RUNTIME_DIR ?? "");
@@ -13,7 +19,12 @@ const composeProject = process.env.OPSWARDEN_E2E_PROJECT ?? "";
 const backendSubnet = process.env.OPSWARDEN_E2E_BACKEND_SUBNET ?? "";
 const appIP = process.env.OPSWARDEN_E2E_APP_IP ?? "";
 const caddyIP = process.env.OPSWARDEN_E2E_CADDY_IP ?? "";
+const restoreBackendSubnet = process.env.OPSWARDEN_E2E_RESTORE_BACKEND_SUBNET ?? "";
+const restoreAppIP = process.env.OPSWARDEN_E2E_RESTORE_APP_IP ?? "";
+const restoreCaddyIP = process.env.OPSWARDEN_E2E_RESTORE_CADDY_IP ?? "";
 const imageVersion = process.env.OPSWARDEN_E2E_IMAGE_VERSION ?? "";
+const caddySourceImage =
+  "caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d";
 if (
   !runtime.startsWith(resolve(root, ".tmp") + "/") ||
   !artifacts.startsWith(resolve(root, ".artifacts") + "/") ||
@@ -27,6 +38,10 @@ if (
   !/^172\.2[0-7]\.\d{1,3}\.[23]$/u.test(caddyIP) ||
   appIP.replace(/\.2$/u, ".0/29") !== backendSubnet ||
   caddyIP.replace(/\.3$/u, ".0/29") !== backendSubnet ||
+  !/^172\.2[0-7]\.\d{1,3}\.0\/29$/u.test(restoreBackendSubnet) ||
+  restoreAppIP.replace(/\.2$/u, ".0/29") !== restoreBackendSubnet ||
+  restoreCaddyIP.replace(/\.3$/u, ".0/29") !== restoreBackendSubnet ||
+  restoreBackendSubnet === backendSubnet ||
   !/^e2e-[0-9a-f]{40}$/u.test(imageVersion)
 ) {
   throw new Error("validated E2E harness environment is required");
@@ -295,6 +310,37 @@ export class APIHarness {
   getOtherSpaceCredential() {
     return this.getCredential(this.state.otherCredentialID);
   }
+
+  async assertConcealedFailureAuditRows() {
+    const database = resolve(runtime, "state-root/data/opswarden.db");
+    const script = [
+      "import json,sqlite3,sys",
+      "db=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)",
+      "rows=db.execute(\"SELECT COALESCE(space_id,''),COALESCE(entity_id,''),CAST(metadata_json AS TEXT) FROM audit_events WHERE action='credential.read' AND json_extract(metadata_json,'$.success')=0 AND json_extract(metadata_json,'$.error_code')='NOT_FOUND' ORDER BY rowid\").fetchall()",
+      "db.close()",
+      "print(json.dumps(rows,separators=(',',':')))",
+    ].join(";");
+    const output = await runCommand("/usr/bin/python3", [
+      "-I", "-c", script, database,
+    ]);
+    const rows = JSON.parse(output.stdout) as [string, string, string][];
+    if (
+      rows.length < 2 ||
+      rows.slice(-2).some(([spaceID, resourceID, metadata]) =>
+        spaceID !== "" ||
+        resourceID !== "" ||
+        !metadata.includes('"success":false') ||
+        metadata.includes(this.state.otherCredentialID)
+      )
+    ) {
+      throw new Error("concealed credential failures lack normalized database audit rows");
+    }
+    await writeFile(
+      resolve(artifacts, "audit/failure-audit-evidence.json"),
+      JSON.stringify(rows.slice(-2)),
+      { mode: 0o600 },
+    );
+  }
 }
 
 export class E2EHarness extends APIHarness {
@@ -329,6 +375,9 @@ export class E2EHarness extends APIHarness {
   }
 
   async createCredentialInUI() {
+    await this.page.getByRole("link", { name: "凭据库" }).click();
+    await this.page.getByRole("heading", { name: "凭据库" }).waitFor();
+    await this.page.getByText("正在加载凭据元数据…").waitFor({ state: "detached" });
     await this.page.getByRole("button", { name: "新建凭据" }).click();
     await this.page.getByLabel("显示名称").fill("e2e-login");
     await this.page.getByLabel("网址").fill("https://e2e.invalid");
@@ -342,6 +391,181 @@ export class E2EHarness extends APIHarness {
     const body = await (await response).json();
     await this.page.getByRole("button", { name: "e2e-login" }).waitFor();
     return body.id as string;
+  }
+
+  async exerciseReactCredentialAndAssetCRUD() {
+    const asset = await this.createAssetInUI();
+    const fixtures = [
+      {
+        type: "login",
+        name: "ui-login",
+        fields: {
+          "网址": "https://ui-login.invalid",
+          "用户名": "ui-login-user",
+          "密码": this.state.credentialPassword,
+        },
+      },
+      {
+        type: "api_token",
+        name: "ui-api-token",
+        fields: { "服务": "ui-service", "Token": this.state.apiToken },
+      },
+      {
+        type: "ssh_key",
+        name: "ui-ssh-key",
+        fields: {
+          "用户名": "ui-ssh-user",
+          "私钥": "-----BEGIN OPENSSH PRIVATE KEY-----\n" +
+            this.state.credentialPassword +
+            "\n-----END OPENSSH PRIVATE KEY-----",
+        },
+      },
+      {
+        type: "database",
+        name: "ui-database",
+        fields: {
+          "数据库引擎": "postgresql",
+          "主机": "db-ui.invalid",
+          "用户名": "ui-db-user",
+          "密码": this.state.credentialPassword,
+        },
+      },
+      {
+        type: "totp",
+        name: "ui-totp",
+        fields: {
+          "签发方": "OpsWarden UI",
+          "账号": this.state.email,
+          "Seed": this.state.loginTOTPSeed,
+        },
+      },
+    ];
+    for (const [index, fixture] of fixtures.entries()) {
+      await this.credentialCRUDInUI(
+        fixture.type,
+        fixture.name,
+        fixture.fields,
+        index === 0 ? asset.id : "",
+      );
+    }
+    await this.updateAndDeleteAssetInUI(asset.id, asset.name);
+  }
+
+  private async createAssetInUI() {
+    await this.page.getByRole("link", { name: "资产", exact: true }).click();
+    await this.page.getByRole("heading", { name: "资产", level: 1 }).waitFor();
+    await this.page.getByText("正在加载资产…").waitFor({ state: "detached" });
+    await this.page.getByRole("button", { name: "新建资产" }).click();
+    const dialog = this.page.getByRole("dialog", { name: "新建资产" });
+    const name = "ui-asset";
+    await dialog.getByLabel("资产名称").fill(name);
+    await dialog.getByLabel("主机名 / 域名").fill("ui-asset.invalid");
+    await dialog.getByLabel("环境").fill("e2e");
+    const response = this.page.waitForResponse((candidate) =>
+      candidate.request().method() === "POST" &&
+      candidate.url().endsWith(`/spaces/${this.state.primarySpaceID}/assets`)
+    );
+    await dialog.getByRole("button", { name: "保存" }).click();
+    const assetResponse = await response;
+    const rawBody = await assetResponse.text();
+    const body = JSON.parse(rawBody);
+    if (!assetResponse.ok()) {
+      await writeFile(
+        resolve(artifacts, "errors/ui-asset-failure.json"),
+        rawBody,
+        { mode: 0o600 },
+      );
+      throw new Error(
+        `asset create failed: status=${assetResponse.status()} code=${body?.error?.code ?? ""}`,
+      );
+    }
+    await dialog.waitFor({ state: "detached" });
+    await this.page.getByRole("link", { name: "概览" }).click();
+    await this.page.getByRole("link", { name: "资产", exact: true }).click();
+    await this.page.getByText("正在加载资产…").waitFor({ state: "detached" });
+    await this.page.getByRole("button", { name }).waitFor();
+    return { id: body.id as string, name };
+  }
+
+  private async credentialCRUDInUI(
+    type: string,
+    name: string,
+    fields: Record<string, string>,
+    assetID: string,
+  ) {
+    await this.page.getByRole("link", { name: "凭据库" }).click();
+    await this.page.getByRole("heading", { name: "凭据库" }).waitFor();
+    await this.page.getByText("正在加载凭据元数据…").waitFor({ state: "detached" });
+    await this.page.getByRole("button", { name: "新建凭据" }).click();
+    const createDialog = this.page.getByRole("dialog", { name: "新建凭据" });
+    await createDialog.getByLabel("显示名称").fill(name);
+    await createDialog.getByLabel("凭据类型").selectOption(type);
+    for (const [label, value] of Object.entries(fields)) {
+      await createDialog.getByLabel(label, { exact: true }).fill(value);
+    }
+    if (assetID) await createDialog.getByLabel("关联资产").fill(assetID);
+    await createDialog.getByRole("button", { name: "保存" }).click();
+    await this.page.getByRole("button", { name, exact: true }).waitFor();
+
+    await this.page.getByRole("button", { name, exact: true }).click();
+    await this.page.getByRole("button", { name: "显示", exact: true }).click();
+    const editCredential = this.page.getByRole("button", { name: "编辑凭据" });
+    await expect(editCredential).toBeEnabled({ timeout: 10_000 });
+    await editCredential.click();
+    const updatedName = `${name}-updated`;
+    await this.page.getByLabel("显示名称").fill(updatedName);
+    await this.page.getByLabel("变更原因").fill("React E2E full CRUD");
+    await this.page.getByRole("button", { name: "保存", exact: true }).click();
+    await this.page.getByRole("button", { name: updatedName, exact: true }).waitFor();
+
+    if (assetID) {
+      await this.page.getByRole("button", { name: updatedName, exact: true }).click();
+      await this.page.getByRole("button", { name: assetID, exact: true }).click();
+      await this.page.getByRole("heading", { name: "ui-asset", exact: true }).waitFor();
+      await this.page.getByRole("button", { name: new RegExp(updatedName) }).click();
+      await this.page.getByRole("heading", { name: updatedName, exact: true }).waitFor();
+      await this.page.getByRole("button", { name: "显示", exact: true }).click();
+      const editLinkedCredential = this.page.getByRole("button", { name: "编辑凭据" });
+      await expect(editLinkedCredential).toBeEnabled({ timeout: 10_000 });
+      await editLinkedCredential.click();
+      await this.page.getByLabel("关联资产").fill("");
+      await this.page.getByLabel("变更原因").fill("React E2E unlink");
+      await this.page.getByRole("button", { name: "保存", exact: true }).click();
+      await this.page.getByRole("button", { name: updatedName, exact: true }).waitFor();
+      await this.page.getByRole("link", { name: "资产", exact: true }).click();
+      await this.page.getByRole("button", { name: "ui-asset", exact: true }).click();
+      await this.page.getByRole("heading", { name: "ui-asset", exact: true }).waitFor();
+      await this.page.getByText("尚未关联凭据。").waitFor();
+      await this.page.getByRole("link", { name: "凭据库" }).click();
+    }
+
+    await this.page.getByRole("button", { name: updatedName, exact: true }).click();
+    await this.page.getByRole("button", { name: "移至回收站" }).click();
+    await this.page.getByLabel("输入凭据名称以确认").fill(updatedName);
+    await this.page.getByRole("button", { name: "确认删除" }).click();
+    await this.page.getByRole("button", { name: updatedName, exact: true }).waitFor({
+      state: "detached",
+    });
+    await this.page.getByRole("button", { name: "回收站" }).click();
+    await this.page.getByRole("row").filter({ hasText: updatedName }).waitFor();
+    await this.page.getByRole("button", { name: "返回凭据列表" }).click();
+  }
+
+  private async updateAndDeleteAssetInUI(assetID: string, originalName: string) {
+    await this.page.getByRole("link", { name: "资产", exact: true }).click();
+    await this.page.getByRole("button", { name: originalName, exact: true }).click();
+    await this.page.getByRole("button", { name: "编辑资产" }).click();
+    const updatedName = `${originalName}-updated`;
+    await this.page.getByLabel("资产名称").fill(updatedName);
+    await this.page.getByLabel("备注").fill(`React E2E asset ${assetID}`);
+    await this.page.getByRole("button", { name: "保存", exact: true }).click();
+    await this.page.getByRole("heading", { name: updatedName, exact: true }).waitFor();
+    await this.page.getByRole("button", { name: "删除资产" }).click();
+    await this.page.getByLabel("输入资产名称以确认").fill(updatedName);
+    await this.page.getByRole("button", { name: "确认删除" }).click();
+    await this.page.getByRole("button", { name: updatedName, exact: true }).waitFor({
+      state: "detached",
+    });
   }
 
   async mcpCredentialGet(id: string) {
@@ -414,7 +638,7 @@ export class RestoreHarness extends APIHarness {
   }
 
   async backupRestoreAndRevoke() {
-    const db = resolve(runtime, "data/opswarden.db");
+    const db = resolve(runtime, "state-root/data/opswarden.db");
     const backup = resolve(artifacts, "backups/online-backup.sqlite3");
     const python = [
       "import sqlite3,sys",
@@ -572,6 +796,24 @@ type RestoreLayout = {
   run(args: string[]): Promise<CommandResult>;
 };
 
+async function setRestoreIdentity(directory: string, delegated: boolean) {
+  const uid = delegated ? 10001 : process.getuid();
+  const gid = delegated ? 10001 : process.getgid();
+  const keyMode = delegated ? "0400" : "0600";
+  await runCommand("docker", [
+    "run", "--rm", "--network", "none", "--read-only",
+    "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "FOWNER",
+    "--security-opt", "no-new-privileges:true",
+    "--mount", `type=bind,src=${directory},dst=/work`,
+    "--entrypoint", "/bin/sh",
+    caddySourceImage,
+    "-c",
+    'chown "$1:$2" /work/master.key && chmod "$3" /work/master.key && chown -R "$1:$2" /work/state-root && chmod 0700 /work/state-root /work/state-root/data /work/state-root/backups',
+    "opswarden-e2e-restore",
+    String(uid), String(gid), keyMode,
+  ]);
+}
+
 async function prepareRestoreLayout(
   name: "restore" | "restore-wrong",
   backup: string,
@@ -604,9 +846,9 @@ async function prepareRestoreLayout(
     `CADDY_CONFIG_PATH=${directory}/caddy-config`,
     "OPSWARDEN_HOSTNAME=e2e.invalid",
     "OPSWARDEN_TLS_EMAIL=e2e@example.invalid",
-    `OPSWARDEN_BACKEND_SUBNET=${backendSubnet}`,
-    `OPSWARDEN_APP_IP=${appIP}`,
-    `OPSWARDEN_CADDY_IP=${caddyIP}`,
+    `OPSWARDEN_BACKEND_SUBNET=${restoreBackendSubnet}`,
+    `OPSWARDEN_APP_IP=${restoreAppIP}`,
+    `OPSWARDEN_CADDY_IP=${restoreCaddyIP}`,
   ].join("\n") + "\n", { mode: 0o600 });
   await writeFile(overridePath, [
     "services:",
@@ -615,7 +857,7 @@ async function prepareRestoreLayout(
     `      - "127.0.0.1:${restorePort}:8080"`,
     "    networks:",
     "      backend:",
-    `        ipv4_address: ${appIP}`,
+    `        ipv4_address: ${restoreAppIP}`,
     "      edge: {}",
   ].join("\n") + "\n", { mode: 0o600 });
   const compose = [
@@ -624,12 +866,26 @@ async function prepareRestoreLayout(
     "-f", resolve(root, "deploy/compose.yaml"),
     "-f", overridePath,
   ];
+  let delegated = false;
   return {
     baseURL: `http://127.0.0.1:${restorePort}`,
     dataDir,
-    run: (args: string[]) => runCommand("docker", [...compose, ...args], {
-      timeoutMs: 60_000,
-    }),
+    run: async (args: string[]) => {
+      if (args[0] === "up" && !delegated) {
+        await setRestoreIdentity(directory, true);
+        delegated = true;
+      }
+      try {
+        return await runCommand("docker", [...compose, ...args], {
+          timeoutMs: 60_000,
+        });
+      } finally {
+        if (args[0] === "down" && delegated) {
+          await setRestoreIdentity(directory, false);
+          delegated = false;
+        }
+      }
+    },
   };
 }
 

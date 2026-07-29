@@ -736,18 +736,35 @@ install-manifest/seal-env/seal-release/preflight 只能执行固定 root-owned h
 
 ## 11. 一键发布验证
 
-发布候选必须从仓库根目录执行 `make verify`。前置条件是 Go 1.24、Node.js 22、
+发布候选必须从仓库根目录执行 `make verify`。前置条件是 Go 1.25.12、Node.js 22、
 npm、Python 3、可用的 Docker/Compose，以及可访问 Playwright 和已锁定基础镜像的
 网络。首次使用或 Playwright 版本升级后，由操作员显式运行 `make e2e-bootstrap`；
 发布 gate 本身使用 `npx --no-install`，会核对锁定的 Playwright 版本与 Chromium
-可执行文件，绝不在验证期间主动下载浏览器。
+可执行文件，绝不在验证期间主动下载浏览器。安全扫描使用固定 `go1.25.12` 工具链
+和固定版本的 `govulncheck`，并对 web 与 E2E lockfile 的生产依赖执行
+`npm audit --omit=dev --audit-level=moderate`。
 
-验证顺序固定为 Go vet/race 与部署辅助程序测试、React 单测和生产构建、Compose
-解析、固定参数镜像构建、三个串行 Playwright 场景及敏感值扫描。场景覆盖：
+运行时会为每个已认证的凭据读取或变更失败另写一条
+`credential.read/create/update/delete/restore/purge` 审计事件，事件只包含固定错误
+码和非敏感上下文，`success=false`。不存在的 ID 和跨 Space 隐藏式拒绝统一记录为
+`NOT_FOUND`，且清空 Space/资源 ID，避免审计库成为枚举旁路；同 Space 的明确权限拒绝
+记录为 `PERMISSION_DENIED`。失败事件在业务事务回滚
+后以独立事务写入；如果该审计无法持久化，请求会 fail closed 为
+`STORAGE_UNAVAILABLE`，不得把原存储/授权错误当作已完整审计的结果继续处理。
 
-- 浏览器创建凭据，Hermes 风格 MCP Agent 读取、更新、软删除，随后在 UI 回收站和
-  审计事件中验证同一资源；
+验证顺序固定为 Go vet/race、固定生产工具链漏洞扫描与部署辅助程序测试、React
+单测、依赖审计和生产构建、Compose 解析、固定参数镜像构建、四个串行 Playwright
+场景及敏感值扫描。主验收场景启动完整的 `opswarden` + Caddy Compose 拓扑；UI、
+REST 和 MCP 都经 `https://localhost:<随机端口>`、SNI `localhost` 和 TLS 边界访问，
+同时核对 production revision label、安全响应头、应用无宿主端口及只有 Caddy
+`443/tcp` 被发布。场景覆盖：
+
+- 浏览器对 login、API Token、SSH key、database、TOTP 五类凭据逐一完成创建、
+  显示、更新和软删除，并完成资产创建、更新、删除以及凭据与资产的双向关联/
+  解除关联；另用 Hermes 风格 MCP Agent 读取、更新、软删除同一浏览器创建的凭据；
 - 对当前 Space 中不存在的 ID 与另一个 Space 中真实 ID 比较一致的 404 安全响应；
+  同时直接检查 SQLite 中两次尝试均写入资源标识已清空、错误码一致且
+  `success=false` 的 `credential.read` 审计事件；
 - 使用 SQLite 在线 Backup API 产生一致快照，将快照和独立保存的匹配 key 副本放入
   独立 Compose project，验证解密，再离线吊销恢复环境中的浏览器会话和 Agent Token。
 

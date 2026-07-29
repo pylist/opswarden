@@ -19,6 +19,18 @@ const (
 	TypeTOTP     Type = "totp"
 )
 
+type Operation string
+
+const (
+	OperationList    Operation = "credential.list"
+	OperationRead    Operation = "credential.read"
+	OperationCreate  Operation = "credential.create"
+	OperationUpdate  Operation = "credential.update"
+	OperationDelete  Operation = "credential.delete"
+	OperationRestore Operation = "credential.restore"
+	OperationPurge   Operation = "credential.purge"
+)
+
 func (credentialType Type) Valid() bool {
 	switch credentialType {
 	case TypeLogin, TypeAPIToken, TypeSSHKey, TypeDatabase, TypeTOTP:

@@ -745,7 +745,7 @@ func normalizeCreateInput(input CreateInput) CreateInput {
 	input.Status = strings.TrimSpace(input.Status)
 	input.Notes = strings.TrimSpace(input.Notes)
 	input.IPs = normalizeIPs(input.IPs)
-	input.Ports = append([]uint16(nil), input.Ports...)
+	input.Ports = append([]uint16{}, input.Ports...)
 	slices.Sort(input.Ports)
 	input.Tags = cloneTags(input.Tags)
 	return input
@@ -1008,7 +1008,7 @@ func validIdentifier(value string) bool {
 }
 
 func normalizeIPs(addresses []netip.Addr) []netip.Addr {
-	cloned := append([]netip.Addr(nil), addresses...)
+	cloned := append([]netip.Addr{}, addresses...)
 	slices.SortFunc(cloned, func(left, right netip.Addr) int {
 		return left.Compare(right)
 	})
@@ -1027,7 +1027,11 @@ func encodeNetworkMetadata(
 	if err != nil {
 		return "", "", err
 	}
-	portsJSON, err := json.Marshal(ports)
+	// A zero-length port list must be stored as a JSON array. Normalization may
+	// produce a nil slice, which json.Marshal would otherwise encode as null and
+	// violate the database's json_type(...)=array constraint.
+	encodedPorts := append([]uint16{}, ports...)
+	portsJSON, err := json.Marshal(encodedPorts)
 	if err != nil {
 		return "", "", err
 	}
@@ -1043,8 +1047,8 @@ func cloneTags(tags map[string]string) map[string]string {
 }
 
 func cloneAsset(asset Asset) Asset {
-	asset.IPs = append([]netip.Addr(nil), asset.IPs...)
-	asset.Ports = append([]uint16(nil), asset.Ports...)
+	asset.IPs = append([]netip.Addr{}, asset.IPs...)
+	asset.Ports = append([]uint16{}, asset.Ports...)
 	asset.Tags = cloneTags(asset.Tags)
 	if asset.DeletedAt != nil {
 		deletedAt := *asset.DeletedAt

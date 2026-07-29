@@ -49,6 +49,7 @@ type AgentAuthenticator interface {
 }
 
 type CredentialService interface {
+	RecordInvalidAttemptAt(context.Context, credentials.Principal, credentials.Operation, time.Time) error
 	List(context.Context, credentials.Principal, credentials.ListFilter) ([]credentials.Metadata, string, error)
 	GetAt(context.Context, credentials.Principal, string, time.Time) (credentials.Decrypted, error)
 	CreateAt(context.Context, credentials.Principal, credentials.CreateInput, credentials.WriteContext, time.Time) (credentials.MutationResult, error)

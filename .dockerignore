@@ -2,6 +2,8 @@
 .gitignore
 .superpowers
 .worktrees
+.tmp
+.artifacts
 .env
 secrets
 certs
@@ -20,6 +22,7 @@ master.key
 *.db-shm
 *.db-wal
 web/node_modules
+tests/e2e/node_modules
 web/coverage
 coverage
 bin

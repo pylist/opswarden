@@ -339,12 +339,16 @@ func (router *Router) handleCredentials(
 		if err := decodeJSONBody(
 			writer, request, credentialBodyLimit, &input,
 		); err != nil {
-			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			router.rejectInvalidCredential(
+				writer, request, principal, credentials.OperationCreate,
+			)
 			return
 		}
 		writeContext, ok := credentialWriteContext(request, principal)
 		if !ok {
-			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			router.rejectInvalidCredential(
+				writer, request, principal, credentials.OperationCreate,
+			)
 			return
 		}
 		result, err := router.deps.Credentials.Create(
@@ -386,12 +390,16 @@ func (router *Router) handleCredentials(
 		if err := decodeJSONBody(
 			writer, request, credentialBodyLimit, &input,
 		); err != nil || input.ExpectedVersion == 0 {
-			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			router.rejectInvalidCredential(
+				writer, request, principal, credentials.OperationUpdate,
+			)
 			return
 		}
 		writeContext, ok := credentialWriteContext(request, principal)
 		if !ok {
-			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			router.rejectInvalidCredential(
+				writer, request, principal, credentials.OperationUpdate,
+			)
 			return
 		}
 		result, err := router.deps.Credentials.Update(
@@ -413,12 +421,16 @@ func (router *Router) handleCredentials(
 		if err := decodeJSONBody(
 			writer, request, defaultBodyLimit, &input,
 		); err != nil || input.CredentialID != rest[0] || input.ExpectedVersion == 0 {
-			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			router.rejectInvalidCredential(
+				writer, request, principal, credentials.OperationDelete,
+			)
 			return
 		}
 		writeContext, ok := credentialWriteContext(request, principal)
 		if !ok {
-			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			router.rejectInvalidCredential(
+				writer, request, principal, credentials.OperationDelete,
+			)
 			return
 		}
 		if err := router.deps.Credentials.Delete(
@@ -438,7 +450,9 @@ func (router *Router) handleCredentials(
 		if err := decodeJSONBody(
 			writer, request, defaultBodyLimit, &input,
 		); err != nil || input.ExpectedVersion == 0 {
-			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			router.rejectInvalidCredential(
+				writer, request, principal, credentials.OperationRestore,
+			)
 			return
 		}
 		writeContext, _ := credentialWriteContext(request, principal)
@@ -464,7 +478,9 @@ func (router *Router) handleCredentials(
 		if err := decodeJSONBody(
 			writer, request, defaultBodyLimit, &input,
 		); err != nil || input.ExpectedVersion == 0 {
-			writeAPIError(writer, request, http.StatusBadRequest, "INVALID_REQUEST", false, nil)
+			router.rejectInvalidCredential(
+				writer, request, principal, credentials.OperationPurge,
+			)
 			return
 		}
 		writeContext, _ := credentialWriteContext(request, principal)
@@ -479,6 +495,27 @@ func (router *Router) handleCredentials(
 	default:
 		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
 	}
+}
+
+func (router *Router) rejectInvalidCredential(
+	writer http.ResponseWriter,
+	request *http.Request,
+	principal credentials.Principal,
+	operation credentials.Operation,
+) {
+	if err := router.deps.Credentials.RecordInvalidAttempt(
+		request.Context(), principal, operation,
+	); err != nil {
+		writeAPIError(
+			writer, request, http.StatusServiceUnavailable,
+			"STORAGE_UNAVAILABLE", true, nil,
+		)
+		return
+	}
+	writeAPIError(
+		writer, request, http.StatusBadRequest,
+		"INVALID_REQUEST", false, nil,
+	)
 }
 
 func credentialWriteContext(

@@ -218,6 +218,41 @@ func TestCannotLinkAcrossSpaces(t *testing.T) {
 	}
 }
 
+func TestCreateAcceptsEmptyOptionalCollections(t *testing.T) {
+	h := newAssetHarness(t)
+	input := h.createInput()
+	input.Name = "Minimal asset"
+	input.Hostname = "minimal.example.test"
+	input.OS = ""
+	input.Status = ""
+	input.IPs = []netip.Addr{}
+	input.Ports = []uint16{}
+	input.Tags = map[string]string{}
+	input.Notes = ""
+
+	created, err := h.service.Create(h.ctx, h.owner, input)
+	if err != nil {
+		t.Fatalf("create minimal asset: %v", err)
+	}
+	if created.IPs == nil || created.Ports == nil {
+		t.Fatalf("empty collections must remain JSON arrays: %#v", created)
+	}
+	update := UpdateInput{
+		AssetID: created.ID, ExpectedVersion: created.Version,
+		Name: "Minimal asset updated", Type: created.Type,
+		Hostname: created.Hostname, Environment: created.Environment,
+		IPs: []netip.Addr{}, Ports: []uint16{}, Tags: map[string]string{},
+	}
+	updated, err := h.service.Update(h.ctx, h.owner, update)
+	if err != nil {
+		t.Fatalf("update minimal asset: %v", err)
+	}
+	if updated.Version != 2 || updated.IPs == nil || updated.Ports == nil ||
+		len(updated.Ports) != 0 {
+		t.Fatalf("unexpected asset: %#v", updated)
+	}
+}
+
 func TestAgentCannotMutateAsset(t *testing.T) {
 	h := newAssetHarness(t)
 	_, err := h.service.Update(h.ctx, h.agent, h.updateInput())

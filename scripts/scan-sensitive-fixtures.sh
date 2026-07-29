@@ -13,4 +13,5 @@ exec /usr/bin/env -i \
   OPSWARDEN_E2E_ARTIFACT_DIR="${artifact_dir}" \
   OPSWARDEN_E2E_RUNTIME_DIR="${runtime_dir}" \
   OPSWARDEN_E2E_SECRET_FILE="${secret_file}" \
+  OPSWARDEN_E2E_STATE_RELATIVE="${OPSWARDEN_E2E_STATE_RELATIVE:-}" \
   /usr/bin/python3 -I "${repo_root}/scripts/scan_sensitive_fixtures.py"

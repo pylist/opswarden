@@ -405,6 +405,48 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertIn("_verify-locked", makefile)
         self.assertIn("scripts/e2e_lock.py", makefile)
 
+    def test_release_gate_pins_go_vulnerability_scan_and_audits_both_node_locks(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        vulnerability_scan = (
+            "GOTOOLCHAIN=go1.25.12 "
+            "go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./..."
+        )
+        web_install = "cd web && npm ci --no-audit --no-fund"
+        web_audit = "cd web && npm audit --omit=dev --audit-level=moderate"
+        e2e_audit = "cd tests/e2e && npm audit --omit=dev --audit-level=moderate"
+        self.assertEqual(makefile.count(vulnerability_scan), 1)
+        self.assertEqual(makefile.count(web_audit), 1)
+        self.assertEqual(makefile.count(e2e_audit), 1)
+        self.assertLess(makefile.index(web_install), makefile.index(web_audit))
+        self.assertNotIn("govulncheck@latest", makefile)
+        self.assertNotIn("npm audit --audit-level=high", makefile)
+
+    def test_primary_e2e_uses_full_tls_compose_release_topology(self) -> None:
+        runner = (ROOT / "scripts/verify-e2e.sh").read_text(encoding="utf-8")
+        server = (ROOT / "tests/e2e/server.mjs").read_text(encoding="utf-8")
+        setup = (ROOT / "tests/e2e/setup.ts").read_text(encoding="utf-8")
+        config = (ROOT / "tests/e2e/playwright.config.ts").read_text(encoding="utf-8")
+        compose = (ROOT / "deploy/compose.yaml").read_text(encoding="utf-8")
+
+        self.assertNotIn('spawnSync("go", ["build"', server)
+        self.assertIn('"up", "-d", "--no-build"', server)
+        self.assertIn('"opswarden", "caddy"', server)
+        self.assertIn("org.opencontainers.image.revision", server)
+        self.assertIn("NetworkSettings.Ports", server)
+        self.assertIn("https://localhost:", setup)
+        self.assertIn("https://localhost:", config)
+        self.assertIn("ignoreHTTPSErrors: true", config)
+        self.assertIn("tls internal", server)
+        self.assertIn('- "443:443/tcp"', compose)
+        self.assertIn("ports: !override", server)
+        self.assertIn("volumes: !override", server)
+        self.assertIn('OPSWARDEN_E2E_BASE_URL="https://localhost:', runner)
+        self.assertIn('tests/e2e/cleanup.mjs"', runner)
+        cleanup = (ROOT / "tests/e2e/cleanup.mjs").read_text(encoding="utf-8")
+        self.assertIn('"down", "--volumes", "--remove-orphans"', cleanup)
+        self.assertIn("`${project}-release`", cleanup)
+        self.assertIn("`${project}-wrong`", cleanup)
+
     def test_mcp_artifact_symlink_cannot_write_outside(self) -> None:
         artifact = self.root / "artifact"
         errors = artifact / "errors"

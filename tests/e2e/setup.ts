@@ -1,5 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { chmod, readFile, writeFile } from "node:fs/promises";
+import { request as httpsRequest } from "node:https";
 import { resolve } from "node:path";
 import type { FullConfig } from "@playwright/test";
 
@@ -8,14 +9,15 @@ const runtime = resolve(process.env.OPSWARDEN_E2E_RUNTIME_DIR ?? "");
 const artifacts = resolve(process.env.OPSWARDEN_E2E_ARTIFACT_DIR ?? "");
 const secretPath = resolve(process.env.OPSWARDEN_E2E_SECRET_FILE ?? "");
 const appPort = Number(process.env.OPSWARDEN_E2E_APP_PORT);
-const baseURL = `http://127.0.0.1:${appPort}`;
+const baseURL = process.env.OPSWARDEN_E2E_BASE_URL ?? "";
 if (
   !runtime.startsWith(resolve(root, ".tmp") + "/") ||
   !artifacts.startsWith(resolve(root, ".artifacts") + "/") ||
   secretPath !== resolve(runtime, "sensitive-patterns") ||
   !Number.isInteger(appPort) ||
   appPort < 1024 ||
-  appPort > 65535
+  appPort > 65535 ||
+  baseURL !== `https://localhost:${appPort}`
 ) {
   throw new Error("validated E2E setup environment is required");
 }
@@ -63,16 +65,39 @@ function totp(seed: string, at = Date.now()) {
 }
 
 async function api(path: string, init: RequestInit = {}) {
-  const response = await fetch(baseURL + path, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init.headers ?? {}) },
+  const body = typeof init.body === "string" ? init.body : "";
+  const response = await new Promise<{ status: number; text: string }>((resolveResponse, reject) => {
+    const request = httpsRequest(baseURL + path, {
+      method: init.method ?? "GET",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        ...(init.headers ?? {}),
+      },
+      rejectUnauthorized: false,
+      servername: "localhost",
+      minVersion: "TLSv1.2",
+    }, (incoming) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      incoming.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > (1 << 20)) request.destroy(new Error("E2E setup response exceeds bound"));
+        else chunks.push(chunk);
+      });
+      incoming.on("end", () => resolveResponse({
+        status: incoming.statusCode ?? 0,
+        text: Buffer.concat(chunks).toString("utf8"),
+      }));
+    });
+    request.on("error", reject);
+    request.end(body);
   });
-  const text = await response.text();
-  const body = text ? JSON.parse(text) : null;
-  if (!response.ok) {
-    throw new Error(`E2E setup request ${path} failed: ${response.status} ${body?.error?.code ?? ""}`);
+  const parsed = response.text ? JSON.parse(response.text) : null;
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`E2E setup request ${path} failed: ${response.status} ${parsed?.error?.code ?? ""}`);
   }
-  return body;
+  return parsed;
 }
 
 export default async function setup(_config: FullConfig) {

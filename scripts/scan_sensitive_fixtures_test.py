@@ -54,6 +54,7 @@ class SensitiveFixtureScannerTest(unittest.TestCase):
                 "OPSWARDEN_E2E_RUNTIME_DIR": str(self.runtime),
                 "OPSWARDEN_E2E_ARTIFACT_DIR": str(self.artifacts),
                 "OPSWARDEN_E2E_SECRET_FILE": str(self.pattern),
+                "OPSWARDEN_E2E_STATE_RELATIVE": "",
             }
         )
 
@@ -82,6 +83,17 @@ class SensitiveFixtureScannerTest(unittest.TestCase):
         archive = self.artifacts / "playwright" / "test-results" / "trace.zip"
         with zipfile.ZipFile(archive, "w") as output:
             output.writestr("trace/network-body.txt", self.secret)
+        self.assertEqual(self.run_scan(), 1)
+
+    def test_pinned_nested_state_namespace_is_scanned(self) -> None:
+        state = self.runtime / "state-root"
+        state.mkdir()
+        (self.runtime / "data").rename(state / "data")
+        (self.runtime / "backups").rename(state / "backups")
+        os.environ["OPSWARDEN_E2E_STATE_RELATIVE"] = "state-root"
+        self.assertEqual(self.run_scan(), 0)
+        database = state / "data" / "opswarden.db"
+        database.write_bytes(database.read_bytes() + self.secret)
         self.assertEqual(self.run_scan(), 1)
 
     def test_raw_length_prefixed_mcp_failure_is_scanned(self) -> None:

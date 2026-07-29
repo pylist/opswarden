@@ -1232,6 +1232,18 @@ type fakeCredentialService struct {
 	purgeID       string
 	purgeVersion  uint64
 	purgeError    error
+	invalidCalls  int
+	invalidOp     credentials.Operation
+}
+
+func (service *fakeCredentialService) RecordInvalidAttempt(
+	_ context.Context,
+	_ credentials.Principal,
+	operation credentials.Operation,
+) error {
+	service.invalidCalls++
+	service.invalidOp = operation
+	return nil
 }
 
 func (service *fakeCredentialService) List(
@@ -1670,6 +1682,13 @@ func TestAgentCredentialWriteRequiresIdempotencyHeader(t *testing.T) {
 	}
 	if credentialService.createCalls != 0 {
 		t.Fatalf("credential create calls=%d", credentialService.createCalls)
+	}
+	if credentialService.invalidCalls != 1 ||
+		credentialService.invalidOp != credentials.OperationCreate {
+		t.Fatalf(
+			"failure audit calls=%d operation=%q",
+			credentialService.invalidCalls, credentialService.invalidOp,
+		)
 	}
 }
 
@@ -2674,6 +2693,13 @@ func TestDuplicateCredentialLabelKeyIsRejectedBeforeMapDecode(t *testing.T) {
 	}
 	if credentialService.createCalls != 0 {
 		t.Fatalf("credential create calls=%d", credentialService.createCalls)
+	}
+	if credentialService.invalidCalls != 1 ||
+		credentialService.invalidOp != credentials.OperationCreate {
+		t.Fatalf(
+			"failure audit calls=%d operation=%q",
+			credentialService.invalidCalls, credentialService.invalidOp,
+		)
 	}
 }
 

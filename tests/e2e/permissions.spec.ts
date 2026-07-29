@@ -30,7 +30,11 @@ test("cross-Space existing and missing IDs are indistinguishable", async ({ requ
       cacheControl: headers["cache-control"],
       contentSecurityPolicy: headers["content-security-policy"],
       contentType: headers["content-type"],
+      permissionsPolicy: headers["permissions-policy"],
       referrerPolicy: headers["referrer-policy"],
+      server: headers.server,
+      strictTransportSecurity: headers["strict-transport-security"],
+      via: headers.via,
       xContentTypeOptions: headers["x-content-type-options"],
       xFrameOptions: headers["x-frame-options"],
       requestId: "<normalized-request-id>",
@@ -39,15 +43,21 @@ test("cross-Space existing and missing IDs are indistinguishable", async ({ requ
   const expectedHeaders = {
     cacheControl: "no-store",
     contentSecurityPolicy:
-      "default-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
+      "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; manifest-src 'self'; worker-src 'none'; upgrade-insecure-requests",
     contentType: "application/json",
+    permissionsPolicy:
+      "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()",
     referrerPolicy: "no-referrer",
+    server: undefined,
+    strictTransportSecurity: "max-age=31536000; includeSubDomains",
+    via: undefined,
     xContentTypeOptions: "nosniff",
     xFrameOptions: "DENY",
     requestId: "<normalized-request-id>",
   };
   expect(securityHeaders(missing)).toEqual(expectedHeaders);
   expect(securityHeaders(forbidden)).toEqual(expectedHeaders);
+  await harness.assertConcealedFailureAuditRows();
   if (process.env.OPSWARDEN_E2E_VERIFY_FAILURE_PATH === "1") {
     throw new Error("intentional E2E runner failure-path verification");
   }

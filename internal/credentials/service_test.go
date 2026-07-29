@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -232,6 +233,27 @@ func TestCreateEncryptsPayloadAndCommitsAuditAtomically(t *testing.T) {
 	)
 	if !errors.Is(err, ErrAuditUnavailable) || h.countCredentials() != 0 {
 		t.Fatalf("err=%v rows=%d", err, h.countCredentials())
+	}
+}
+
+func TestEmptyAssetLinksRemainAJSONCollection(t *testing.T) {
+	h := newCredentialHarness(t)
+	created := h.create(h.editor)
+	revealed, err := h.service.Get(h.ctx, h.editor, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revealed.Metadata.AssetIDs == nil {
+		t.Fatal("read returned null asset links")
+	}
+	listed, _, err := h.service.List(
+		h.ctx, h.editor, ListFilter{SpaceID: h.spaceID, Limit: 10},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].AssetIDs == nil {
+		t.Fatalf("list returned null asset links: %#v", listed)
 	}
 }
 
@@ -615,6 +637,319 @@ func TestGetDoesNotReturnPayloadWhenAuditFails(t *testing.T) {
 	}
 }
 
+func TestFailedCredentialAttemptsAreAuditedWithoutEnumerationMetadata(t *testing.T) {
+	h := newCredentialHarness(t)
+	created := h.create(h.editor)
+
+	for name, attempt := range map[string]func() error{
+		"missing": func() error {
+			_, err := h.service.Get(h.ctx, h.other, "crd_missing")
+			return err
+		},
+		"cross-space": func() error {
+			_, err := h.service.Get(h.ctx, h.other, created.ID)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := attempt(); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+
+	rows, err := h.db.Reader.QueryContext(h.ctx, `
+		SELECT COALESCE(space_id, ''), COALESCE(entity_id, ''), metadata_json
+		FROM audit_events
+		WHERE action = 'credential.read'
+		ORDER BY rowid
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var spaceID, resourceID, metadata string
+		if err := rows.Scan(&spaceID, &resourceID, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, spaceID+"|"+resourceID+"|"+metadata)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != got[1] {
+		t.Fatalf("concealed failures differ: %#v", got)
+	}
+	if !strings.Contains(got[0], `"success":false`) ||
+		!strings.Contains(got[0], `"error_code":"NOT_FOUND"`) ||
+		strings.Contains(got[0], created.ID) ||
+		strings.Contains(got[0], "crd_missing") {
+		t.Fatalf("failure audit is not normalized: %s", got[0])
+	}
+}
+
+func TestFailedCredentialValidationAndVersionAttemptsAreAudited(t *testing.T) {
+	h := newCredentialHarness(t)
+	_, err := h.service.Create(
+		h.ctx,
+		h.editor,
+		CreateInput{SpaceID: h.spaceID, DisplayName: "invalid", Type: TypeLogin},
+		h.writeContext("invalid-create", h.editor.Actor),
+	)
+	if !errors.Is(err, ErrInvalidPayload) {
+		t.Fatalf("create error=%v", err)
+	}
+
+	created := h.create(h.editor)
+	name := "stale"
+	_, err = h.service.Update(
+		h.ctx,
+		h.editor,
+		UpdateInput{
+			CredentialID: created.ID, ExpectedVersion: created.Version + 1,
+			DisplayName: &name,
+		},
+		h.writeContext("stale-update", h.editor.Actor),
+	)
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("update error=%v", err)
+	}
+
+	for action, code := range map[string]string{
+		"credential.create": "INVALID_INPUT",
+		"credential.update": "VERSION_CONFLICT",
+	} {
+		var count int
+		if err := h.db.Reader.QueryRowContext(h.ctx, `
+			SELECT count(*) FROM audit_events
+			WHERE action = ? AND json_extract(metadata_json, '$.success') = 0
+			  AND json_extract(metadata_json, '$.error_code') = ?
+		`, action, code).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("%s/%s failures=%d", action, code, count)
+		}
+	}
+}
+
+func TestFailedCredentialAuditNeverPersistsUntrustedIdentifiers(t *testing.T) {
+	h := newCredentialHarness(t)
+	injected := "spc_secret_probe"
+	_, err := h.service.Create(
+		h.ctx,
+		h.editor,
+		CreateInput{SpaceID: injected, DisplayName: "", Type: TypeLogin},
+		h.writeContext("invalid-untrusted-create", h.editor.Actor),
+	)
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("create error=%v", err)
+	}
+	var spaceID, resourceID, metadata string
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT COALESCE(space_id, ''), COALESCE(entity_id, ''), metadata_json
+		FROM audit_events WHERE action = 'credential.create'
+		  AND json_extract(metadata_json, '$.success') = 0
+		ORDER BY rowid DESC LIMIT 1
+	`).Scan(&spaceID, &resourceID, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if spaceID != "" || resourceID != "" || strings.Contains(metadata, injected) {
+		t.Fatalf("untrusted identifier persisted: %q %q %s", spaceID, resourceID, metadata)
+	}
+}
+
+func TestSameSpaceAuthorizationFailureAuditUsesPermissionDenied(t *testing.T) {
+	h := newCredentialHarness(t)
+	_, err := h.service.Create(
+		h.ctx,
+		h.reader,
+		h.createInput(),
+		h.writeContext("reader-create", h.reader.Actor),
+	)
+	if !errors.Is(err, authorization.ErrDenied) {
+		t.Fatalf("create error=%v", err)
+	}
+	var count int
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT count(*) FROM audit_events
+		WHERE action = 'credential.create'
+		  AND json_extract(metadata_json, '$.success') = 0
+		  AND json_extract(metadata_json, '$.error_code') = 'PERMISSION_DENIED'
+	`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("forbidden audits=%d", count)
+	}
+}
+
+func TestTransportRejectedCredentialAttemptIsAuditedWithoutInput(t *testing.T) {
+	h := newCredentialHarness(t)
+	if err := h.service.RecordInvalidAttempt(
+		h.ctx, h.editor, OperationUpdate,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var spaceID, resourceID, metadata string
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT COALESCE(space_id, ''), COALESCE(entity_id, ''), metadata_json
+		FROM audit_events WHERE action = 'credential.update'
+		ORDER BY rowid DESC LIMIT 1
+	`).Scan(&spaceID, &resourceID, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if spaceID != "" || resourceID != "" ||
+		!strings.Contains(metadata, `"success":false`) ||
+		!strings.Contains(metadata, `"error_code":"INVALID_INPUT"`) {
+		t.Fatalf("transport failure audit=%q %q %s", spaceID, resourceID, metadata)
+	}
+	if err := h.service.RecordInvalidAttempt(
+		h.ctx, h.editor, Operation("credential.injected"),
+	); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("invalid operation error=%v", err)
+	}
+}
+
+func TestCredentialStorageFailureRollsBackAndWritesSanitizedFailureAudit(t *testing.T) {
+	h := newCredentialHarness(t)
+	if _, err := h.db.Writer.ExecContext(h.ctx, `
+		CREATE TRIGGER force_credential_insert_failure
+		BEFORE INSERT ON credentials
+		BEGIN
+			SELECT RAISE(ABORT, 'forced credential storage failure');
+		END
+	`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := h.service.Create(
+		h.ctx,
+		h.editor,
+		h.createInput(),
+		h.writeContext("storage-failure", h.editor.Actor),
+	)
+	if err == nil || errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("create error=%v", err)
+	}
+	if h.countCredentials() != 0 {
+		t.Fatal("failed storage transaction left a credential")
+	}
+	var spaceID, resourceID, count string
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT COALESCE(space_id, ''), COALESCE(entity_id, ''),
+		       json_extract(metadata_json, '$.error_code')
+		FROM audit_events WHERE action = 'credential.create'
+		  AND json_extract(metadata_json, '$.success') = 0
+		ORDER BY rowid DESC LIMIT 1
+	`).Scan(&spaceID, &resourceID, &count); err != nil {
+		t.Fatal(err)
+	}
+	if spaceID != h.spaceID || resourceID != "" || count != "INTERNAL_ERROR" {
+		t.Fatalf("storage failure audit=%q %q %q", spaceID, resourceID, count)
+	}
+}
+
+func TestCredentialDecryptFailureReturnsNoPayloadAndWritesFailureAudit(t *testing.T) {
+	h := newCredentialHarness(t)
+	created := h.create(h.editor)
+	var versionID, createdAt string
+	var createdBy sql.NullString
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT id, created_by_user_id, created_at
+		FROM credential_versions WHERE credential_id = ? AND version = 1
+	`, created.ID).Scan(&versionID, &createdBy, &createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Writer.ExecContext(h.ctx,
+		`DELETE FROM credential_versions WHERE id = ?`, versionID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Writer.ExecContext(h.ctx, `
+		INSERT INTO credential_versions (
+			id, credential_id, version, payload_ciphertext, payload_nonce,
+			wrapped_data_key, wrap_nonce, created_by_user_id, created_at
+		) VALUES (?, ?, 1, zeroblob(16), zeroblob(24), zeroblob(48),
+		          zeroblob(24), ?, ?)
+	`, versionID, created.ID, nullableTestString(createdBy), createdAt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := h.service.Get(h.ctx, h.reader, created.ID)
+	if err == nil || got.Payload != nil {
+		t.Fatalf("decrypt result=%#v error=%v", got, err)
+	}
+	var count int
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT count(*) FROM audit_events
+		WHERE action = 'credential.read' AND entity_id = ?
+		  AND json_extract(metadata_json, '$.success') = 0
+		  AND json_extract(metadata_json, '$.error_code') = 'INTERNAL_ERROR'
+	`, created.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("decrypt failure audits=%d", count)
+	}
+}
+
+func TestDeleteAndRestoreFailuresWriteVersionConflictAudits(t *testing.T) {
+	h := newCredentialHarness(t)
+	created := h.create(h.editor)
+	deleteContext := h.writeContext("delete-version-failure", h.editor.Actor)
+	if err := h.service.Delete(
+		h.ctx, h.editor, created.ID, created.Version+1, deleteContext,
+	); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("delete error=%v", err)
+	}
+	if err := h.service.Delete(
+		h.ctx, h.editor, created.ID, created.Version,
+		h.writeContext("delete-success", h.editor.Actor),
+	); err != nil {
+		t.Fatal(err)
+	}
+	owner := humanCredentialPrincipal(
+		"usr_editor", h.spaceID, authorization.RoleOwner,
+	)
+	if _, err := h.service.Restore(
+		h.ctx, owner, created.ID, created.Version+1,
+		h.writeContext("restore-version-failure", owner.Actor),
+	); !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("restore error=%v", err)
+	}
+	for _, action := range []string{"credential.delete", "credential.restore"} {
+		var count int
+		if err := h.db.Reader.QueryRowContext(h.ctx, `
+			SELECT count(*) FROM audit_events
+			WHERE action = ? AND entity_id = ?
+			  AND json_extract(metadata_json, '$.success') = 0
+			  AND json_extract(metadata_json, '$.error_code') = 'VERSION_CONFLICT'
+		`, action, created.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("%s failure audits=%d", action, count)
+		}
+	}
+}
+
+func nullableTestString(value sql.NullString) any {
+	if value.Valid {
+		return value.String
+	}
+	return nil
+}
+
+func TestFailedCredentialAttemptFailsClosedWhenFailureAuditCannotPersist(t *testing.T) {
+	h := newCredentialHarness(t)
+	h.audit.FailNextInsert(audit.ErrAuditUnavailable)
+	_, err := h.service.Get(h.ctx, h.reader, "crd_missing")
+	if !errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestOnlyOneConcurrentUpdateWins(t *testing.T) {
 	h := newCredentialHarness(t)
 	created := h.create(h.editor)
@@ -651,6 +986,27 @@ func TestOnlyOneConcurrentUpdateWins(t *testing.T) {
 	}
 	if successes != 1 || conflicts != 1 {
 		t.Fatalf("successes=%d conflicts=%d", successes, conflicts)
+	}
+	var successAudits, failureAudits int
+	if err := h.db.Reader.QueryRowContext(h.ctx, `
+		SELECT
+		  count(*) FILTER (
+		    WHERE json_extract(metadata_json, '$.success') = 1
+		  ),
+		  count(*) FILTER (
+		    WHERE json_extract(metadata_json, '$.success') = 0
+		      AND json_extract(metadata_json, '$.error_code') = 'VERSION_CONFLICT'
+		  )
+		FROM audit_events
+		WHERE action = 'credential.update' AND entity_id = ?
+	`, created.ID).Scan(&successAudits, &failureAudits); err != nil {
+		t.Fatal(err)
+	}
+	if successAudits != 1 || failureAudits != 1 {
+		t.Fatalf(
+			"concurrent audit successes=%d failures=%d",
+			successAudits, failureAudits,
+		)
 	}
 }
 
@@ -1266,12 +1622,14 @@ func TestPurgeSamplesOperationTimeAfterWriterAcquisition(t *testing.T) {
 			if err := h.db.Reader.QueryRowContext(
 				h.ctx,
 				`SELECT count(*) FROM audit_events
-				 WHERE action = 'credential.purge' AND entity_id = ?`,
+				 WHERE action = 'credential.purge' AND entity_id = ?
+				   AND json_extract(metadata_json, '$.success') = 0
+				   AND json_extract(metadata_json, '$.error_code') = 'AUTHORIZATION_FAILED'`,
 				created.ID,
 			).Scan(&purgeEvents); err != nil {
 				t.Fatal(err)
 			}
-			if purgeEvents != 0 {
+			if purgeEvents != 1 {
 				t.Fatalf("failed purge audit events=%d", purgeEvents)
 			}
 		})

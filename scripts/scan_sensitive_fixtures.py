@@ -467,9 +467,19 @@ def main() -> int:
             os.environ.get("OPSWARDEN_E2E_SECRET_FILE", ""),
         )
         budget = ArchiveBudget()
+        state_relative = os.environ.get("OPSWARDEN_E2E_STATE_RELATIVE", "")
+        if state_relative not in ("", "state-root"):
+            raise ScanRefused("runtime state namespace is outside the exact allowlist")
+        state_fd = runtime_fd
+        if state_relative:
+            state_fd = open_relative(runtime_fd, state_relative)
+            if not stat.S_ISDIR(os.fstat(state_fd).st_mode):
+                os.close(state_fd)
+                raise ScanRefused("runtime state namespace is not a directory")
+            descriptors.append(state_fd)
 
         required = (
-            (runtime_fd, "data/opswarden.db"),
+            (state_fd, "data/opswarden.db"),
             (artifact_fd, "backups/online-backup.sqlite3"),
             (artifact_fd, "logs/application.log"),
             (artifact_fd, "logs/restore-compose.log"),
@@ -486,8 +496,8 @@ def main() -> int:
                 os.close(descriptor)
 
         roots = (
-            (runtime_fd, "data"),
-            (runtime_fd, "backups"),
+            (state_fd, "data"),
+            (state_fd, "backups"),
             (artifact_fd, "backups"),
             (artifact_fd, "logs"),
             (artifact_fd, "audit"),

@@ -291,7 +291,9 @@ func handleCredentialList(
 	}
 	var input credentialListInput
 	if err := decodeExact(raw, &input); err != nil || blank(input.SpaceID) {
-		return nil, ErrInvalidToolInput
+		return nil, recordInvalidCredentialTool(
+			ctx, dependencies, authenticated, credentials.OperationList,
+		)
 	}
 	principal := credentialPrincipal(authenticated, input.SpaceID)
 	items, next, err := dependencies.Credentials.List(
@@ -329,7 +331,9 @@ func handleCredentialGet(
 	var input credentialGetInput
 	if err := decodeExact(raw, &input); err != nil ||
 		blank(input.SpaceID) || blank(input.CredentialID) {
-		return nil, ErrInvalidToolInput
+		return nil, recordInvalidCredentialTool(
+			ctx, dependencies, authenticated, credentials.OperationRead,
+		)
 	}
 	readNow, err := nextRequestTime(ctx)
 	if err != nil {
@@ -369,7 +373,9 @@ func handleCredentialCreate(
 		blank(input.SpaceID) || blank(input.DisplayName) ||
 		blank(string(input.Type)) || len(input.Payload) == 0 ||
 		blank(input.Reason) || blank(input.IdempotencyKey) {
-		return nil, ErrInvalidToolInput
+		return nil, recordInvalidCredentialTool(
+			ctx, dependencies, authenticated, credentials.OperationCreate,
+		)
 	}
 	defer clear(input.Payload)
 	principal := credentialPrincipal(authenticated, input.SpaceID)
@@ -409,7 +415,9 @@ func handleCredentialUpdate(
 	if err := decodeExact(raw, &input); err != nil ||
 		blank(input.SpaceID) || blank(input.CredentialID) || input.Expected == 0 ||
 		blank(input.Reason) || blank(input.IdempotencyKey) {
-		return nil, ErrInvalidToolInput
+		return nil, recordInvalidCredentialTool(
+			ctx, dependencies, authenticated, credentials.OperationUpdate,
+		)
 	}
 	defer clear(input.Payload)
 	mutationNow, err := nextRequestTime(ctx)
@@ -448,7 +456,9 @@ func handleCredentialDelete(
 	if err := decodeExact(raw, &input); err != nil ||
 		blank(input.SpaceID) || blank(input.CredentialID) || input.Expected == 0 ||
 		blank(input.Reason) || blank(input.IdempotencyKey) {
-		return nil, ErrInvalidToolInput
+		return nil, recordInvalidCredentialTool(
+			ctx, dependencies, authenticated, credentials.OperationDelete,
+		)
 	}
 	mutationNow, err := nextRequestTime(ctx)
 	if err != nil {
@@ -547,7 +557,9 @@ func handleTOTPGenerate(
 	var input totpGenerateInput
 	if err := decodeExact(raw, &input); err != nil ||
 		blank(input.SpaceID) || blank(input.CredentialID) {
-		return nil, ErrInvalidToolInput
+		return nil, recordInvalidCredentialTool(
+			ctx, dependencies, authenticated, credentials.OperationRead,
+		)
 	}
 	readNow, err := nextRequestTime(ctx)
 	if err != nil {
@@ -609,6 +621,24 @@ func handleTOTPGenerate(
 		Code   string    `json:"code"`
 		Expiry time.Time `json:"expiry"`
 	}{Code: string(code), Expiry: expiry}, nil
+}
+
+func recordInvalidCredentialTool(
+	ctx context.Context,
+	dependencies Dependencies,
+	authenticated requestContext,
+	operation credentials.Operation,
+) error {
+	now, err := nextRequestTime(ctx)
+	if err != nil {
+		return err
+	}
+	if err := dependencies.Credentials.RecordInvalidAttemptAt(
+		ctx, credentialPrincipal(authenticated, ""), operation, now,
+	); err != nil {
+		return audit.ErrAuditUnavailable
+	}
+	return ErrInvalidToolInput
 }
 
 func nextRequestTime(ctx context.Context) (time.Time, error) {

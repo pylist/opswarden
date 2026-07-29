@@ -35,6 +35,7 @@ const (
 
 type realParityHarness struct {
 	token      string
+	db         *storage.DB
 	agent      *agents.Service
 	credential *credentials.Service
 	httpClient *http.Client
@@ -177,6 +178,7 @@ func TestRealRESTAndMCPServiceParity(t *testing.T) {
 			"space_id": "spc_outside", "credential_id": seed.ID,
 		})
 		assertToolCode(t, mcpResult, restCode)
+		harness.assertFailureAudits(t, "credential.read", "NOT_FOUND", 2)
 
 		updateBody := []byte(`{"expectedVersion":99,"displayName":"changed"}`)
 		status, restCode, _ = harness.rest(
@@ -193,6 +195,7 @@ func TestRealRESTAndMCPServiceParity(t *testing.T) {
 			"reason": "parity test", "idempotency_key": "mcp-version",
 		})
 		assertToolCode(t, mcpResult, restCode)
+		harness.assertFailureAudits(t, "credential.update", "VERSION_CONFLICT", 2)
 	})
 
 	t.Run("idempotency conflicts use the same stable code", func(t *testing.T) {
@@ -235,6 +238,7 @@ func TestRealRESTAndMCPServiceParity(t *testing.T) {
 			"reason":  "parity test", "idempotency_key": "mcp-idempotency",
 		})
 		assertToolCode(t, secondMCP, restCode)
+		harness.assertFailureAudits(t, "credential.create", "IDEMPOTENCY_CONFLICT", 2)
 	})
 
 	t.Run("a real SQLite write lock has storage busy parity", func(t *testing.T) {
@@ -249,7 +253,7 @@ func TestRealRESTAndMCPServiceParity(t *testing.T) {
 			"rest-busy", "parity test",
 		)
 		harness.lock.release(t)
-		if status != http.StatusServiceUnavailable || restCode != "STORAGE_BUSY" {
+		if status != http.StatusServiceUnavailable || restCode != "STORAGE_UNAVAILABLE" {
 			t.Fatalf("REST busy = %d/%q", status, restCode)
 		}
 
@@ -412,9 +416,30 @@ func newRealParityHarness(t *testing.T) *realParityHarness {
 	}
 	t.Cleanup(func() { _ = session.Close() })
 	return &realParityHarness{
-		token: token, agent: agentService,
+		token: token, db: db, agent: agentService,
 		credential: credentialService, httpClient: httpClient,
 		restURL: restServer.URL, mcpSession: session, lock: lockRecorder,
+	}
+}
+
+func (harness *realParityHarness) assertFailureAudits(
+	t *testing.T,
+	action string,
+	errorCode string,
+	want int,
+) {
+	t.Helper()
+	var got int
+	if err := harness.db.Reader.QueryRowContext(context.Background(), `
+		SELECT count(*) FROM audit_events
+		WHERE action = ?
+		  AND json_extract(metadata_json, '$.success') = 0
+		  AND json_extract(metadata_json, '$.error_code') = ?
+	`, action, errorCode).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("%s/%s failure audits=%d want=%d", action, errorCode, got, want)
 	}
 }
 
