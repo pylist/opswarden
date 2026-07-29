@@ -227,17 +227,47 @@ async function writeProtectedArtifact(body: Buffer) {
         stdio: ["pipe", "ignore", "ignore"],
       },
     );
-    const timeout = setTimeout(() => child.kill("SIGKILL"), 10_000);
+    let closedCode: number | null | undefined;
+    let pipeComplete = false;
+    let settled = false;
+    const succeedIfComplete = () => {
+      if (!settled && closedCode === 0 && pipeComplete) {
+        settled = true;
+        resolveWrite();
+      }
+    };
+    const refuse = () => {
+      if (!settled) {
+        settled = true;
+        rejectWrite(new Error("protected MCP failure artifact writer refused output"));
+      }
+    };
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      refuse();
+    }, 10_000);
     child.on("error", () => {
       clearTimeout(timeout);
-      rejectWrite(new Error("protected MCP failure artifact writer could not start"));
+      refuse();
+    });
+    child.stdin.on("error", () => {
+      clearTimeout(timeout);
+      refuse();
     });
     child.on("close", (code) => {
       clearTimeout(timeout);
-      if (code === 0) resolveWrite();
-      else rejectWrite(new Error("protected MCP failure artifact writer refused output"));
+      closedCode = code;
+      if (code !== 0) refuse();
+      else succeedIfComplete();
     });
-    child.stdin.end(body);
+    child.stdin.end(body, (error?: Error | null) => {
+      if (error) {
+        refuse();
+        return;
+      }
+      pipeComplete = true;
+      succeedIfComplete();
+    });
   });
 }
 

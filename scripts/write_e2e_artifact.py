@@ -91,6 +91,8 @@ def main(argv: list[str]) -> int:
             or not stat.S_ISREG(output.st_mode)
             or output.st_uid != os.getuid()
             or stat.S_IMODE(output.st_mode) != 0o600
+            or output.st_nlink != 1
+            or namespace.st_nlink != 1
         ):
             raise RuntimeError("MCP failure artifact is unsafe")
         body = sys.stdin.buffer.read(MAX_BODY + 1)
@@ -108,6 +110,8 @@ def main(argv: list[str]) -> int:
         errors_after = os.stat("errors", dir_fd=root_fd, follow_symlinks=False)
         if (
             identity(after) != identity(namespace_after)
+            or after.st_nlink != 1
+            or namespace_after.st_nlink != 1
             or identity(errors_after) != identity(errors_opened)
         ):
             raise RuntimeError("artifact namespace changed while writing")

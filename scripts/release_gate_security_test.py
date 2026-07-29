@@ -305,11 +305,28 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.fail("supervised runner child did not appear")
 
     def test_single_runner_pid_kill_releases_lock_for_restart(self) -> None:
-        fixture, environment = self.make_runner_fixture()
-        first = self.start_runner(fixture, environment)
-        assert first.stdout is not None
-        first.stdout.readline()
-        marker = fixture / "npm-started"
+        runner = self.root / "single-runner.py"
+        marker = self.root / "single-runner-ready"
+        runner.write_text(
+            "#!/usr/bin/python3\n"
+            "import pathlib,signal,sys\n"
+            "pathlib.Path(sys.argv[1]).touch()\n"
+            "signal.pause()\n",
+            encoding="ascii",
+        )
+        runner.chmod(0o755)
+        lock_command = [
+            "/usr/bin/python3",
+            "-I",
+            str(ROOT / "scripts/e2e_lock.py"),
+            str(self.root),
+            "--",
+        ]
+        first = subprocess.Popen(
+            [*lock_command, str(runner), str(marker)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         for _ in range(100):
             if marker.exists():
                 break
@@ -317,19 +334,14 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertTrue(marker.exists())
         runner_pid = self.child_pid(first)
         os.kill(runner_pid, signal.SIGKILL)
-        first.communicate(timeout=10)
-        self.assertEqual(first.returncode, 137)
-        marker.unlink()
-        second = self.start_runner(fixture, environment)
-        assert second.stdout is not None
-        self.assertIn("runtime=", second.stdout.readline())
-        for _ in range(100):
-            if marker.exists():
-                break
-            time.sleep(0.05)
-        self.assertTrue(marker.exists())
-        second.send_signal(signal.SIGTERM)
-        second.communicate(timeout=15)
+        _, first_stderr = first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 137, first_stderr)
+        second = subprocess.run(
+            [*lock_command, "/usr/bin/true"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
 
     def test_forged_legacy_lock_environment_cannot_bypass_parent_lock(self) -> None:
         fixture, environment = self.make_runner_fixture()
@@ -376,6 +388,8 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         setup = (ROOT / "tests/e2e/setup.ts").read_text(encoding="utf-8")
         self.assertIn("errors/mcp-failures.bin", harness)
         self.assertIn("scripts/write_e2e_artifact.py", harness)
+        self.assertIn('child.stdin.on("error"', harness)
+        self.assertIn("child.stdin.end(body, (error?: Error | null) =>", harness)
         self.assertNotIn("bodyBase64", harness)
         self.assertNotIn("status()}: ${body}", harness)
         self.assertNotIn("failed: ${body}", harness)
@@ -435,6 +449,42 @@ class ReleaseGateSecurityTest(unittest.TestCase):
             len(body).to_bytes(8, "big") + body,
         )
 
+    def test_mcp_artifact_hardlink_and_oversize_are_refused(self) -> None:
+        artifact = self.root / "artifact-hardlink"
+        errors = artifact / "errors"
+        errors.mkdir(parents=True)
+        artifact.chmod(0o700)
+        errors.chmod(0o700)
+        outside = self.root / "outside-hardlink"
+        outside.write_bytes(b"unchanged")
+        outside.chmod(0o600)
+        os.link(outside, errors / "mcp-failures.bin")
+        command = [
+            "/usr/bin/python3",
+            "-I",
+            str(ROOT / "scripts/write_e2e_artifact.py"),
+            str(artifact),
+            "errors/mcp-failures.bin",
+        ]
+        completed = subprocess.run(
+            command,
+            input=b"must not escape",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(outside.read_bytes(), b"unchanged")
+        (errors / "mcp-failures.bin").unlink()
+        completed = subprocess.run(
+            command,
+            input=b"x" * ((4 << 20) + 1),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual((errors / "mcp-failures.bin").read_bytes(), b"")
+
     def test_lock_refuses_symlinked_tmp_component(self) -> None:
         real_tmp = self.root / "real-lock-tmp"
         real_tmp.mkdir()
@@ -452,6 +502,54 @@ class ReleaseGateSecurityTest(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.assertEqual(completed.returncode, 75)
+
+    def test_supervisor_kills_ignore_term_group_before_releasing_lock(self) -> None:
+        child = self.root / "ignore-term.py"
+        ready = self.root / "ignore-term-ready"
+        child.write_text(
+            "#!/usr/bin/python3\n"
+            "import pathlib,signal,sys\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "pathlib.Path(sys.argv[1]).touch()\n"
+            "signal.pause()\n",
+            encoding="ascii",
+        )
+        child.chmod(0o755)
+        command = [
+            "/usr/bin/python3",
+            "-I",
+            str(ROOT / "scripts/e2e_lock.py"),
+            str(self.root),
+            "--",
+            str(child),
+            str(ready),
+        ]
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        for _ in range(100):
+            if ready.exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(ready.exists())
+        started = time.monotonic()
+        process.send_signal(signal.SIGTERM)
+        process.communicate(timeout=8)
+        self.assertEqual(process.returncode, 143)
+        self.assertLess(time.monotonic() - started, 7)
+        reacquired = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(ROOT / "scripts/e2e_lock.py"),
+                str(self.root),
+                "--",
+                "/usr/bin/true",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(reacquired.returncode, 0, reacquired.stderr)
 
     def test_bounded_command_terminates_unresponsive_child(self) -> None:
         child = self.root / "unresponsive.py"

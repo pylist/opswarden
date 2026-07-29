@@ -286,12 +286,12 @@ def scan_tree(
     return leaked, file_count
 
 
-def scan_top_entry(
+def pin_and_scan_top_entry(
     parent_fd: int,
     name: str,
     patterns: tuple[bytes, ...],
     budget: ArchiveBudget,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, int, os.stat_result]:
     if name in ("", ".", "..") or "/" in name or "\0" in name:
         raise ScanRefused("top-level artifact root name is unsafe")
     before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -305,7 +305,36 @@ def scan_top_entry(
         namespace = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if identity(opened) != identity(after) or identity(opened) != identity(namespace):
             raise ScanRefused("top-level artifact root changed while scanning")
-        return result
+        return result[0], result[1], descriptor, opened
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def revalidate_top_entry(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    baseline: os.stat_result,
+) -> None:
+    opened = os.fstat(descriptor)
+    namespace = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if identity(baseline) != identity(opened) or identity(baseline) != identity(namespace):
+        raise ScanRefused("top-level artifact root changed after its scan")
+
+
+def scan_top_entry(
+    parent_fd: int,
+    name: str,
+    patterns: tuple[bytes, ...],
+    budget: ArchiveBudget,
+) -> tuple[bool, int]:
+    leaked, count, descriptor, baseline = pin_and_scan_top_entry(
+        parent_fd, name, patterns, budget
+    )
+    try:
+        revalidate_top_entry(parent_fd, name, descriptor, baseline)
+        return leaked, count
     finally:
         os.close(descriptor)
 
@@ -468,10 +497,13 @@ def main() -> int:
         )
         leaked = False
         scanned_files = 0
+        retained_tops: list[tuple[int, str, int, os.stat_result]] = []
         for root_fd, relative in roots:
-            tree_leaked, tree_count = scan_top_entry(
+            tree_leaked, tree_count, top_fd, baseline = pin_and_scan_top_entry(
                 root_fd, relative, patterns, budget
             )
+            retained_tops.append((root_fd, relative, top_fd, baseline))
+            descriptors.append(top_fd)
             leaked = leaked or tree_leaked
             scanned_files += tree_count
             if scanned_files > MAX_FILES:
@@ -481,6 +513,8 @@ def main() -> int:
             if scanned_files > MAX_FILES:
                 raise ScanRefused("aggregate scan target count exceeds bound")
             leaked = scan_file(repo_fd, relative, patterns, budget) or leaked
+        for parent_fd, name, top_fd, baseline in retained_tops:
+            revalidate_top_entry(parent_fd, name, top_fd, baseline)
         verify_pinned_directory(repo_root, repo_fd)
         verify_pinned_directory(artifact_dir, artifact_fd)
         verify_pinned_directory(runtime_dir, runtime_fd)

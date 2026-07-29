@@ -132,10 +132,13 @@ def supervise(command: list[str]) -> int:
         },
     )
     forwarded = 0
+    signal_deadline: float | None = None
 
     def forward(received: int, _frame) -> None:
-        nonlocal forwarded
-        forwarded = received
+        nonlocal forwarded, signal_deadline
+        if not forwarded:
+            forwarded = received
+            signal_deadline = time.monotonic() + 5
         try:
             os.killpg(process.pid, received)
         except ProcessLookupError:
@@ -144,7 +147,21 @@ def supervise(command: list[str]) -> int:
     previous_int = signal.signal(signal.SIGINT, forward)
     previous_term = signal.signal(signal.SIGTERM, forward)
     try:
-        status = process.wait()
+        while True:
+            try:
+                status = process.wait(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if (
+                    signal_deadline is not None
+                    and time.monotonic() >= signal_deadline
+                ):
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    status = process.wait()
+                    break
     finally:
         signal.signal(signal.SIGINT, previous_int)
         signal.signal(signal.SIGTERM, previous_term)

@@ -757,8 +757,9 @@ O_DIRECTORY/O_NOFOLLOW 固定仓库和 `.tmp`，随后在 `.tmp/opswarden-e2e.lo
 checkout 的并发 gate 不会在 Go/React/build/Playwright 任一阶段争用资源；伪造环境
 变量不能跳过锁。若锁已被占用，第二个执行立即以 75 失败。lock FD 只由 supervisor
 parent 持有并保持 close-on-exec/non-inheritable，绝不传入 make、npm、node、docker
-或其后代。parent 转发 INT/TERM，runner 被单独 SIGKILL 时也会先终止其残余进程组、
-wait 完成再释放锁；正常退出和 SIGKILL 最终都由内核释放，不依赖 PID/目录锁。取得锁后立即输出
+或其后代。parent 转发 INT/TERM 后采用 deadline polling，五秒内未退出就 KILL
+整个 runner process group，reap 完成后才释放锁；runner 被单独 SIGKILL 时同样先
+终止其残余进程组。正常退出和 SIGKILL 最终都由内核释放，不依赖 PID/目录锁。取得锁后立即输出
 本次 runtime、artifact、Compose project、两个 loopback
 端口和后端子网标识，便于信号中断或宿主异常后的精确处置。每次执行生成独立的
 `.tmp/opswarden-e2e.<随机值>`、
@@ -780,14 +781,18 @@ tracked-file scanner 和 archive 命令均同时设置 `GIT_NO_REPLACE_OBJECTS=1
 test-results/report，以及 zip/tar/gzip 内部内容和 Git 跟踪文件。扫描器从固定
 directory FD 出发，以 openat/O_NOFOLLOW 打开每一级目录和文件；枚举到 child 时
 立即保留其 FD 并从该 FD 扫描，不再按路径重开。pattern 文件同样只能相对已固定的
-runtime FD 打开。读取前后核对 inode、owner、mode、size 与 mtime；整个 scan
+runtime FD 打开。每个顶层 artifact root 的 FD 和 entry baseline 会保留到全部
+targets 扫描结束，最后统一核对 namespace/identity，已扫描目录的晚替换也会拒绝。
+读取前后核对 inode、owner、mode、size 与 mtime；整个 scan
 共享唯一 archive member/expanded-byte 预算（跨所有顶层文件与嵌套层），任何
 symlink、runtime/目录替换或聚合压缩炸弹均 fail closed。模式包含每个原子
 密码、JWT、Agent Token、私钥随机体、数据库密码、连接串/TOTP/recovery/session 和
 全部十个初始 recovery codes、主密钥。control 文件只保存三个确实被场景消费的
 recovery code。MCP 失败的原始 body 由 isolated Python writer 从 `/` 逐组件固定
-artifact root，再相对 pinned `errors` FD 以 O_NOFOLLOW/O_APPEND 写入；它拒绝
-symlink、错误 owner/mode/inode 和 namespace swap。记录使用 8 字节长度前缀和原始
+artifact root，再相对 pinned `errors` FD 以 O_NOFOLLOW/O_APPEND 写入；existing
+和新建目标在写前后都必须是 `st_nlink == 1`，并拒绝 symlink、hardlink、错误
+owner/mode/inode 和 namespace swap。Node pipe 会等待写端完成并把 EPIPE/提前退出
+转换成不含 body 的净化错误。记录使用 8 字节长度前缀和原始
 字节、仅以 0600 写入受扫描 artifact，因此 scanner 能直接匹配其中的敏感模式；Playwright
 异常和 reporter 只显示状态与净化后的错误摘要。自动负控会逐类注入模式，并在任何
 false negative 时阻止 gate。

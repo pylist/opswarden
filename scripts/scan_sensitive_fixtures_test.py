@@ -232,6 +232,32 @@ class SensitiveFixtureScannerTest(unittest.TestCase):
         finally:
             os.close(artifact_fd)
 
+    def test_previously_scanned_top_is_retained_until_global_revalidation(self) -> None:
+        artifact_fd = os.open(self.artifacts, scanner.DIRECTORY_FLAGS)
+        errors_fd = -1
+        logs_fd = -1
+        try:
+            _, _, errors_fd, errors_baseline = scanner.pin_and_scan_top_entry(
+                artifact_fd, "errors", (self.secret,), scanner.ArchiveBudget()
+            )
+            moved = self.artifacts / "errors-scanned"
+            (self.artifacts / "errors").rename(moved)
+            (self.artifacts / "errors").mkdir()
+            (self.artifacts / "errors" / "late-secret.log").write_bytes(self.secret)
+            _, _, logs_fd, _ = scanner.pin_and_scan_top_entry(
+                artifact_fd, "logs", (self.secret,), scanner.ArchiveBudget()
+            )
+            with self.assertRaises(scanner.ScanRefused):
+                scanner.revalidate_top_entry(
+                    artifact_fd, "errors", errors_fd, errors_baseline
+                )
+        finally:
+            if logs_fd >= 0:
+                os.close(logs_fd)
+            if errors_fd >= 0:
+                os.close(errors_fd)
+            os.close(artifact_fd)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
