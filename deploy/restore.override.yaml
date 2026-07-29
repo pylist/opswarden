@@ -4,7 +4,7 @@ services:
       - "${OPSWARDEN_RESTORE_HOST_PORT:?set restore loopback port}"
     volumes: !override
       - type: bind
-        source: /srv/opswarden-restore-worktree/source/deploy/RestoreCaddyfile
+        source: /srv/opswarden-restore/release/deploy/RestoreCaddyfile
         target: /etc/caddy/Caddyfile
         read_only: true
       - type: bind

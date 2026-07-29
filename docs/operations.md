@@ -60,23 +60,64 @@ printf 'SQLite state filesystem: %s (local filesystem preflight passed)\n' \
 ### 固定的 root-owned 运维辅助程序
 
 任何以 root 或 `10001` 身份运行的 Python 辅助程序都只能来自固定 trust anchor，
-不得直接执行 Git worktree 中的脚本。首次安装或每次升级 trust anchor 前，先由
-非 root 部署操作员使用受信 OpenPGP key 验证 annotated release tag、完整 commit
-和真实 tree。所有这些 Git 操作都关闭 replace-object，并清除可改变 repository、
-worktree 或 object store 的环境变量：
+不得直接执行 Git checkout/worktree 中的脚本。首次安装或每次升级 trust anchor
+前，由非 root 部署操作员在固定、只读的
+`/etc/opswarden/release-gnupg` keyring 中导入并人工核对发布公钥。以下函数以
+`env -i` 建立完全显式的 Git 环境：固定绝对二进制、HOME/PATH/locale/keyring，
+关闭 system/global config、replace-object、hooks、fsmonitor、外部 diff 与全局
+attributes，并固定 OpenPGP verifier 和 fully-trusted key 策略。它不继承
+`GIT_DIR`、`GIT_WORK_TREE`、object/alternate object directory、
+`GIT_CONFIG_COUNT`、`GNUPGHOME` 或其他 `GIT_*` 注入。仓库本地
+`.gitattributes` 仍可能存在，因此验证后只使用不运行 clean/smudge/diff 的
+`cat-file`/`ls-tree` 原始对象 plumbing；绝不运行 checkout、worktree add、status
+或 diff：
 
 ```bash
 set -euo pipefail
 cd /opt/opswarden
 release_ref='<approved-signed-release-tag>'
 expected_revision='<approved-full-revision>'
-unset GIT_DIR GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
-while IFS='=' read -r git_env_name _; do
-  case "$git_env_name" in GIT_*) unset "$git_env_name" ;; esac
-done < <(env)
-export GIT_NO_REPLACE_OBJECTS=1
-safe_git() { /usr/bin/git --no-replace-objects "$@"; }
-safe_git fetch --tags --force
+SAFE_GIT_CONFIG=(
+  -c safe.directory=/opt/opswarden
+  -c core.hooksPath=/dev/null
+  -c core.fsmonitor=false
+  -c core.attributesFile=/dev/null
+  -c diff.external=
+  -c fsck.skipList=/dev/null
+  -c receive.fsck.skipList=/dev/null
+  -c fetch.fsck.skipList=/dev/null
+  -c gpg.format=openpgp
+  -c gpg.program=/usr/bin/gpg
+  -c gpg.minTrustLevel=fully
+)
+safe_git() {
+  env -i \
+    HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GNUPGHOME=/etc/opswarden/release-gnupg \
+    /usr/bin/git --no-replace-objects \
+    "${SAFE_GIT_CONFIG[@]}" -C /opt/opswarden "$@"
+}
+verified_blob_sha256() {
+  local object_id="$1" object_size
+  object_size="$(safe_git cat-file -s "$object_id")"
+  safe_git cat-file blob "$object_id" |
+    env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -c '
+import hashlib, sys
+object_id, size = sys.argv[1], int(sys.argv[2])
+raw = sys.stdin.buffer.read(size + 1)
+if len(raw) != size:
+    raise SystemExit("raw blob size mismatch")
+git_hash = hashlib.sha1() if len(object_id) == 40 else hashlib.sha256()
+git_hash.update(b"blob " + str(size).encode("ascii") + b"\0" + raw)
+if git_hash.hexdigest() != object_id:
+    raise SystemExit("raw blob object ID mismatch")
+print(hashlib.sha256(raw).hexdigest())
+' "$object_id" "$object_size"
+}
+# 在进入此信任流程前，以已批准的普通 HTTPS/SSH 传输取得对象；这里不运行 fetch，
+# 避免使用仓库中可能被篡改的 remote helper/URL 配置。
 [ -z "$(safe_git for-each-ref --format='%(refname)' refs/replace/)" ] || {
   echo "repository 存在 refs/replace；拒绝信任或安装辅助程序" >&2
   exit 1
@@ -87,27 +128,85 @@ safe_git fetch --tags --force
 }
 safe_git verify-tag "refs/tags/$release_ref"
 [ "$(safe_git rev-parse "refs/tags/${release_ref}^{commit}")" = "$expected_revision" ]
-[ "$(safe_git rev-parse HEAD)" = "$expected_revision" ]
-[ "$(safe_git rev-parse HEAD^{tree})" = \
-  "$(safe_git rev-parse "refs/tags/${release_ref}^{commit}^{tree}")" ]
-[ -z "$(safe_git status --porcelain --untracked-files=all)" ]
-safe_git show "$expected_revision:deploy/offline_ops.py" |
-  cmp -s - deploy/offline_ops.py
-safe_git show "$expected_revision:deploy/offline_revoke.py" |
-  cmp -s - deploy/offline_revoke.py
+safe_git fsck --strict --no-reflogs "$expected_revision"
+expected_tree="$(safe_git rev-parse "${expected_revision}^{tree}")"
+expected_epoch="$(safe_git show -s --format=%ct "$expected_revision")"
+
+# 每个 helper 只从已验证 commit 的 blob OID 流入固定 root installer。installer
+# 从 stdin 写 root-owned 同目录临时文件，校验 size/SHA-256，fsync、fchown/fchmod，
+# 再 atomic rename 并复核最终文件；它永不重读 operator-writable 路径。
 sudo install -d -o root -g root -m 0755 /usr/local/libexec/opswarden
-sudo install -o root -g root -m 0755 -- \
-  deploy/offline_ops.py /usr/local/libexec/opswarden/offline_ops.py
-sudo install -o root -g root -m 0755 -- \
-  deploy/offline_revoke.py /usr/local/libexec/opswarden/offline_revoke.py
+install_signed_blob() {
+  local object_id="$1" destination="$2" expected_size expected_sha256
+  [ "$(safe_git cat-file -t "$object_id")" = blob ]
+  expected_size="$(safe_git cat-file -s "$object_id")"
+  expected_sha256="$(verified_blob_sha256 "$object_id")"
+  safe_git cat-file blob "$object_id" |
+    sudo env -i PATH=/usr/bin:/bin LC_ALL=C \
+      /usr/bin/python3 -c '
+import hashlib, os, pathlib, stat, sys, tempfile
+destination = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+size = int(sys.argv[3])
+object_id = sys.argv[4]
+fd, name = tempfile.mkstemp(prefix="." + destination.name + ".", dir=destination.parent)
+try:
+    digest = hashlib.sha256()
+    git_hash = hashlib.sha1() if len(object_id) == 40 else hashlib.sha256()
+    git_hash.update(b"blob " + str(size).encode("ascii") + b"\0")
+    total = 0
+    while total <= size:
+        chunk = os.read(0, min(1048576, size + 1 - total))
+        if not chunk:
+            break
+        digest.update(chunk)
+        git_hash.update(chunk)
+        total += len(chunk)
+        view = memoryview(chunk)
+        while view:
+            view = view[os.write(fd, view):]
+    if (total != size or digest.hexdigest() != expected or
+        git_hash.hexdigest() != object_id):
+        raise SystemExit("signed blob stream mismatch")
+    os.fchown(fd, 0, 0)
+    os.fchmod(fd, 0o755)
+    os.fsync(fd)
+    os.close(fd)
+    fd = -1
+    os.replace(name, destination)
+    directory_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    os.fsync(directory_fd)
+    os.close(directory_fd)
+    metadata = os.lstat(destination)
+    payload = destination.read_bytes()
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or
+        metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o755 or
+        len(payload) != size or hashlib.sha256(payload).hexdigest() != expected):
+        raise SystemExit("installed trust anchor verification failed")
+finally:
+    if fd >= 0:
+        os.close(fd)
+    try:
+        os.unlink(name)
+    except FileNotFoundError:
+        pass
+' "$destination" "$expected_sha256" "$expected_size" "$object_id"
+}
+ops_blob="$(safe_git rev-parse "${expected_revision}:deploy/offline_ops.py")"
+revoke_blob="$(safe_git rev-parse "${expected_revision}:deploy/offline_revoke.py")"
+install_signed_blob "$ops_blob" \
+  /usr/local/libexec/opswarden/offline_ops.py
+install_signed_blob "$revoke_blob" \
+  /usr/local/libexec/opswarden/offline_revoke.py
 sudo stat -c '%U:%G %a %n' \
   /usr/local/libexec/opswarden/offline_ops.py \
   /usr/local/libexec/opswarden/offline_revoke.py
 ```
 
 预期两行均为 `root:root 755`。辅助程序启动时还会自行拒绝符号链接、非普通文件、
-非固定路径、非 root 所有或 group/other 可写的副本。上述验证成功前不能复制或执行
-release 中的 Python 文件。
+非固定路径、非 root 所有或 group/other 可写的副本。不能先 `cmp` worktree 文件再
+`sudo install` 同一路径；即使该路径在比较后被并发替换，以上安装器读取的仍是
+`cat-file blob <OID>` 的单一对象流。
 
 ## 2. 生成主密钥与配置
 
@@ -293,34 +392,13 @@ sudo -u '#10001' -- python3 \
 其真实版本、commit 和 commit 时间，验证后启动：
 
 ```bash
-unset GIT_DIR GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
-while IFS='=' read -r git_env_name _; do
-  case "$git_env_name" in GIT_*) unset "$git_env_name" ;; esac
-done < <(env)
-export GIT_NO_REPLACE_OBJECTS=1
-safe_git() { /usr/bin/git --no-replace-objects "$@"; }
 release_ref='<approved-release-tag>'
 expected_revision='<approved-full-revision>'
-safe_git fetch --tags --force
-[ -z "$(safe_git for-each-ref --format='%(refname)' refs/replace/)" ]
- [ "$(safe_git cat-file -t "refs/tags/$release_ref")" = tag ]
-safe_git verify-tag "refs/tags/$release_ref"
-[ "$(safe_git rev-parse "refs/tags/${release_ref}^{commit}")" = \
-  "$expected_revision" ]
-safe_git checkout --detach "$expected_revision"
-[ "$(safe_git rev-parse HEAD)" = "$expected_revision" ]
-[ "$(safe_git rev-parse HEAD^{tree})" = \
-  "$(safe_git rev-parse "refs/tags/${release_ref}^{commit}^{tree}")" ]
-safe_git show -s --format=%ct HEAD
-[ -z "$(safe_git status --porcelain --untracked-files=all)" ]
-safe_git show "HEAD:deploy/offline_ops.py" | cmp -s - deploy/offline_ops.py
-safe_git show "HEAD:deploy/offline_revoke.py" | cmp -s - deploy/offline_revoke.py
-# 确认 HEAD、tag peeled commit 和 tree 完全相等后，才更新固定 trust anchor。
-sudo install -o root -g root -m 0755 -- \
-  deploy/offline_ops.py /usr/local/libexec/opswarden/offline_ops.py
-sudo install -o root -g root -m 0755 -- \
-  deploy/offline_revoke.py /usr/local/libexec/opswarden/offline_revoke.py
-# 将上两条输出分别写入 deploy/.env 的 OPSWARDEN_REVISION 与 SOURCE_DATE_EPOCH，
+# 在新的 shell 中逐字重新执行第 1 节的 SAFE_GIT_CONFIG、safe_git、
+# annotated tag 验证和 install_signed_blob 流程。禁止 checkout/worktree/status/diff，
+# 也禁止从当前目录复制 helper。记录其 expected_tree 与 expected_epoch。
+# 将 expected_revision 与 expected_epoch 分别写入 deploy/.env 的
+# OPSWARDEN_REVISION 与 SOURCE_DATE_EPOCH，
 # 并把 OPSWARDEN_VERSION 写为该固定 release；不要使用 latest。
 docker compose --env-file deploy/.env -f deploy/compose.yaml config --quiet
 docker compose --env-file deploy/.env -f deploy/compose.yaml \
@@ -369,8 +447,12 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml \
 schema 兼容的签名 release tag，以及该 tag 对应的完整 HEAD revision；缺少任一项
 就拒绝恢复。
 
-先验证签名 tag 与完整 revision，并把该 revision 检出为独立、detached Git
-worktree。以下三个占位值必须从受保护的备份/发布记录中逐字替换：
+先在非 root 操作员 shell 中重新定义第 1 节完全相同的 `SAFE_GIT_CONFIG` 和
+`safe_git`，验证签名 tag 与完整 revision；禁止 checkout/worktree-add。随后从已验证
+commit 的原始 blob 建立严格 manifest，并将 archive 仅解到操作员私有 staging。
+`.gitattributes` 的 `export-ignore`/`export-subst` 即使影响 archive，也会在 root
+seal 时因 missing/unexpected/size/SHA-256 不符而失败。以下三个占位值必须从受保护的
+备份/发布记录中逐字替换：
 
 ```bash
 set -euo pipefail
@@ -381,7 +463,7 @@ recorded_sha256='<recorded-lowercase-snapshot-sha256>'
 RESTORE_OPERATOR_UID="$(id -u)"
 RESTORE_OPERATOR_GID="$(id -g)"
 [ "$RESTORE_OPERATOR_UID" -ne 0 ] || {
-  echo "Git worktree 必须由非 root 部署操作员创建" >&2
+  echo "release staging 必须由非 root 部署操作员创建" >&2
   exit 1
 }
 case "$expected_revision" in
@@ -393,17 +475,49 @@ case "$recorded_sha256" in
 esac
 [ "${#recorded_sha256}" -eq 64 ] || { echo "SHA-256 长度无效" >&2; exit 1; }
 [ ! -e /srv/opswarden-restore ] &&
-  [ ! -e /srv/opswarden-restore-worktree ] || {
+  [ ! -e /srv/opswarden-restore-staging ] || {
   echo "隔离恢复目录已存在；先人工调查并按本节清理流程处理" >&2
   exit 1
 }
-unset GIT_DIR GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
-while IFS='=' read -r git_env_name _; do
-  case "$git_env_name" in GIT_*) unset "$git_env_name" ;; esac
-done < <(env)
-export GIT_NO_REPLACE_OBJECTS=1
-safe_git() { /usr/bin/git --no-replace-objects "$@"; }
-safe_git fetch --tags --force
+SAFE_GIT_CONFIG=(
+  -c safe.directory=/opt/opswarden
+  -c core.hooksPath=/dev/null
+  -c core.fsmonitor=false
+  -c core.attributesFile=/dev/null
+  -c diff.external=
+  -c fsck.skipList=/dev/null
+  -c receive.fsck.skipList=/dev/null
+  -c fetch.fsck.skipList=/dev/null
+  -c gpg.format=openpgp
+  -c gpg.program=/usr/bin/gpg
+  -c gpg.minTrustLevel=fully
+)
+safe_git() {
+  env -i \
+    HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GNUPGHOME=/etc/opswarden/release-gnupg \
+    /usr/bin/git --no-replace-objects \
+    "${SAFE_GIT_CONFIG[@]}" -C /opt/opswarden "$@"
+}
+verified_blob_sha256() {
+  local object_id="$1" object_size
+  object_size="$(safe_git cat-file -s "$object_id")"
+  safe_git cat-file blob "$object_id" |
+    env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -c '
+import hashlib, sys
+object_id, size = sys.argv[1], int(sys.argv[2])
+raw = sys.stdin.buffer.read(size + 1)
+if len(raw) != size:
+    raise SystemExit("raw blob size mismatch")
+git_hash = hashlib.sha1() if len(object_id) == 40 else hashlib.sha256()
+git_hash.update(b"blob " + str(size).encode("ascii") + b"\0" + raw)
+if git_hash.hexdigest() != object_id:
+    raise SystemExit("raw blob object ID mismatch")
+print(hashlib.sha256(raw).hexdigest())
+' "$object_id" "$object_size"
+}
 [ -z "$(safe_git for-each-ref --format='%(refname)' refs/replace/)" ] || {
   echo "source repository 存在 refs/replace；拒绝恢复" >&2
   exit 1
@@ -418,39 +532,58 @@ tag_revision="$(safe_git rev-parse "refs/tags/${release_ref}^{commit}")"
   echo "签名 tag 与备份记录 revision 不一致" >&2
   exit 1
 }
-tag_tree="$(safe_git rev-parse "refs/tags/${release_ref}^{commit}^{tree}")"
-sudo install -d -o "$RESTORE_OPERATOR_UID" -g "$RESTORE_OPERATOR_GID" -m 0700 \
-  /srv/opswarden-restore-worktree
-safe_git worktree add --detach \
-  /srv/opswarden-restore-worktree/source "$expected_revision"
-chmod 0700 /srv/opswarden-restore-worktree/source
-if [ "$(safe_git -C /srv/opswarden-restore-worktree/source rev-parse HEAD)" != "$expected_revision" ]; then
-  echo "隔离 worktree HEAD 与记录 revision 不一致" >&2
-  exit 1
-fi
-if [ "$(safe_git -C /srv/opswarden-restore-worktree/source rev-parse HEAD^{tree})" != "$tag_tree" ]; then
-  echo "隔离 worktree tree 与签名 release 不一致" >&2
-  exit 1
-fi
-[ -z "$(safe_git -C /srv/opswarden-restore-worktree/source \
-  status --porcelain --untracked-files=all)" ] || {
-    echo "隔离 worktree 不干净" >&2
-    exit 1
-  }
-[ -z "$(safe_git -C /srv/opswarden-restore-worktree/source ls-files -v |
-  sed -n '/^[^H] /p')" ] || {
-    echo "隔离 worktree 存在 assume-unchanged/skip-worktree 或异常 index 状态" >&2
-    exit 1
-  }
-[ -z "$(safe_git -C /srv/opswarden-restore-worktree/source \
-  ls-files --others --ignored --exclude-standard)" ] || {
-    echo "隔离 worktree 存在 ignored build input" >&2
-    exit 1
-  }
-safe_git -C /srv/opswarden-restore-worktree/source \
-  diff --no-ext-diff --quiet HEAD --
-
+safe_git fsck --strict --no-reflogs "$expected_revision"
+tag_tree="$(safe_git rev-parse "${expected_revision}^{tree}")"
+expected_epoch="$(safe_git show -s --format=%ct "$expected_revision")"
 sudo install -d -o root -g root -m 0755 /srv/opswarden-restore
+sudo install -d -o "$RESTORE_OPERATOR_UID" -g "$RESTORE_OPERATOR_GID" -m 0700 \
+  /srv/opswarden-restore-staging
+install -d -m 0700 /srv/opswarden-restore-staging/release
+safe_git archive --format=tar "$expected_revision" |
+  /usr/bin/tar -x -C /srv/opswarden-restore-staging/release \
+    --no-same-owner --no-same-permissions
+/usr/bin/find /srv/opswarden-restore-staging/release -type d -exec chmod 0700 {} +
+/usr/bin/find /srv/opswarden-restore-staging/release -type f -exec chmod 0600 {} +
+manifest=/srv/opswarden-restore-staging/release.manifest
+{
+  printf '%s\n' OPSWARDEN-RELEASE-MANIFEST-V1
+  printf 'tag %s\nrevision %s\ntree %s\nepoch %s\n' \
+    "$release_ref" "$expected_revision" "$tag_tree" "$expected_epoch"
+  while IFS= read -r -d '' mode &&
+        IFS= read -r -d '' object_type &&
+        IFS= read -r -d '' object_id &&
+        IFS= read -r -d '' object_path; do
+    case "$mode:$object_type" in
+      100644:blob|100755:blob) ;;
+      *) echo "release 含 symlink/submodule/special mode" >&2; exit 1 ;;
+    esac
+    case "$object_path" in
+      ''|/*|*'//'*) echo "不安全 release path" >&2; exit 1 ;;
+      *[!A-Za-z0-9._+@/-]*) echo "release path 字符不受支持" >&2; exit 1 ;;
+    esac
+    case "/$object_path/" in
+      *'/../'*|*'/./'*|*'/.git/'*) echo "不安全 release path segment" >&2; exit 1 ;;
+    esac
+    object_size="$(safe_git cat-file -s "$object_id")"
+    object_sha256="$(verified_blob_sha256 "$object_id")"
+    printf '%s %s %s %s\n' \
+      "$mode" "$object_size" "$object_sha256" "$object_path"
+  done < <(
+    safe_git ls-tree -r -z --full-tree \
+      --format='%(objectmode)%x00%(objecttype)%x00%(objectname)%x00%(path)%x00' \
+      "$expected_revision"
+  )
+} >"$manifest"
+chmod 0400 "$manifest"
+
+# root helper 不执行 Git，也不信任 staging 的路径稳定性。它以 O_NOFOLLOW 打开每个
+# manifest 项，复制期间校验 inode/owner/mode/size/mtime/raw SHA-256，只创建
+# root:root 0444/0555 目标；拒绝 symlink、special、unexpected、missing，fsync 后
+# atomic rename，并再次遍历最终 release。
+sudo -- python3 /usr/local/libexec/opswarden/offline_ops.py seal-release \
+  "$release_ref" "$expected_revision" "$tag_tree" "$expected_epoch" \
+  "$RESTORE_OPERATOR_UID" "$RESTORE_OPERATOR_GID"
+
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/opswarden-restore/state/data \
   /srv/opswarden-restore/state/backups \
@@ -488,16 +621,18 @@ OPSWARDEN_INTERNAL_CIDRS=
 OPSWARDEN_RESTORE_HOST_PORT=127.0.0.1:8443:443/tcp
 ```
 
-隔离 Caddy 配置与 Compose override 固定为签名 worktree 中的
+隔离 Caddy 配置与 Compose override 固定为 immutable release 中的
 `deploy/RestoreCaddyfile` 和 `deploy/restore.override.yaml`。不要在
-`/srv/opswarden-restore` 另建或修改 override；preflight 验证 clean signed tree，
+`/srv/opswarden-restore` 另建或修改 override；preflight 验证 manifest-exact export，
 而 host port 只能来自已严格验证的 `OPSWARDEN_RESTORE_HOST_PORT`。
 
-在任何 Compose 配置、构建或启动之前执行统一 preflight。它再次要求 isolated
-worktree 为 detached HEAD，内部再次验证签名 tag 恰好解析到记录 revision，拒绝
-tracked、untracked、ignored build input 以及 assume-unchanged/skip-worktree index
-flag，并对整个 working tree 与 signed HEAD 做 no-external-diff 比较；因此 Dockerfile、
-Compose、Caddy 和所有构建输入都来自签名 tree。它还验证恢复副本是
+在任何 Compose 配置、构建或启动之前执行统一 preflight。root helper 在整个
+seal/preflight 生命周期中不执行任何 Git 命令；它只读取 root-owned `0444`
+manifest 与 root-owned `0555` release，验证完整路径集合和每个 raw blob 的 mode、
+size、SHA-256。因此恶意 local/system/global Git config、hooks、fsmonitor、
+clean/smudge/diff filter、`.gitattributes`、`GIT_*` 环境与 replace ref 都不可能在
+root 身份执行，Dockerfile、Compose、Caddy 和全部 build context 都来自已签名 tree。
+它还验证恢复副本是
 `10001:10001`、`0600`、规范、非空、
 非符号链接的普通文件；实际 SHA-256 必须与记录值恒定时间比较相等，SQLite 完整性
 输出必须恰好为 `ok\n`。它还以无 shell evaluation 的严格 parser 读取随后 Compose
@@ -512,19 +647,19 @@ sudo -- python3 /usr/local/libexec/opswarden/offline_ops.py restore-preflight \
   "$RESTORE_OPERATOR_UID" "$RESTORE_OPERATOR_GID"
 ```
 
-preflight 成功后，只从隔离 worktree 构建和启动，不能引用
+preflight 成功后，只从 immutable release 构建和启动，不能引用
 `/opt/opswarden/deploy/compose.yaml`：
 
 ```bash
 docker compose -p opswarden-restore \
   --env-file /srv/opswarden-restore/restore.env \
-  -f /srv/opswarden-restore-worktree/source/deploy/compose.yaml \
-  -f /srv/opswarden-restore-worktree/source/deploy/restore.override.yaml \
+  -f /srv/opswarden-restore/release/deploy/compose.yaml \
+  -f /srv/opswarden-restore/release/deploy/restore.override.yaml \
   config --quiet
 docker compose -p opswarden-restore \
   --env-file /srv/opswarden-restore/restore.env \
-  -f /srv/opswarden-restore-worktree/source/deploy/compose.yaml \
-  -f /srv/opswarden-restore-worktree/source/deploy/restore.override.yaml \
+  -f /srv/opswarden-restore/release/deploy/compose.yaml \
+  -f /srv/opswarden-restore/release/deploy/restore.override.yaml \
   up -d --build
 curl --insecure --fail --silent --show-error https://127.0.0.1:8443/health/live
 ```
@@ -538,25 +673,19 @@ curl --insecure --fail --silent --show-error https://127.0.0.1:8443/health/live
 
 ```bash
 set -euo pipefail
-unset GIT_DIR GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
-while IFS='=' read -r git_env_name _; do
-  case "$git_env_name" in GIT_*) unset "$git_env_name" ;; esac
-done < <(env)
-export GIT_NO_REPLACE_OBJECTS=1
-safe_git() { /usr/bin/git --no-replace-objects "$@"; }
 docker compose -p opswarden-restore \
   --env-file /srv/opswarden-restore/restore.env \
-  -f /srv/opswarden-restore-worktree/source/deploy/compose.yaml \
-  -f /srv/opswarden-restore-worktree/source/deploy/restore.override.yaml down
+  -f /srv/opswarden-restore/release/deploy/compose.yaml \
+  -f /srv/opswarden-restore/release/deploy/restore.override.yaml down
 remaining="$(
   docker compose -p opswarden-restore \
     --env-file /srv/opswarden-restore/restore.env \
-    -f /srv/opswarden-restore-worktree/source/deploy/compose.yaml \
-    -f /srv/opswarden-restore-worktree/source/deploy/restore.override.yaml \
+    -f /srv/opswarden-restore/release/deploy/compose.yaml \
+    -f /srv/opswarden-restore/release/deploy/restore.override.yaml \
     ps --all --quiet
 )"
 if [ -n "$remaining" ]; then
-  echo "恢复演练仍有关联容器；拒绝删除 worktree、state 或密钥" >&2
+  echo "恢复演练仍有关联容器；拒绝删除 release、state 或密钥" >&2
   exit 1
 fi
 restore_root="$(readlink -f -- /srv/opswarden-restore)"
@@ -570,28 +699,29 @@ if findmnt --noheadings --mountpoint /srv/opswarden-restore >/dev/null 2>&1; the
   echo "恢复根目录仍是挂载点；拒绝删除" >&2
   exit 1
 fi
-worktree_root="$(readlink -f -- /srv/opswarden-restore-worktree)"
-[ "$worktree_root" = /srv/opswarden-restore-worktree ] &&
-  [ -d /srv/opswarden-restore-worktree ] &&
-  [ ! -L /srv/opswarden-restore-worktree ] || {
-    echo "worktree 根目录不是预期规范目录；拒绝清理" >&2
+staging_root="$(readlink -f -- /srv/opswarden-restore-staging)"
+[ "$staging_root" = /srv/opswarden-restore-staging ] &&
+  [ -d /srv/opswarden-restore-staging ] &&
+  [ ! -L /srv/opswarden-restore-staging ] || {
+    echo "staging 根目录不是预期规范目录；拒绝清理" >&2
     exit 1
   }
-safe_git -C /opt/opswarden worktree remove \
-  /srv/opswarden-restore-worktree/source
-sudo rmdir -- /srv/opswarden-restore-worktree
 sudo rm -f -- /srv/opswarden-restore/secrets/master.key
 sudo rm -rf -- /srv/opswarden-restore/state \
   /srv/opswarden-restore/secrets \
-  /srv/opswarden-restore/caddy
-sudo rm -f -- /srv/opswarden-restore/restore.env
+  /srv/opswarden-restore/caddy \
+  /srv/opswarden-restore/release
+sudo rm -f -- /srv/opswarden-restore/restore.env \
+  /srv/opswarden-restore/release.manifest
 sudo rmdir -- /srv/opswarden-restore
-safe_git -C /opt/opswarden worktree prune
+sudo rm -rf -- /srv/opswarden-restore-staging/release
+sudo rm -f -- /srv/opswarden-restore-staging/release.manifest
+sudo rmdir -- /srv/opswarden-restore-staging
 ```
 
-不得给 `git worktree remove` 加 `--force`；如果它报告 tracked/untracked 修改，先保留
-现场调查。上述删除不可从应用恢复；数据库快照、其受保护 checksum 记录、对应
-release/revision 和匹配密钥的权威副本必须仍在独立备份系统。
+上述删除不可从应用恢复；数据库快照、其受保护 checksum 记录、对应
+release/revision/tree 和匹配密钥的权威副本必须仍在独立备份系统。任何 seal 或
+preflight 失败都先保留 staging/release 现场调查，不要直接删除重试。
 
 ## 9. 紧急吊销
 
@@ -644,19 +774,20 @@ v1 内部具备数据密钥 rewrap 原语，但没有经过支持的在线轮换
 
 灾难恢复必须逐条执行第 8 节的同一顺序和同一个 `offline_ops.py
 restore-preflight`，不能简化为从当前 source 构建：先取得快照记录的 SHA-256、
-签名 release tag 和完整 HEAD revision；验证 tag 后建立 isolated detached
-worktree；恢复匹配密钥与快照；在任何 Compose 启动前验证 worktree/revision、
-checksum 和字节级恰好为 `ok\n` 的完整性结果；最后只从该 isolated worktree
-构建。先以不开放公网的方式验证测试凭据解密和审计查询，确认接管后再切换规范
+签名 release tag 和完整 revision；在 hermetic 非 root Git 环境验证 tag 后，从
+raw blob 建立 manifest 和 staging，由固定 root helper seal 成 immutable
+root-owned release；恢复匹配密钥与快照；在任何 Compose 启动前验证
+release/revision、checksum 和字节级恰好为 `ok\n` 的完整性结果；最后只从该
+immutable release 构建。先以不开放公网的方式验证测试凭据解密和审计查询，确认接管后再切换规范
 DNS/443。如果恢复环境成为生产，立即吊销恢复期间产生的会话与 Agent Token，签发
 新 Token，并重新建立独立数据库备份、受保护 checksum/版本记录和主密钥备份。
 未经验证不得删除原主机、原 snapshot 或原密钥副本。
 
 全新灾难主机还没有 trust anchor 时，先安装操作系统发行版提供的
-`/usr/bin/git`、`/usr/bin/gpg` 和受信 release 公钥；不执行任何仓库文件。以非 root
-操作员按第 1 节命令清除 Git 环境、设置 `GIT_NO_REPLACE_OBJECTS=1`、为每条命令使用
-`git --no-replace-objects`、拒绝 `refs/replace/*`、验证 annotated tag 签名，并核对
-peeled commit、完整 HEAD、真实 tree 与 clean status。全部成功后，root 才可用
-`install -o root -g root -m 0755` 把两个 Python 文件复制到
-`/usr/local/libexec/opswarden/`；第一次 privileged preflight 也只能执行这个固定
-副本。任何一步失败都不得安装辅助程序、启动 Compose 或接触生产 DNS。
+`/usr/bin/git`、`/usr/bin/gpg` 和受信 release 公钥；把核对过的公钥导入固定
+`/etc/opswarden/release-gnupg`，不执行任何仓库文件。以非 root 操作员逐字执行第
+1 节的 `env -i` hermetic Git、拒绝 replace refs、annotated tag 验证和 raw
+`cat-file blob <OID>` 流程；两个 helper 都只能经固定 stdin atomic installer
+写入 `/usr/local/libexec/opswarden/`，不能从 checkout/worktree 路径复制。第一次
+privileged seal/preflight 也只能执行这个 root-owned 固定副本；它自身绝不运行
+Git。任何一步失败都不得安装辅助程序、启动 Compose 或接触生产 DNS。

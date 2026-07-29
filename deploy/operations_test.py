@@ -63,6 +63,7 @@ class OfflineOpsTest(unittest.TestCase):
         self.root = Path(self.tempdir.name).resolve()
         self.uid = os.getuid()
         self.gid = os.getgid()
+        self.fixture_count = 0
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -132,308 +133,198 @@ class OfflineOpsTest(unittest.TestCase):
         self.assertEqual(digest, hashlib.sha256(snapshot.read_bytes()).hexdigest())
         self.ops.verify_integrity(snapshot)
 
-    def create_git_checkout(self) -> tuple[Path, str]:
-        repository = self.root / "repository"
-        checkout = self.root / "checkout"
-        subprocess.run(["git", "init", "-q", repository], check=True)
-        subprocess.run(
-            ["git", "-C", repository, "config", "user.email", "fixture@example.com"],
-            check=True,
-        )
-        subprocess.run(
-            ["git", "-C", repository, "config", "user.name", "Fixture"],
-            check=True,
-        )
-        (repository / "release.txt").write_text("fixture\n", encoding="utf-8")
-        (repository / "deploy").mkdir()
-        (repository / "deploy" / "Dockerfile").write_text(
-            "FROM scratch\n", encoding="utf-8"
-        )
-        (repository / ".gitignore").write_text(
-            "ignored-build-input\n", encoding="utf-8"
-        )
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                repository,
-                "add",
-                "release.txt",
-                "deploy/Dockerfile",
-                ".gitignore",
-            ],
-            check=True,
-        )
-        subprocess.run(
-            ["git", "-C", repository, "commit", "-q", "-m", "fixture"], check=True
-        )
-        subprocess.run(
-            ["git", "-C", repository, "worktree", "add", "--detach", checkout],
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
-        checkout.chmod(0o700)
-        revision = subprocess.check_output(
-            ["git", "-C", checkout, "rev-parse", "HEAD"], text=True
-        ).strip()
-        return checkout, revision
+    def make_release(self) -> tuple[Path, Path, str, int]:
+        self.fixture_count += 1
+        release = self.root / f"release-{self.fixture_count}"
+        deploy = release / "deploy"
+        deploy.mkdir(parents=True)
+        files = {
+            ".gitattributes": b"*.txt filter=evil diff=evil\n",
+            "deploy/Dockerfile": b"FROM scratch\n",
+            "release.txt": b"fixture\n",
+        }
+        for relative, content in files.items():
+            path = release / relative
+            path.write_bytes(content)
+            path.chmod(0o444)
+        deploy.chmod(0o555)
+        release.chmod(0o555)
+        revision = "a" * 40
+        tree = "b" * 40
+        epoch = 1700000000
+        lines = [
+            self.ops.MANIFEST_HEADER,
+            "tag v1.0.0",
+            f"revision {revision}",
+            f"tree {tree}",
+            f"epoch {epoch}",
+        ]
+        for relative, content in sorted(files.items()):
+            lines.append(
+                f"100644 {len(content)} {hashlib.sha256(content).hexdigest()} {relative}"
+            )
+        manifest = self.root / f"release-{self.fixture_count}.manifest"
+        manifest.write_text("\n".join(lines) + "\n", encoding="ascii")
+        manifest.chmod(0o444)
+        return release, manifest, revision, epoch
 
-    def checkout_tree(self, checkout: Path) -> str:
-        return subprocess.check_output(
-            [
-                "git",
-                "--no-replace-objects",
-                "-C",
-                checkout,
-                "rev-parse",
-                "HEAD^{tree}",
-            ],
-            text=True,
-        ).strip()
-
-    def make_restore_fixture(self) -> tuple[Path, str, Path, str]:
-        checkout, revision = self.create_git_checkout()
-        snapshot = self.root / "restore.sqlite3"
+    def make_restore_fixture(self) -> tuple[Path, Path, str, Path, str]:
+        release, manifest, revision, _ = self.make_release()
+        snapshot = self.root / f"restore-{self.fixture_count}.sqlite3"
         make_sqlite(snapshot)
         digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
-        return checkout, revision, snapshot, digest
+        return release, manifest, revision, snapshot, digest
+
+    def restore(self, release, manifest, revision, snapshot, digest):
+        return self.ops.restore_preflight(
+            release,
+            manifest,
+            "v1.0.0",
+            revision,
+            snapshot,
+            digest,
+            self.uid,
+            self.gid,
+            release_uid=self.uid,
+            release_gid=self.gid,
+        )
 
     def test_restore_preflight_rejects_wrong_revision(self):
-        checkout, _, snapshot, digest = self.make_restore_fixture()
+        release, manifest, _, snapshot, digest = self.make_restore_fixture()
         with self.assertRaises((OSError, RuntimeError, ValueError)):
-            self.ops.restore_preflight(
-                checkout, "v1.0.0", "0" * 40, snapshot, digest, self.uid, self.gid
-            )
+            self.restore(release, manifest, "0" * 40, snapshot, digest)
 
     def test_restore_preflight_rejects_missing_snapshot(self):
-        checkout, revision = self.create_git_checkout()
-        with mock.patch.object(
-            self.ops,
-            "verify_release_tag",
-            return_value=(self.checkout_tree(checkout), 0),
-        ):
-            with self.assertRaises((OSError, RuntimeError, ValueError)):
-                self.ops.restore_preflight(
-                    checkout,
-                    "v1.0.0",
-                    revision,
-                    self.root / "missing.sqlite3",
-                    "0" * 64,
-                    self.uid,
-                    self.gid,
-                )
+        release, manifest, revision, _ = self.make_release()
+        with self.assertRaises((OSError, RuntimeError, ValueError)):
+            self.restore(
+                release,
+                manifest,
+                revision,
+                self.root / "missing.sqlite3",
+                "0" * 64,
+            )
 
     def test_restore_preflight_rejects_empty_snapshot(self):
-        checkout, revision = self.create_git_checkout()
+        release, manifest, revision, _ = self.make_release()
         snapshot = self.root / "empty-restore.sqlite3"
         snapshot.touch(mode=0o600)
         digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
-        with mock.patch.object(
-            self.ops,
-            "verify_release_tag",
-            return_value=(self.checkout_tree(checkout), 0),
-        ):
-            with self.assertRaises((OSError, RuntimeError, ValueError)):
-                self.ops.restore_preflight(
-                    checkout,
-                    "v1.0.0",
-                    revision,
-                    snapshot,
-                    digest,
-                    self.uid,
-                    self.gid,
-                )
+        with self.assertRaises((OSError, RuntimeError, ValueError)):
+            self.restore(release, manifest, revision, snapshot, digest)
 
     def test_restore_preflight_rejects_wrong_checksum(self):
-        checkout, revision, snapshot, _ = self.make_restore_fixture()
-        with mock.patch.object(
-            self.ops,
-            "verify_release_tag",
-            return_value=(self.checkout_tree(checkout), 0),
-        ):
-            with self.assertRaises((OSError, RuntimeError, ValueError)):
-                self.ops.restore_preflight(
-                    checkout,
-                    "v1.0.0",
-                    revision,
-                    snapshot,
-                    "0" * 64,
-                    self.uid,
-                    self.gid,
-                )
+        release, manifest, revision, snapshot, _ = self.make_restore_fixture()
+        with self.assertRaises((OSError, RuntimeError, ValueError)):
+            self.restore(release, manifest, revision, snapshot, "0" * 64)
 
     def test_restore_preflight_rejects_corrupt_snapshot(self):
-        checkout, revision = self.create_git_checkout()
+        release, manifest, revision, _ = self.make_release()
         snapshot = self.root / "corrupt.sqlite3"
         snapshot.write_bytes(b"not a sqlite database")
         snapshot.chmod(0o600)
         digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
-        with mock.patch.object(
-            self.ops,
-            "verify_release_tag",
-            return_value=(self.checkout_tree(checkout), 0),
-        ):
-            with self.assertRaises((OSError, RuntimeError, ValueError)):
-                self.ops.restore_preflight(
-                    checkout,
-                    "v1.0.0",
-                    revision,
-                    snapshot,
-                    digest,
-                    self.uid,
-                    self.gid,
-                )
+        with self.assertRaises((OSError, RuntimeError, ValueError)):
+            self.restore(release, manifest, revision, snapshot, digest)
 
     def test_restore_preflight_accepts_exact_revision_checksum_and_database(self):
-        checkout, revision, snapshot, digest = self.make_restore_fixture()
-        with mock.patch.object(
-            self.ops,
-            "verify_release_tag",
-            return_value=(self.checkout_tree(checkout), 0),
-        ) as verify_tag:
-            self.ops.restore_preflight(
-                checkout,
-                "v1.0.0",
-                revision,
-                snapshot,
-                digest,
-                self.uid,
-                self.gid,
-            )
-        verify_tag.assert_called_once_with(checkout, "v1.0.0", revision)
+        release, manifest, revision, snapshot, digest = self.make_restore_fixture()
+        self.restore(release, manifest, revision, snapshot, digest)
 
     def test_restore_preflight_rejects_symlink_snapshot(self):
-        checkout, revision, snapshot, digest = self.make_restore_fixture()
+        release, manifest, revision, snapshot, digest = self.make_restore_fixture()
         link = self.root / "linked-restore.sqlite3"
         link.symlink_to(snapshot)
-        with mock.patch.object(
-            self.ops,
-            "verify_release_tag",
-            return_value=(self.checkout_tree(checkout), 0),
-        ):
-            with self.assertRaises((OSError, RuntimeError, ValueError)):
-                self.ops.restore_preflight(
-                    checkout,
-                    "v1.0.0",
-                    revision,
-                    link,
-                    digest,
-                    self.uid,
-                    self.gid,
-                )
+        with self.assertRaises((OSError, RuntimeError, ValueError)):
+            self.restore(release, manifest, revision, link, digest)
 
     def test_restore_preflight_rejects_untracked_build_context(self):
-        checkout, revision, snapshot, digest = self.make_restore_fixture()
-        (checkout / "untracked-build-input").write_text(
+        release, manifest, revision, snapshot, digest = self.make_restore_fixture()
+        release.chmod(0o755)
+        (release / "untracked-build-input").write_text(
             "unexpected\n", encoding="utf-8"
         )
-        with mock.patch.object(
-            self.ops,
-            "verify_release_tag",
-            return_value=(self.checkout_tree(checkout), 0),
-        ):
-            with self.assertRaises(RuntimeError):
-                self.ops.restore_preflight(
-                    checkout,
-                    "v1.0.0",
-                    revision,
-                    snapshot,
-                    digest,
-                    self.uid,
-                    self.gid,
-                )
+        with self.assertRaises((PermissionError, RuntimeError)):
+            self.restore(release, manifest, revision, snapshot, digest)
 
-    def test_restore_rejects_clean_assume_unchanged_build_input(self):
-        checkout, revision, snapshot, digest = self.make_restore_fixture()
-        dockerfile = checkout / "deploy" / "Dockerfile"
-        dockerfile.write_text("FROM malicious.example/image\n", encoding="utf-8")
+    def test_restore_rejects_modified_mode_digest_symlink_and_special_paths(self):
+        for mutation in ("mode", "digest", "symlink"):
+            with self.subTest(mutation=mutation):
+                release, manifest, revision, snapshot, digest = self.make_restore_fixture()
+                target = release / "release.txt"
+                release.chmod(0o755)
+                if mutation == "mode":
+                    target.chmod(0o644)
+                elif mutation == "digest":
+                    target.chmod(0o644)
+                    target.write_bytes(b"malicious\n")
+                    target.chmod(0o444)
+                else:
+                    target.unlink()
+                    target.symlink_to("/etc/passwd")
+                release.chmod(0o555)
+                with self.assertRaises((OSError, RuntimeError, ValueError)):
+                    self.restore(release, manifest, revision, snapshot, digest)
+
+    def test_root_preflight_never_executes_malicious_git_configuration(self):
+        release, manifest, revision, snapshot, digest = self.make_restore_fixture()
+        attacker = self.root / "attacker-repo"
+        marker_names = ("clean", "smudge", "diff", "fsmonitor", "hook", "gpg", "env")
+        subprocess.run(["git", "init", "-q", attacker], check=True)
+        for name in marker_names:
+            command = self.root / f"{name}.sh"
+            command.write_text(
+                f"#!/bin/sh\n: > '{self.root / (name + '.marker')}'\n",
+                encoding="utf-8",
+            )
+            command.chmod(0o755)
+        attributes = release / ".gitattributes"
+        self.assertIn("filter=evil", attributes.read_text(encoding="utf-8"))
         subprocess.run(
-            [
-                "git",
-                "-C",
-                checkout,
-                "update-index",
-                "--assume-unchanged",
-                "deploy/Dockerfile",
-            ],
+            ["git", "-C", attacker, "config", "filter.evil.clean", str(self.root / "clean.sh")],
             check=True,
         )
-        self.assertEqual(
-            subprocess.check_output(
-                ["git", "-C", checkout, "status", "--porcelain"], text=True
-            ),
-            "",
+        subprocess.run(
+            ["git", "-C", attacker, "config", "filter.evil.smudge", str(self.root / "smudge.sh")],
+            check=True,
         )
-        with mock.patch.object(
-            self.ops,
-            "verify_release_tag",
-            return_value=(self.checkout_tree(checkout), 0),
+        subprocess.run(
+            ["git", "-C", attacker, "config", "diff.external", str(self.root / "diff.sh")],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", attacker, "config", "core.fsmonitor", str(self.root / "fsmonitor.sh")],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", attacker, "config", "core.hooksPath", str(self.root)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", attacker, "config", "gpg.program", str(self.root / "gpg.sh")],
+            check=True,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_DIR": str(attacker / ".git"),
+                "GIT_WORK_TREE": str(release),
+                "GIT_EXTERNAL_DIFF": str(self.root / "env.sh"),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                "GIT_CONFIG_VALUE_0": str(self.root / "fsmonitor.sh"),
+            },
+            clear=False,
         ):
-            with self.assertRaises(RuntimeError):
-                self.ops.restore_preflight(
-                    checkout,
-                    "v1.0.0",
-                    revision,
-                    snapshot,
-                    digest,
-                    self.uid,
-                    self.gid,
-                )
+            self.restore(release, manifest, revision, snapshot, digest)
+        for name in marker_names:
+            self.assertFalse((self.root / f"{name}.marker").exists(), name)
+        source = OFFLINE_OPS.read_text(encoding="utf-8")
+        self.assertNotIn('"/usr/bin/git"', source)
+        self.assertNotRegex(source, r'git_command|verify_release_tag|verify_pristine_worktree')
 
-    def test_restore_rejects_ignored_build_context_input(self):
-        checkout, revision, snapshot, digest = self.make_restore_fixture()
-        (checkout / "ignored-build-input").write_text(
-            "malicious\n", encoding="utf-8"
-        )
-        self.assertEqual(
-            subprocess.check_output(
-                ["git", "-C", checkout, "status", "--porcelain"], text=True
-            ),
-            "",
-        )
-        with mock.patch.object(
-            self.ops,
-            "verify_release_tag",
-            return_value=(self.checkout_tree(checkout), 0),
-        ):
-            with self.assertRaises(RuntimeError):
-                self.ops.restore_preflight(
-                    checkout,
-                    "v1.0.0",
-                    revision,
-                    snapshot,
-                    digest,
-                    self.uid,
-                    self.gid,
-                )
-
-    def test_release_tag_verification_failure_is_rejected(self):
-        checkout, revision, _, _ = self.make_restore_fixture()
-        failed = subprocess.CompletedProcess(
-            ["git", "verify-tag"], 1, stdout=b"", stderr=b"bad signature"
-        )
-        with mock.patch.object(
-            self.ops, "exact_git_line", return_value="tag"
-        ), mock.patch.object(self.ops.subprocess, "run", return_value=failed):
-            with self.assertRaises(RuntimeError):
-                self.ops.verify_release_tag(checkout, "v1.0.0", revision)
-
-    def test_git_is_forced_to_no_replace_and_scrubs_object_env(self):
-        command = self.ops.git_command(self.root, "rev-parse", "HEAD")
-        environment = self.ops.git_environment()
-        self.assertEqual(command[1], "--no-replace-objects")
-        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
-        for key in (
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        ):
-            self.assertNotIn(key, environment)
-
-    def test_restore_rejects_replacement_ref_with_clean_malicious_worktree(self):
-        repository = self.root / "replacement-repository"
-        checkout = self.root / "replacement-checkout"
+    def test_hermetic_plumbing_ignores_git_injection_and_exposes_replace_ref(self):
+        repository = self.root / "hostile-repository"
         subprocess.run(["git", "init", "-q", repository], check=True)
         subprocess.run(
             ["git", "-C", repository, "config", "user.email", "fixture@example.com"],
@@ -443,42 +334,165 @@ class OfflineOpsTest(unittest.TestCase):
             ["git", "-C", repository, "config", "user.name", "Fixture"],
             check=True,
         )
-        release = repository / "release.txt"
-        release.write_text("genuine\n", encoding="utf-8")
-        subprocess.run(["git", "-C", repository, "add", "release.txt"], check=True)
+        payload = repository / "payload.txt"
+        payload.write_text("genuine\n", encoding="utf-8")
+        (repository / ".gitattributes").write_text(
+            "*.txt filter=evil diff=evil\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", repository, "add", "."], check=True)
         subprocess.run(
-            ["git", "-C", repository, "commit", "-q", "-m", "genuine"], check=True
+            ["git", "-C", repository, "commit", "-qm", "genuine"], check=True
         )
         genuine = subprocess.check_output(
             ["git", "-C", repository, "rev-parse", "HEAD"], text=True
         ).strip()
-        release.write_text("malicious\n", encoding="utf-8")
-        subprocess.run(
-            ["git", "-C", repository, "commit", "-qam", "malicious"], check=True
-        )
+        genuine_tree = subprocess.check_output(
+            ["git", "--no-replace-objects", "-C", repository, "rev-parse", "HEAD^{tree}"],
+            text=True,
+        ).strip()
+        payload.write_text("malicious\n", encoding="utf-8")
+        subprocess.run(["git", "-C", repository, "commit", "-qam", "malicious"], check=True)
         malicious = subprocess.check_output(
             ["git", "-C", repository, "rev-parse", "HEAD"], text=True
         ).strip()
-        subprocess.run(
-            ["git", "-C", repository, "replace", genuine, malicious], check=True
-        )
-        subprocess.run(
-            ["git", "-C", repository, "worktree", "add", "--detach", checkout, genuine],
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
-        checkout.chmod(0o700)
+        subprocess.run(["git", "-C", repository, "replace", genuine, malicious], check=True)
+
+        markers = {}
+        for name in ("clean", "smudge", "diff", "fsmonitor", "hook", "gpg", "env"):
+            marker = self.root / f"hermetic-{name}.marker"
+            command = self.root / f"hermetic-{name}.sh"
+            command.write_text(f"#!/bin/sh\n: > '{marker}'\n", encoding="utf-8")
+            command.chmod(0o755)
+            markers[name] = marker
+        for key, value in (
+            ("filter.evil.clean", self.root / "hermetic-clean.sh"),
+            ("filter.evil.smudge", self.root / "hermetic-smudge.sh"),
+            ("diff.external", self.root / "hermetic-diff.sh"),
+            ("core.fsmonitor", self.root / "hermetic-fsmonitor.sh"),
+            ("core.hooksPath", self.root),
+            ("gpg.program", self.root / "hermetic-gpg.sh"),
+        ):
+            subprocess.run(
+                ["git", "-C", repository, "config", key, str(value)], check=True
+            )
+
+        command_prefix = [
+            "/usr/bin/git",
+            "--no-replace-objects",
+            "-c",
+            f"safe.directory={repository}",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "diff.external=",
+            "-c",
+            "fsck.skipList=/dev/null",
+            "-c",
+            "receive.fsck.skipList=/dev/null",
+            "-c",
+            "fetch.fsck.skipList=/dev/null",
+            "-c",
+            "gpg.format=openpgp",
+            "-c",
+            "gpg.program=/usr/bin/gpg",
+            "-c",
+            "gpg.minTrustLevel=fully",
+            "-C",
+            str(repository),
+        ]
+        environment = {
+            "HOME": "/nonexistent",
+            "PATH": "/usr/bin:/bin",
+            "LC_ALL": "C",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GNUPGHOME": str(self.root / "fixed-keyring"),
+        }
+        injected = {
+            "GIT_DIR": str(self.root / "wrong.git"),
+            "GIT_WORK_TREE": str(self.root / "wrong-tree"),
+            "GIT_OBJECT_DIRECTORY": str(self.root / "wrong-objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.root / "wrong-alternates"),
+            "GIT_EXTERNAL_DIFF": str(self.root / "hermetic-env.sh"),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": str(self.root / "hermetic-fsmonitor.sh"),
+        }
+        with mock.patch.dict(os.environ, injected, clear=False):
+            resolved_tree = subprocess.check_output(
+                command_prefix + ["rev-parse", f"{genuine}^{{tree}}"],
+                env=environment,
+                text=True,
+            ).strip()
+            subprocess.check_output(
+                command_prefix + ["ls-tree", "-r", "-z", genuine], env=environment
+            )
+            blob = subprocess.check_output(
+                command_prefix + ["rev-parse", f"{genuine}:payload.txt"],
+                env=environment,
+                text=True,
+            ).strip()
+            self.assertEqual(
+                subprocess.check_output(
+                    command_prefix + ["cat-file", "blob", blob], env=environment
+                ),
+                b"genuine\n",
+            )
+            replace_refs = subprocess.check_output(
+                command_prefix
+                + ["for-each-ref", "--format=%(refname)", "refs/replace/"],
+                env=environment,
+                text=True,
+            )
+            subprocess.run(
+                command_prefix + ["fsck", "--strict", "--no-reflogs", genuine],
+                env=environment,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+        self.assertEqual(resolved_tree, genuine_tree)
+        self.assertIn("refs/replace/", replace_refs)
         self.assertEqual(
             subprocess.check_output(
-                ["git", "-C", checkout, "status", "--porcelain"], text=True
-            ),
-            "",
+                command_prefix + ["config", "--get", "gpg.program"],
+                env=environment,
+                text=True,
+            ).strip(),
+            "/usr/bin/gpg",
         )
-        self.assertEqual(
-            (checkout / "release.txt").read_text(encoding="utf-8"), "malicious\n"
-        )
-        with self.assertRaises(RuntimeError):
-            self.ops.reject_replace_refs(checkout)
+        for name, marker in markers.items():
+            self.assertFalse(marker.exists(), name)
+
+    def test_atomic_blob_install_uses_open_stream_not_swapped_path(self):
+        source = self.root / "helper.py"
+        genuine = b"#!/usr/bin/python3\nprint('genuine')\n"
+        malicious = b"#!/usr/bin/python3\nprint('malicious')\n"
+        source.write_bytes(genuine)
+        descriptor = os.open(source, os.O_RDONLY)
+        replacement = self.root / "replacement.py"
+        replacement.write_bytes(malicious)
+        os.replace(replacement, source)
+        destination_parent = self.root / "trusted"
+        destination_parent.mkdir(mode=0o755)
+        destination = destination_parent / "offline_ops.py"
+        try:
+            self.ops.atomic_install_blob(
+                descriptor,
+                destination,
+                hashlib.sha256(genuine).hexdigest(),
+                len(genuine),
+                self.uid,
+                self.gid,
+            )
+        finally:
+            os.close(descriptor)
+        self.assertEqual(destination.read_bytes(), genuine)
+        self.assertNotEqual(destination.read_bytes(), source.read_bytes())
 
     def test_restore_env_rejects_template_defaults_duplicates_and_symlink(self):
         env_path = self.root / "restore.env"
@@ -907,9 +921,12 @@ class OperationsDocumentationTest(unittest.TestCase):
         preflight = restore.index("offline_ops.py restore-preflight")
         compose = restore.index("docker compose")
         self.assertLess(preflight, compose)
-        self.assertIn("safe_git worktree add --detach", restore)
+        self.assertIn("offline_ops.py seal-release", restore)
+        self.assertIn("safe_git ls-tree -r -z --full-tree", restore)
+        self.assertNotIn("safe_git worktree add", restore)
+        self.assertNotIn("safe_git checkout", restore)
         self.assertIn('safe_git verify-tag "refs/tags/$release_ref"', restore)
-        self.assertIn('rev-parse HEAD)" != "$expected_revision"', restore)
+        self.assertIn('rev-parse "${expected_revision}^{tree}"', restore)
 
     def test_runbook_uses_root_first_offline_revocation_helper(self):
         text = OPERATIONS_DOC.read_text(encoding="utf-8")
@@ -930,11 +947,28 @@ class OperationsDocumentationTest(unittest.TestCase):
         )
         self.assertNotIn("sudo -- python3 deploy/offline_revoke.py", text)
 
-    def test_restore_uses_no_replace_and_private_operator_worktree(self):
+    def test_restore_uses_hermetic_git_and_private_operator_staging(self):
         text = OPERATIONS_DOC.read_text(encoding="utf-8")
         restore = text[text.index("## 8. 每季度隔离恢复演练") : text.index("## 9.")]
-        self.assertIn("GIT_NO_REPLACE_OBJECTS=1", restore)
-        self.assertIn("--no-replace-objects", restore)
+        for required in (
+            "env -i",
+            "GIT_NO_REPLACE_OBJECTS=1",
+            "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GNUPGHOME=/etc/opswarden/release-gnupg",
+            "--no-replace-objects",
+            "safe.directory=/opt/opswarden",
+            "core.hooksPath=/dev/null",
+            "core.fsmonitor=false",
+            "core.attributesFile=/dev/null",
+            "diff.external=",
+            "fsck.skipList=/dev/null",
+            "receive.fsck.skipList=/dev/null",
+            "fetch.fsck.skipList=/dev/null",
+            "gpg.program=/usr/bin/gpg",
+            "gpg.minTrustLevel=fully",
+        ):
+            self.assertIn(required, restore)
         self.assertIn("refs/replace/", restore)
         self.assertIn("-m 0700", restore)
         self.assertIn("RESTORE_OPERATOR_UID", restore)
@@ -944,12 +978,40 @@ class OperationsDocumentationTest(unittest.TestCase):
         )
         self.assertIn("/srv/opswarden-restore/restore.env", restore)
         self.assertNotIn("/srv/opswarden-restore/override.yaml", restore)
+        self.assertNotIn("/srv/opswarden-restore-worktree", restore)
+
+    def test_trust_anchor_install_streams_exact_blob_atomically(self):
+        text = OPERATIONS_DOC.read_text(encoding="utf-8")
+        anchor = text[text.index("### 固定的 root-owned 运维辅助程序") : text.index("## 2.")]
+        self.assertIn("safe_git cat-file blob \"$object_id\" |", anchor)
+        self.assertIn("tempfile.mkstemp", anchor)
+        self.assertIn("os.fsync", anchor)
+        self.assertIn("os.fchown", anchor)
+        self.assertIn("os.fchmod", anchor)
+        self.assertIn("os.replace", anchor)
+        self.assertNotIn("cmp -s", anchor)
+        self.assertNotIn("sudo install -o root -g root -m 0755 --", anchor)
+
+    def test_root_helper_has_no_git_execution_or_worktree_inspection(self):
+        source = OFFLINE_OPS.read_text(encoding="utf-8")
+        for forbidden in (
+            "/usr/bin/git",
+            "git_command",
+            "verify_release_tag",
+            "verify_pristine_worktree",
+            '"status"',
+            '"diff"',
+            '"checkout"',
+        ):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("verify_release_filesystem", source)
+        self.assertIn("seal_release", source)
 
     def test_signed_restore_override_uses_only_env_loopback_port(self):
         override = RESTORE_OVERRIDE.read_text(encoding="utf-8")
         self.assertIn("${OPSWARDEN_RESTORE_HOST_PORT:", override)
         self.assertIn(
-            "/srv/opswarden-restore-worktree/source/deploy/RestoreCaddyfile",
+            "/srv/opswarden-restore/release/deploy/RestoreCaddyfile",
             override,
         )
         self.assertNotIn("0.0.0.0:", override)
