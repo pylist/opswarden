@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 module_path = Path(__file__).with_name("scan_sensitive_fixtures.py")
 module_spec = importlib.util.spec_from_file_location("scan_sensitive_fixtures", module_path)
@@ -85,6 +86,60 @@ class SensitiveFixtureScannerTest(unittest.TestCase):
     def test_pattern_file_requires_private_mode(self) -> None:
         self.pattern.chmod(0o644)
         self.assertEqual(self.run_scan(), 2)
+
+    def test_intermediate_directory_symlink_is_refused(self) -> None:
+        real = self.artifacts / "real-errors"
+        (self.artifacts / "errors").rename(real)
+        (self.artifacts / "errors").symlink_to(real, target_is_directory=True)
+        self.assertEqual(self.run_scan(), 2)
+
+    def test_recursive_archive_member_budget_is_shared(self) -> None:
+        nested = io.BytesIO()
+        with zipfile.ZipFile(nested, "w") as output:
+            for index in range(6):
+                output.writestr(f"safe-{index}.txt", b"safe")
+        outer = io.BytesIO()
+        with zipfile.ZipFile(outer, "w") as output:
+            output.writestr("one.zip", nested.getvalue())
+            output.writestr("two.zip", nested.getvalue())
+        with mock.patch.object(scanner, "MAX_ARCHIVE_MEMBERS", 10):
+            with self.assertRaises(scanner.ScanRefused):
+                scanner.scan_archive(
+                    outer.getvalue(), "bomb.zip", (self.secret,)
+                )
+
+    def test_recursive_archive_expanded_byte_budget_is_shared(self) -> None:
+        outer = io.BytesIO()
+        with zipfile.ZipFile(outer, "w") as output:
+            output.writestr("one.txt", b"a" * 60)
+            output.writestr("two.txt", b"b" * 60)
+        with mock.patch.object(scanner, "MAX_ARCHIVE_EXPANDED_BYTES", 100):
+            with self.assertRaises(scanner.ScanRefused):
+                scanner.scan_archive(
+                    outer.getvalue(), "expanded-bomb.zip", (self.secret,)
+                )
+
+    def test_file_namespace_swap_during_scan_is_refused(self) -> None:
+        target = self.artifacts / "errors" / "captured-errors.json"
+        root_fd = os.open(self.artifacts, scanner.DIRECTORY_FLAGS)
+        original_read = scanner.os.read
+        swapped = False
+
+        def swapping_read(descriptor: int, size: int) -> bytes:
+            nonlocal swapped
+            body = original_read(descriptor, size)
+            if body and not swapped:
+                swapped = True
+                target.rename(target.with_suffix(".old"))
+                target.write_bytes(b"replacement")
+            return body
+
+        try:
+            with mock.patch.object(scanner.os, "read", side_effect=swapping_read):
+                with self.assertRaises(scanner.ScanRefused):
+                    scanner.scan_file(root_fd, "errors/captured-errors.json", (self.secret,))
+        finally:
+            os.close(root_fd)
 
 
 if __name__ == "__main__":

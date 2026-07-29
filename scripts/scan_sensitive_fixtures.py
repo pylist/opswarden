@@ -16,58 +16,135 @@ import zipfile
 
 MAX_FILE_BYTES = 64 << 20
 MAX_ARCHIVE_MEMBER_BYTES = 32 << 20
+MAX_ARCHIVE_EXPANDED_BYTES = 128 << 20
 MAX_ARCHIVE_MEMBERS = 2048
+MAX_FILES = 8192
+MAX_DEPTH = 32
+OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+DIRECTORY_FLAGS = OPEN_FLAGS | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+FILE_FLAGS = OPEN_FLAGS | getattr(os, "O_NOFOLLOW", 0)
 
 
 class ScanRefused(RuntimeError):
     pass
 
 
-def canonical_directory(value: str, label: str) -> Path:
-    path = Path(value)
+class ArchiveBudget:
+    def __init__(self) -> None:
+        self.members = 0
+        self.expanded = 0
+
+    def member(self) -> None:
+        self.members += 1
+        if self.members > MAX_ARCHIVE_MEMBERS:
+            raise ScanRefused("recursive archive member count exceeds scan bound")
+
+    def expand(self, size: int) -> None:
+        self.expanded += size
+        if self.expanded > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ScanRefused("recursive archive expanded bytes exceed scan bound")
+
+
+def _components(path: Path) -> tuple[str, ...]:
     if not path.is_absolute():
-        raise ScanRefused(f"{label} must be absolute")
+        raise ScanRefused("pinned path must be absolute")
+    parts = path.parts[1:]
+    if not parts or len(parts) > MAX_DEPTH or any(
+        part in ("", ".", "..") or "/" in part or "\0" in part for part in parts
+    ):
+        raise ScanRefused("pinned path has unsafe components")
+    return parts
+
+
+def open_absolute(path: Path, *, directory: bool) -> int:
+    current = os.open("/", DIRECTORY_FLAGS)
     try:
-        metadata = os.lstat(path)
-    except OSError as error:
-        raise ScanRefused(f"{label} is missing") from error
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise ScanRefused(f"{label} must be a non-symlink directory")
-    if path.resolve(strict=True) != path:
-        raise ScanRefused(f"{label} must be canonical")
-    return path
+        parts = _components(path)
+        for index, part in enumerate(parts):
+            final = index == len(parts) - 1
+            flags = DIRECTORY_FLAGS if not final or directory else FILE_FLAGS
+            following = os.open(part, flags, dir_fd=current)
+            before = os.stat(part, dir_fd=current, follow_symlinks=False)
+            opened = os.fstat(following)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                os.close(following)
+                raise ScanRefused("pinned path changed while opening")
+            os.close(current)
+            current = following
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def open_relative(root_fd: int, relative: str, *, directory: bool = False) -> int:
+    parts = tuple(relative.split("/"))
+    if (
+        not parts
+        or len(parts) > MAX_DEPTH
+        or any(part in ("", ".", "..") or "/" in part or "\0" in part for part in parts)
+    ):
+        raise ScanRefused("scan target has unsafe components")
+    current = os.dup(root_fd)
+    try:
+        for index, part in enumerate(parts):
+            final = index == len(parts) - 1
+            flags = DIRECTORY_FLAGS if not final or directory else FILE_FLAGS
+            before = os.stat(part, dir_fd=current, follow_symlinks=False)
+            following = os.open(part, flags, dir_fd=current)
+            opened = os.fstat(following)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                os.close(following)
+                raise ScanRefused("scan target changed while opening")
+            os.close(current)
+            current = following
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+def pinned_directory(value: str, label: str) -> tuple[Path, int]:
+    path = Path(value)
+    descriptor = open_absolute(path, directory=True)
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) & 0o022
+        or path.resolve(strict=True) != path
+    ):
+        os.close(descriptor)
+        raise ScanRefused(f"{label} must be a canonical non-symlink directory")
+    return path, descriptor
 
 
 def private_pattern_file(value: str) -> tuple[Path, tuple[bytes, ...]]:
     path = Path(value)
-    if not path.is_absolute():
-        raise ScanRefused("protected value file must be absolute")
-    metadata = os.lstat(path)
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or metadata.st_size <= 0
-        or metadata.st_size > (1 << 20)
-        or path.resolve(strict=True) != path
-    ):
-        raise ScanRefused("protected value file ownership, mode, or type is unsafe")
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = open_absolute(path, directory=False)
     try:
-        opened = os.fstat(descriptor)
+        before = os.fstat(descriptor)
         if (
-            (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
-            or not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != os.getuid()
-            or stat.S_IMODE(opened.st_mode) != 0o600
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size <= 0
+            or before.st_size > (1 << 20)
+            or path.resolve(strict=True) != path
         ):
-            raise ScanRefused("protected value file changed while opening")
-        encoded = os.read(descriptor, (1 << 20) + 1)
+            raise ScanRefused("protected value file ownership, mode, or type is unsafe")
+        encoded = read_bounded(descriptor, (1 << 20))
+        after = os.fstat(descriptor)
+        if identity(before) != identity(after) or len(encoded) != before.st_size:
+            raise ScanRefused("protected value file changed while reading")
+        verification = open_absolute(path, directory=False)
+        try:
+            if identity(os.fstat(verification)) != identity(before):
+                raise ScanRefused("protected value path changed while reading")
+        finally:
+            os.close(verification)
     finally:
         os.close(descriptor)
-    if len(encoded) != metadata.st_size:
-        raise ScanRefused("protected value file changed while reading")
     patterns = tuple(line for line in encoded.splitlines() if line)
     if len(patterns) < 12 or len(patterns) > 128:
         raise ScanRefused("protected value pattern count is outside the expected bound")
@@ -78,28 +155,70 @@ def private_pattern_file(value: str) -> tuple[Path, tuple[bytes, ...]]:
     return path, patterns
 
 
-def regular_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    for current, directories, names in os.walk(root, topdown=True, followlinks=False):
-        current_path = Path(current)
-        safe_directories: list[str] = []
-        for name in directories:
-            candidate = current_path / name
-            metadata = os.lstat(candidate)
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                raise ScanRefused("artifact tree contains a symlink or special directory")
-            safe_directories.append(name)
-        directories[:] = safe_directories
+def identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def read_bounded(descriptor: int, maximum: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, min(1 << 20, maximum + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > maximum:
+            raise ScanRefused("scan target exceeds size bound")
+
+
+def regular_files(root_fd: int) -> list[str]:
+    files: list[str] = []
+
+    def visit(directory_fd: int, prefix: str, depth: int) -> None:
+        if depth > MAX_DEPTH:
+            raise ScanRefused("artifact tree depth exceeds scan bound")
+        names = os.listdir(directory_fd)
         for name in names:
-            candidate = current_path / name
-            metadata = os.lstat(candidate)
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            if name in ("", ".", "..") or "/" in name or "\0" in name:
+                raise ScanRefused("artifact tree contains an unsafe name")
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            relative = f"{prefix}/{name}" if prefix else name
+            if stat.S_ISDIR(metadata.st_mode):
+                if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+                    raise ScanRefused("artifact directory ownership or mode is unsafe")
+                child = os.open(name, DIRECTORY_FLAGS, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child)
+                    if (metadata.st_dev, metadata.st_ino) != (opened.st_dev, opened.st_ino):
+                        raise ScanRefused("artifact directory changed while opening")
+                    visit(child, relative, depth + 1)
+                    after = os.fstat(child)
+                    if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
+                        raise ScanRefused("artifact directory changed while scanning")
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(metadata.st_mode):
+                if (
+                    metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o022
+                    or metadata.st_size > MAX_FILE_BYTES
+                ):
+                    raise ScanRefused("artifact file exceeds scan size bound")
+                files.append(relative)
+                if len(files) > MAX_FILES:
+                    raise ScanRefused("artifact file count exceeds scan bound")
+            else:
                 raise ScanRefused("artifact tree contains a symlink or special file")
-            if metadata.st_size > MAX_FILE_BYTES:
-                raise ScanRefused("artifact file exceeds scan size bound")
-            files.append(candidate)
-            if len(files) > 8192:
-                raise ScanRefused("artifact file count exceeds scan bound")
+
+    visit(root_fd, "", 0)
     return files
 
 
@@ -107,42 +226,54 @@ def contains_pattern(encoded: bytes, patterns: tuple[bytes, ...]) -> bool:
     return any(pattern in encoded for pattern in patterns)
 
 
-def scan_archive(encoded: bytes, name: str, patterns: tuple[bytes, ...], depth: int = 0) -> bool:
+def _archive_body(handle, declared: int, budget: ArchiveBudget) -> bytes:
+    if declared < 0 or declared > MAX_ARCHIVE_MEMBER_BYTES:
+        raise ScanRefused("archive member exceeds scan size bound")
+    body = handle.read(MAX_ARCHIVE_MEMBER_BYTES + 1)
+    if len(body) > MAX_ARCHIVE_MEMBER_BYTES or len(body) != declared:
+        raise ScanRefused("archive member length is unsafe")
+    budget.expand(len(body))
+    return body
+
+
+def scan_archive(
+    encoded: bytes,
+    name: str,
+    patterns: tuple[bytes, ...],
+    depth: int = 0,
+    budget: ArchiveBudget | None = None,
+) -> bool:
     if depth > 3:
         raise ScanRefused("nested archive depth exceeds scan bound")
+    budget = ArchiveBudget() if budget is None else budget
     lowered = name.lower()
     if lowered.endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(encoded)) as archive:
-            members = archive.infolist()
-            if len(members) > MAX_ARCHIVE_MEMBERS:
-                raise ScanRefused("archive member count exceeds scan bound")
-            for member in members:
+            for member in archive.infolist():
+                budget.member()
                 if member.is_dir():
                     continue
-                if member.file_size > MAX_ARCHIVE_MEMBER_BYTES:
-                    raise ScanRefused("archive member exceeds scan size bound")
-                body = archive.read(member)
+                with archive.open(member, "r") as handle:
+                    body = _archive_body(handle, member.file_size, budget)
                 if contains_pattern(body, patterns) or scan_archive(
-                    body, member.filename, patterns, depth + 1
+                    body, member.filename, patterns, depth + 1, budget
                 ):
                     return True
     elif lowered.endswith((".tar", ".tar.gz", ".tgz")):
         mode = "r:gz" if lowered.endswith((".tar.gz", ".tgz")) else "r:"
         with tarfile.open(fileobj=io.BytesIO(encoded), mode=mode) as archive:
-            members = archive.getmembers()
-            if len(members) > MAX_ARCHIVE_MEMBERS:
-                raise ScanRefused("archive member count exceeds scan bound")
-            for member in members:
+            for member in archive:
+                budget.member()
                 if member.issym() or member.islnk():
                     raise ScanRefused("archive contains a link")
                 if not member.isfile():
                     continue
-                if member.size > MAX_ARCHIVE_MEMBER_BYTES:
-                    raise ScanRefused("archive member exceeds scan size bound")
                 handle = archive.extractfile(member)
-                body = b"" if handle is None else handle.read(MAX_ARCHIVE_MEMBER_BYTES + 1)
+                if handle is None:
+                    raise ScanRefused("archive member cannot be read")
+                body = _archive_body(handle, member.size, budget)
                 if contains_pattern(body, patterns) or scan_archive(
-                    body, member.name, patterns, depth + 1
+                    body, member.name, patterns, depth + 1, budget
                 ):
                     return True
     elif lowered.endswith(".gz"):
@@ -150,93 +281,112 @@ def scan_archive(encoded: bytes, name: str, patterns: tuple[bytes, ...], depth: 
             body = archive.read(MAX_ARCHIVE_MEMBER_BYTES + 1)
         if len(body) > MAX_ARCHIVE_MEMBER_BYTES:
             raise ScanRefused("compressed artifact exceeds scan size bound")
+        budget.member()
+        budget.expand(len(body))
         return contains_pattern(body, patterns) or scan_archive(
-            body, lowered[:-3], patterns, depth + 1
+            body, lowered[:-3], patterns, depth + 1, budget
         )
     return False
 
 
-def scan_file(path: Path, patterns: tuple[bytes, ...]) -> bool:
-    encoded = path.read_bytes()
+def scan_file(root_fd: int, relative: str, patterns: tuple[bytes, ...]) -> bool:
+    descriptor = open_relative(root_fd, relative)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_FILE_BYTES:
+            raise ScanRefused("scan target is not a bounded regular file")
+        encoded = read_bounded(descriptor, MAX_FILE_BYTES)
+        after = os.fstat(descriptor)
+        if identity(before) != identity(after) or len(encoded) != before.st_size:
+            raise ScanRefused("scan target changed while reading")
+    finally:
+        os.close(descriptor)
+    verification = open_relative(root_fd, relative)
+    try:
+        if identity(os.fstat(verification)) != identity(before):
+            raise ScanRefused("scan target path changed while reading")
+    finally:
+        os.close(verification)
     return contains_pattern(encoded, patterns) or scan_archive(
-        encoded, path.name, patterns
+        encoded, relative.rsplit("/", 1)[-1], patterns
     )
 
 
-def tracked_files(repo_root: Path) -> list[Path]:
+def tracked_files(repo_root: Path) -> list[str]:
     completed = subprocess.run(
         ["/usr/bin/git", "-C", str(repo_root), "ls-files", "-z"],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         timeout=30,
+        env={"HOME": "/nonexistent", "PATH": "/usr/bin:/bin", "LC_ALL": "C"},
     )
-    paths = [
-        repo_root / item.decode("utf-8", errors="strict")
-        for item in completed.stdout.split(b"\0")
-        if item
-    ]
-    for path in paths:
-        metadata = os.lstat(path)
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            raise ScanRefused("tracked scan target is not a regular file")
-        if metadata.st_size > MAX_FILE_BYTES:
-            raise ScanRefused("tracked scan target exceeds size bound")
+    paths = [item.decode("utf-8", errors="strict") for item in completed.stdout.split(b"\0") if item]
+    if len(paths) > MAX_FILES:
+        raise ScanRefused("tracked scan target count exceeds bound")
     return paths
 
 
 def main() -> int:
+    descriptors: list[int] = []
     try:
-        repo_root = canonical_directory(
+        repo_root, repo_fd = pinned_directory(
             os.environ.get("OPSWARDEN_E2E_REPO_ROOT", ""), "repository root"
         )
-        artifact_dir = canonical_directory(
+        artifact_dir, artifact_fd = pinned_directory(
             os.environ.get("OPSWARDEN_E2E_ARTIFACT_DIR", ""), "artifact root"
         )
-        runtime_dir = canonical_directory(
+        runtime_dir, runtime_fd = pinned_directory(
             os.environ.get("OPSWARDEN_E2E_RUNTIME_DIR", ""), "runtime root"
         )
-        pattern_path, patterns = private_pattern_file(
-            os.environ.get("OPSWARDEN_E2E_SECRET_FILE", "")
-        )
+        descriptors.extend((repo_fd, artifact_fd, runtime_fd))
+        _, patterns = private_pattern_file(os.environ.get("OPSWARDEN_E2E_SECRET_FILE", ""))
 
-        required_files = [
-            runtime_dir / "data" / "opswarden.db",
-            artifact_dir / "backups" / "online-backup.sqlite3",
-            artifact_dir / "logs" / "application.log",
-            artifact_dir / "logs" / "restore-compose.log",
-            artifact_dir / "audit" / "audit-export.json",
-            artifact_dir / "browser" / "browser-storage.json",
-            artifact_dir / "errors" / "captured-errors.json",
-        ]
-        scan_roots = [
-            runtime_dir / "data",
-            runtime_dir / "backups",
-            artifact_dir / "backups",
-            artifact_dir / "logs",
-            artifact_dir / "audit",
-            artifact_dir / "browser",
-            artifact_dir / "errors",
-            artifact_dir / "playwright",
-        ]
-        for path in required_files:
-            if not path.is_file() or path.is_symlink():
-                raise ScanRefused("a required artifact class is missing or unsafe")
-        files: list[Path] = []
-        for scan_root in scan_roots:
-            canonical_directory(str(scan_root), "artifact class")
-            files.extend(regular_files(scan_root))
-        files.extend(tracked_files(repo_root))
-        files = list(dict.fromkeys(files))
-        if pattern_path in files:
-            raise ScanRefused("protected value file entered the scan target set")
-        if any(scan_file(path, patterns) for path in files):
+        required = (
+            (runtime_fd, "data/opswarden.db"),
+            (artifact_fd, "backups/online-backup.sqlite3"),
+            (artifact_fd, "logs/application.log"),
+            (artifact_fd, "logs/restore-compose.log"),
+            (artifact_fd, "audit/audit-export.json"),
+            (artifact_fd, "browser/browser-storage.json"),
+            (artifact_fd, "errors/captured-errors.json"),
+        )
+        for root_fd, relative in required:
+            descriptor = open_relative(root_fd, relative)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise ScanRefused("a required artifact class is unsafe")
+            finally:
+                os.close(descriptor)
+
+        roots = (
+            (runtime_fd, "data"),
+            (runtime_fd, "backups"),
+            (artifact_fd, "backups"),
+            (artifact_fd, "logs"),
+            (artifact_fd, "audit"),
+            (artifact_fd, "browser"),
+            (artifact_fd, "errors"),
+            (artifact_fd, "playwright"),
+        )
+        targets: list[tuple[int, str]] = []
+        for root_fd, relative in roots:
+            directory_fd = open_relative(root_fd, relative, directory=True)
+            try:
+                targets.extend(
+                    (root_fd, f"{relative}/{child}") for child in regular_files(directory_fd)
+                )
+            finally:
+                os.close(directory_fd)
+        targets.extend((repo_fd, relative) for relative in tracked_files(repo_root))
+        unique = list(dict.fromkeys(targets))
+        if any(scan_file(root_fd, relative, patterns) for root_fd, relative in unique):
             print(
                 "sensitive fixture scan failed: a protected value escaped an encrypted boundary",
                 file=sys.stderr,
             )
             return 1
-        print(f"sensitive fixture scan: clean ({len(scan_roots)} artifact classes)")
+        print(f"sensitive fixture scan: clean ({len(roots)} artifact classes)")
         return 0
     except (
         OSError,
@@ -247,6 +397,12 @@ def main() -> int:
     ) as error:
         print(f"sensitive fixture scan refused: {error}", file=sys.stderr)
         return 2
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

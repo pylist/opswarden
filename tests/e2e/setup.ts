@@ -168,9 +168,8 @@ export default async function setup(_config: FullConfig) {
   const secrets = [
     password, credentialPassword, apiToken, privateKeyMarker,
     databasePassword, connectionMarker, connectionString,
-    credentialTOTPSeed, loginTOTPSeed, bootstrap.recoveryCodes[0],
-    bootstrap.recoveryCodes[1],
-    bootstrap.recoveryCodes[2], claims.sid, login.token, issued.token, masterKey,
+    credentialTOTPSeed, loginTOTPSeed, ...bootstrap.recoveryCodes,
+    claims.sid, login.token, issued.token, masterKey,
   ];
   await writeFile(secretPath, secrets.join("\n") + "\n", { mode: 0o600 });
   await chmod(secretPath, 0o600);

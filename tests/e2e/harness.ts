@@ -1,6 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { APIRequestContext, APIResponse, Locator, Page } from "@playwright/test";
 
@@ -186,12 +186,36 @@ async function mcpCall(request: APIRequestContext, state: Control, name: string,
     },
   });
   const body = await response.text();
-  if (!response.ok()) throw new Error(`MCP HTTP ${response.status()}: ${body}`);
-  const envelope = JSON.parse(body);
+  if (!response.ok()) {
+    await recordMCPFailure(name, response.status(), body);
+    throw new Error(`MCP ${name} HTTP failure: status=${response.status()}`);
+  }
+  let envelope: any;
+  try {
+    envelope = JSON.parse(body);
+  } catch {
+    await recordMCPFailure(name, response.status(), body);
+    throw new Error(`MCP ${name} returned an invalid protected response`);
+  }
   if (envelope.error || envelope.result?.isError) {
-    throw new Error(`MCP ${name} failed: ${body}`);
+    await recordMCPFailure(name, response.status(), body);
+    throw new Error(`MCP ${name} reported a protected tool failure`);
   }
   return envelope.result.structuredContent;
+}
+
+async function recordMCPFailure(name: string, status: number, body: string) {
+  const target = resolve(artifacts, "errors/mcp-failures.jsonl");
+  await appendFile(
+    target,
+    JSON.stringify({
+      name,
+      status,
+      bodyBase64: Buffer.from(body, "utf8").toString("base64"),
+    }) + "\n",
+    { mode: 0o600 },
+  );
+  await chmod(target, 0o600);
 }
 
 export class APIHarness {
@@ -229,7 +253,7 @@ export class E2EHarness extends APIHarness {
     super(request, state);
   }
 
-  static async start(page: Page, request: APIRequestContext) {
+  static async startWithPage(page: Page, request: APIRequestContext) {
     const state = await control();
     const harness = new E2EHarness(request, state, page);
     await page.goto("/");
