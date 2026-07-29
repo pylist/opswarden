@@ -208,6 +208,30 @@ class SensitiveFixtureScannerTest(unittest.TestCase):
         finally:
             os.close(root_fd)
 
+    def test_top_level_root_late_swap_with_new_secret_is_refused(self) -> None:
+        artifact_fd = os.open(self.artifacts, scanner.DIRECTORY_FLAGS)
+        original_scan = scanner.scan_tree
+
+        def swap_after_scan(*args, **kwargs):
+            result = original_scan(*args, **kwargs)
+            moved = self.artifacts / "errors-original"
+            (self.artifacts / "errors").rename(moved)
+            (self.artifacts / "errors").mkdir()
+            (self.artifacts / "errors" / "late-secret.log").write_bytes(self.secret)
+            return result
+
+        try:
+            with mock.patch.object(scanner, "scan_tree", side_effect=swap_after_scan):
+                with self.assertRaises(scanner.ScanRefused):
+                    scanner.scan_top_entry(
+                        artifact_fd,
+                        "errors",
+                        (self.secret,),
+                        scanner.ArchiveBudget(),
+                    )
+        finally:
+            os.close(artifact_fd)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

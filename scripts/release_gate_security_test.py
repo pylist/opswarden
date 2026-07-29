@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 class ReleaseGateSecurityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="opswarden-gate-test-")
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -157,6 +157,7 @@ class ReleaseGateSecurityTest(unittest.TestCase):
             "cleanup_e2e_secrets.py",
             "e2e_lock.py",
             "bounded_command.py",
+            "write_e2e_artifact.py",
         ):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         (binary / "node").write_text("#!/bin/sh\nprintf '31001 31002\\n'\n", encoding="ascii")
@@ -191,7 +192,15 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         )
         (binary / "ready_child.py").write_text(
             "#!/usr/bin/python3\n"
-            "import pathlib,signal,sys\n"
+            "import os,pathlib,signal,sys\n"
+            "lock=os.stat(sys.argv[2])\n"
+            "for number in range(3,256):\n"
+            " try:\n"
+            "  opened=os.fstat(number)\n"
+            " except OSError:\n"
+            "  continue\n"
+            " if (opened.st_dev,opened.st_ino)==(lock.st_dev,lock.st_ino):\n"
+            "  raise SystemExit(3)\n"
             "pathlib.Path(sys.argv[1]).touch()\n"
             "signal.pause()\n",
             encoding="ascii",
@@ -199,7 +208,8 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         (binary / "npm").write_text(
             "#!/bin/sh\n"
             "exec /usr/bin/python3 -I \"$(dirname \"$0\")/ready_child.py\" "
-            "\"$(dirname \"$0\")/../npm-started\"\n",
+            "\"$(dirname \"$0\")/../npm-started\" "
+            "\"$(dirname \"$0\")/../.tmp/opswarden-e2e.lock\"\n",
             encoding="ascii",
         )
         (binary / "npx").write_text("#!/bin/sh\nsleep 30\n", encoding="ascii")
@@ -214,7 +224,15 @@ class ReleaseGateSecurityTest(unittest.TestCase):
 
     def start_runner(self, fixture: Path, environment: dict[str, str]) -> subprocess.Popen[str]:
         return subprocess.Popen(
-            ["/bin/bash", str(fixture / "scripts/verify-e2e.sh")],
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(fixture / "scripts/e2e_lock.py"),
+                str(fixture),
+                "--",
+                "/bin/bash",
+                str(fixture / "scripts/verify-e2e.sh"),
+            ],
             cwd=fixture,
             env=environment,
             text=True,
@@ -235,12 +253,12 @@ class ReleaseGateSecurityTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertTrue(marker.exists())
-        os.killpg(process.pid, sent)
+        process.send_signal(sent)
         try:
             _, stderr = process.communicate(timeout=15)
         finally:
             if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
+                process.kill()
                 process.communicate()
         self.assertEqual(process.returncode, expected, stderr)
         runtime = Path(identifiers.split("runtime=", 1)[1].split(" artifact=", 1)[0])
@@ -267,11 +285,26 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         second = self.start_runner(fixture, environment)
         _, second_stderr = second.communicate(timeout=10)
         self.assertEqual(second.returncode, 75, second_stderr)
-        os.killpg(first.pid, signal.SIGTERM)
+        first.send_signal(signal.SIGTERM)
         first.communicate(timeout=15)
         self.assertTrue((fixture / ".tmp/opswarden-e2e.lock").exists())
 
-    def test_sigkill_automatically_releases_lock_for_restart(self) -> None:
+    def child_pid(self, parent: subprocess.Popen[str]) -> int:
+        for _ in range(100):
+            completed = subprocess.run(
+                ["/bin/ps", "-axo", "pid=,ppid="],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            for line in completed.stdout.splitlines():
+                values = line.split()
+                if len(values) == 2 and int(values[1]) == parent.pid:
+                    return int(values[0])
+            time.sleep(0.05)
+        self.fail("supervised runner child did not appear")
+
+    def test_single_runner_pid_kill_releases_lock_for_restart(self) -> None:
         fixture, environment = self.make_runner_fixture()
         first = self.start_runner(fixture, environment)
         assert first.stdout is not None
@@ -282,8 +315,10 @@ class ReleaseGateSecurityTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertTrue(marker.exists())
-        os.killpg(first.pid, signal.SIGKILL)
+        runner_pid = self.child_pid(first)
+        os.kill(runner_pid, signal.SIGKILL)
         first.communicate(timeout=10)
+        self.assertEqual(first.returncode, 137)
         marker.unlink()
         second = self.start_runner(fixture, environment)
         assert second.stdout is not None
@@ -293,13 +328,38 @@ class ReleaseGateSecurityTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertTrue(marker.exists())
-        os.killpg(second.pid, signal.SIGTERM)
+        second.send_signal(signal.SIGTERM)
         second.communicate(timeout=15)
+
+    def test_forged_legacy_lock_environment_cannot_bypass_parent_lock(self) -> None:
+        fixture, environment = self.make_runner_fixture()
+        first = self.start_runner(fixture, environment)
+        assert first.stdout is not None
+        first.stdout.readline()
+        marker = fixture / "npm-started"
+        for _ in range(100):
+            if marker.exists():
+                break
+            time.sleep(0.05)
+        forged = {**environment, "OPSWARDEN_E2E_LOCK_HELD": "1"}
+        second = self.start_runner(fixture, forged)
+        _, stderr = second.communicate(timeout=10)
+        self.assertEqual(second.returncode, 75, stderr)
+        first.send_signal(signal.SIGTERM)
+        first.communicate(timeout=15)
 
     def test_subnet_collision_exhaustion_fails_closed_and_releases_lock(self) -> None:
         fixture, environment = self.make_runner_fixture(all_subnets=True)
         completed = subprocess.run(
-            ["/bin/bash", str(fixture / "scripts/verify-e2e.sh")],
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(fixture / "scripts/e2e_lock.py"),
+                str(fixture),
+                "--",
+                "/bin/bash",
+                str(fixture / "scripts/verify-e2e.sh"),
+            ],
             cwd=fixture,
             env=environment,
             text=True,
@@ -315,7 +375,7 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         harness = (ROOT / "tests/e2e/harness.ts").read_text(encoding="utf-8")
         setup = (ROOT / "tests/e2e/setup.ts").read_text(encoding="utf-8")
         self.assertIn("errors/mcp-failures.bin", harness)
-        self.assertIn("header.writeBigUInt64BE(BigInt(raw.length))", harness)
+        self.assertIn("scripts/write_e2e_artifact.py", harness)
         self.assertNotIn("bodyBase64", harness)
         self.assertNotIn("status()}: ${body}", harness)
         self.assertNotIn("failed: ${body}", harness)
@@ -327,6 +387,71 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertIn("GIT_NO_REPLACE_OBJECTS=1", makefile)
         self.assertIn("verify_source_tree.py $(E2E_REVISION)", makefile)
         self.assertIn("E2E runtime=%s artifact=%s project=%s", runner)
+        self.assertNotIn("OPSWARDEN_E2E_LOCK_HELD", runner)
+        self.assertIn("_verify-locked", makefile)
+        self.assertIn("scripts/e2e_lock.py", makefile)
+
+    def test_mcp_artifact_symlink_cannot_write_outside(self) -> None:
+        artifact = self.root / "artifact"
+        errors = artifact / "errors"
+        errors.mkdir(parents=True)
+        artifact.chmod(0o700)
+        errors.chmod(0o700)
+        outside = self.root / "outside"
+        outside.write_bytes(b"unchanged")
+        outside.chmod(0o600)
+        (errors / "mcp-failures.bin").symlink_to(outside)
+        completed = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(ROOT / "scripts/write_e2e_artifact.py"),
+                str(artifact),
+                "errors/mcp-failures.bin",
+            ],
+            input=b"secret body",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(outside.read_bytes(), b"unchanged")
+        (errors / "mcp-failures.bin").unlink()
+        body = b"raw protected MCP body"
+        completed = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(ROOT / "scripts/write_e2e_artifact.py"),
+                str(artifact),
+                "errors/mcp-failures.bin",
+            ],
+            input=body,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            (errors / "mcp-failures.bin").read_bytes(),
+            len(body).to_bytes(8, "big") + body,
+        )
+
+    def test_lock_refuses_symlinked_tmp_component(self) -> None:
+        real_tmp = self.root / "real-lock-tmp"
+        real_tmp.mkdir()
+        (self.root / ".tmp").symlink_to(real_tmp, target_is_directory=True)
+        completed = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(ROOT / "scripts/e2e_lock.py"),
+                str(self.root),
+                "--",
+                "/usr/bin/true",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 75)
 
     def test_bounded_command_terminates_unresponsive_child(self) -> None:
         child = self.root / "unresponsive.py"

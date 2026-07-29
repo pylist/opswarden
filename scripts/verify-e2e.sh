@@ -9,11 +9,6 @@ image_version="${OPSWARDEN_E2E_IMAGE_VERSION:?set the image version built by mak
 }
 
 mkdir -p -- "${repo_root}/.tmp" "${repo_root}/.artifacts"
-lock_file="${repo_root}/.tmp/opswarden-e2e.lock"
-if [[ "${OPSWARDEN_E2E_LOCK_HELD:-}" != "1" ]]; then
-  exec /usr/bin/python3 -I "${repo_root}/scripts/e2e_lock.py" \
-    "${lock_file}" "${repo_root}/scripts/verify-e2e.sh"
-fi
 runtime_dir="$(mktemp -d "${repo_root}/.tmp/opswarden-e2e.XXXXXXXX")"
 artifact_dir="$(mktemp -d "${repo_root}/.artifacts/opswarden-e2e.XXXXXXXX")"
 chmod 0700 "${runtime_dir}" "${artifact_dir}"

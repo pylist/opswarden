@@ -1,14 +1,20 @@
 .NOTPARALLEL:
-.PHONY: verify e2e-bootstrap
+.PHONY: verify _verify-locked e2e-bootstrap
 
+ifneq ($(filter _verify-locked,$(MAKECMDGOALS)),)
 E2E_REVISION := $(shell GIT_NO_REPLACE_OBJECTS=1 git --no-replace-objects rev-parse --verify HEAD)
 E2E_VERSION := e2e-$(E2E_REVISION)
+endif
 
 e2e-bootstrap:
 	cd tests/e2e && npm ci --ignore-scripts --no-audit --no-fund
 	cd tests/e2e && npx --no-install playwright install chromium
 
 verify:
+	/usr/bin/python3 -I scripts/e2e_lock.py "$(CURDIR)" -- \
+		/usr/bin/make --no-print-directory -f "$(CURDIR)/Makefile" _verify-locked
+
+_verify-locked:
 	/usr/bin/python3 -I scripts/verify_source_tree.py $(E2E_REVISION)
 	go vet ./...
 	go test -race ./...

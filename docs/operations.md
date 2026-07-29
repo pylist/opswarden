@@ -751,10 +751,14 @@ npm、Python 3、可用的 Docker/Compose，以及可访问 Playwright 和已锁
 - 使用 SQLite 在线 Backup API 产生一致快照，将快照和独立保存的匹配 key 副本放入
   独立 Compose project，验证解密，再离线吊销恢复环境中的浏览器会话和 Agent Token。
 
-每次执行先由 isolated Python wrapper 在 `.tmp/opswarden-e2e.lock` 上取得
-`fcntl.flock` OS lock，因此同一 checkout 的并发 gate 不会争用端口、容器或清理
-范围；若锁已被占用，第二个执行立即以 75 失败。lock FD 贯穿整个 runner，正常退出、
-signal 或 SIGKILL 都由内核自动释放，不依赖可遗留的 PID/目录锁。取得锁后立即输出
+`make verify` 的第一条 recipe 由 isolated Python parent 从 `/` 开始逐组件
+O_DIRECTORY/O_NOFOLLOW 固定仓库和 `.tmp`，随后在 `.tmp/opswarden-e2e.lock` 上取得
+`fcntl.flock` OS lock，并在锁内 spawn/wait 完整 `_verify-locked` gate。因此同一
+checkout 的并发 gate 不会在 Go/React/build/Playwright 任一阶段争用资源；伪造环境
+变量不能跳过锁。若锁已被占用，第二个执行立即以 75 失败。lock FD 只由 supervisor
+parent 持有并保持 close-on-exec/non-inheritable，绝不传入 make、npm、node、docker
+或其后代。parent 转发 INT/TERM，runner 被单独 SIGKILL 时也会先终止其残余进程组、
+wait 完成再释放锁；正常退出和 SIGKILL 最终都由内核释放，不依赖 PID/目录锁。取得锁后立即输出
 本次 runtime、artifact、Compose project、两个 loopback
 端口和后端子网标识，便于信号中断或宿主异常后的精确处置。每次执行生成独立的
 `.tmp/opswarden-e2e.<随机值>`、
@@ -781,8 +785,10 @@ runtime FD 打开。读取前后核对 inode、owner、mode、size 与 mtime；�
 symlink、runtime/目录替换或聚合压缩炸弹均 fail closed。模式包含每个原子
 密码、JWT、Agent Token、私钥随机体、数据库密码、连接串/TOTP/recovery/session 和
 全部十个初始 recovery codes、主密钥。control 文件只保存三个确实被场景消费的
-recovery code。MCP 失败的原始 body 使用 8 字节长度前缀和原始字节、仅以 0600
-写入受扫描 artifact，因此 scanner 能直接匹配其中的敏感模式；Playwright
+recovery code。MCP 失败的原始 body 由 isolated Python writer 从 `/` 逐组件固定
+artifact root，再相对 pinned `errors` FD 以 O_NOFOLLOW/O_APPEND 写入；它拒绝
+symlink、错误 owner/mode/inode 和 namespace swap。记录使用 8 字节长度前缀和原始
+字节、仅以 0600 写入受扫描 artifact，因此 scanner 能直接匹配其中的敏感模式；Playwright
 异常和 reporter 只显示状态与净化后的错误摘要。自动负控会逐类注入模式，并在任何
 false negative 时阻止 gate。
 

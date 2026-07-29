@@ -1,6 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
-import { appendFile, chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { APIRequestContext, APIResponse, Locator, Page } from "@playwright/test";
 
@@ -205,18 +205,40 @@ async function mcpCall(request: APIRequestContext, state: Control, name: string,
 }
 
 async function recordMCPFailure(name: string, status: number, body: string) {
-  const target = resolve(artifacts, "errors/mcp-failures.bin");
   const raw = Buffer.from(body, "utf8");
-  const header = Buffer.alloc(8);
-  header.writeBigUInt64BE(BigInt(raw.length));
-  await appendFile(
-    target,
-    Buffer.concat([header, raw]),
-    { mode: 0o600 },
-  );
-  await chmod(target, 0o600);
+  await writeProtectedArtifact(raw);
   void name;
   void status;
+}
+
+async function writeProtectedArtifact(body: Buffer) {
+  await new Promise<void>((resolveWrite, rejectWrite) => {
+    const child = spawn(
+      "/usr/bin/python3",
+      [
+        "-I",
+        resolve(root, "scripts/write_e2e_artifact.py"),
+        artifacts,
+        "errors/mcp-failures.bin",
+      ],
+      {
+        cwd: root,
+        env: { HOME: "/nonexistent", PATH: "/usr/bin:/bin", LC_ALL: "C" },
+        stdio: ["pipe", "ignore", "ignore"],
+      },
+    );
+    const timeout = setTimeout(() => child.kill("SIGKILL"), 10_000);
+    child.on("error", () => {
+      clearTimeout(timeout);
+      rejectWrite(new Error("protected MCP failure artifact writer could not start"));
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code === 0) resolveWrite();
+      else rejectWrite(new Error("protected MCP failure artifact writer refused output"));
+    });
+    child.stdin.end(body);
+  });
 }
 
 export class APIHarness {

@@ -286,6 +286,30 @@ def scan_tree(
     return leaked, file_count
 
 
+def scan_top_entry(
+    parent_fd: int,
+    name: str,
+    patterns: tuple[bytes, ...],
+    budget: ArchiveBudget,
+) -> tuple[bool, int]:
+    if name in ("", ".", "..") or "/" in name or "\0" in name:
+        raise ScanRefused("top-level artifact root name is unsafe")
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    descriptor = os.open(name, DIRECTORY_FLAGS, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if identity(before) != identity(opened):
+            raise ScanRefused("top-level artifact root changed while opening")
+        result = scan_tree(descriptor, patterns, budget)
+        after = os.fstat(descriptor)
+        namespace = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if identity(opened) != identity(after) or identity(opened) != identity(namespace):
+            raise ScanRefused("top-level artifact root changed while scanning")
+        return result
+    finally:
+        os.close(descriptor)
+
+
 def contains_pattern(encoded: bytes, patterns: tuple[bytes, ...]) -> bool:
     return any(pattern in encoded for pattern in patterns)
 
@@ -445,15 +469,13 @@ def main() -> int:
         leaked = False
         scanned_files = 0
         for root_fd, relative in roots:
-            directory_fd = open_relative(root_fd, relative, directory=True)
-            try:
-                tree_leaked, tree_count = scan_tree(directory_fd, patterns, budget)
-                leaked = leaked or tree_leaked
-                scanned_files += tree_count
-                if scanned_files > MAX_FILES:
-                    raise ScanRefused("aggregate artifact file count exceeds scan bound")
-            finally:
-                os.close(directory_fd)
+            tree_leaked, tree_count = scan_top_entry(
+                root_fd, relative, patterns, budget
+            )
+            leaked = leaked or tree_leaked
+            scanned_files += tree_count
+            if scanned_files > MAX_FILES:
+                raise ScanRefused("aggregate artifact file count exceeds scan bound")
         for relative in tracked_files(repo_root):
             scanned_files += 1
             if scanned_files > MAX_FILES:
