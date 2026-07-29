@@ -294,33 +294,39 @@ func (limiter *Limiter) Reserve(
 		overflow  bool
 	}
 	type stagedBucket struct {
-		key    stagedKey
-		bucket *limiterBucket
-		tokens float64
-		spend  float64
-		create bool
+		key          stagedKey
+		bucket       *limiterBucket
+		tokens       float64
+		spend        float64
+		create       bool
+		effectiveNow time.Time
 	}
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
-	operations := make(map[Operation]struct{}, len(unique))
+	effectiveTimes := make(map[Operation]time.Time, len(unique))
 	for _, request := range unique {
-		if last := limiter.lastNow[request.Operation]; !last.IsZero() &&
-			now.Before(last) {
-			if last.Sub(now) >= concurrentClockSkew {
-				return nil, Decision{RetryAfter: last.Sub(now)}
-			}
-			now = last
+		if _, exists := effectiveTimes[request.Operation]; exists {
+			continue
 		}
-		operations[request.Operation] = struct{}{}
+		effectiveNow := now
+		if last := limiter.lastNow[request.Operation]; !last.IsZero() &&
+			effectiveNow.Before(last) {
+			if last.Sub(effectiveNow) >= concurrentClockSkew {
+				return nil, Decision{RetryAfter: last.Sub(effectiveNow)}
+			}
+			effectiveNow = last
+		}
+		effectiveTimes[request.Operation] = effectiveNow
 	}
-	for operation := range operations {
-		limiter.rotateGenerationLocked(operation, now)
+	for operation, effectiveNow := range effectiveTimes {
+		limiter.rotateGenerationLocked(operation, effectiveNow)
 	}
 	staged := make([]stagedBucket, 0, len(unique))
 	stagedIndexes := make(map[stagedKey]int, len(unique))
 	pendingNew := make(map[Operation]int, len(unique))
 	var retryAfter time.Duration
 	for _, request := range unique {
+		effectiveNow := effectiveTimes[request.Operation]
 		capacity := limiter.capacity[request.Operation]
 		bucket := limiter.subjectBucketLocked(
 			request.Operation, request.Subject,
@@ -348,18 +354,19 @@ func (limiter *Limiter) Reserve(
 		}
 		tokens := capacity
 		if bucket != nil {
-			if now.Before(bucket.last) {
-				return nil, Decision{RetryAfter: bucket.last.Sub(now)}
+			if effectiveNow.Before(bucket.last) {
+				return nil, Decision{RetryAfter: bucket.last.Sub(effectiveNow)}
 			}
 			tokens = math.Min(
 				capacity,
 				bucket.tokens+
-					now.Sub(bucket.last).Seconds()*limiter.refill[request.Operation],
+					effectiveNow.Sub(bucket.last).Seconds()*limiter.refill[request.Operation],
 			)
 		}
 		stagedIndexes[key] = len(staged)
 		staged = append(staged, stagedBucket{
 			key: key, bucket: bucket, tokens: tokens, spend: 1, create: create,
+			effectiveNow: effectiveNow,
 		})
 	}
 	for _, item := range staged {
@@ -374,8 +381,8 @@ func (limiter *Limiter) Reserve(
 			retryAfter = wait
 		}
 	}
-	for _, request := range unique {
-		limiter.lastNow[request.Operation] = now
+	for operation, effectiveNow := range effectiveTimes {
+		limiter.lastNow[operation] = effectiveNow
 	}
 	if retryAfter > 0 {
 		return nil, Decision{RetryAfter: retryAfter}
@@ -391,8 +398,8 @@ func (limiter *Limiter) Reserve(
 			}
 		}
 		item.bucket.tokens = item.tokens - item.spend
-		item.bucket.last = now
-		item.bucket.lastSeen = now
+		item.bucket.last = item.effectiveNow
+		item.bucket.lastSeen = item.effectiveNow
 	}
 	reservationItems := make([]reservationItem, 0, len(staged))
 	for _, item := range staged {

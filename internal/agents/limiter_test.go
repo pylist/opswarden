@@ -606,6 +606,72 @@ func TestLimiterClampsConcurrentTimestampReorderingWithoutRefill(t *testing.T) {
 	}
 }
 
+func TestLimiterReserveIsolatesOperationClocks(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	const (
+		operationA = OperationHumanRequestRead
+		operationB = OperationHumanRequestWrite
+	)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{
+			operationA: 2,
+			operationB: 1,
+		},
+		RefillPerSecond: map[Operation]float64{
+			operationA: 1,
+			operationB: 2,
+		},
+	})
+	if !limiter.Allow("a-existing", operationA, now.Add(900*time.Millisecond)).Allowed {
+		t.Fatal("failed to establish operation A clock")
+	}
+	if !limiter.Allow("b-exhausted", operationB, now).Allowed {
+		t.Fatal("failed to exhaust operation B")
+	}
+	beforeSubjects := limiter.SubjectCountFor(operationA)
+	if _, decision := limiter.Reserve([]LimitRequest{
+		{Subject: "a-concurrent", Operation: operationA},
+		{Subject: "b-exhausted", Operation: operationB},
+	}, now); decision.Allowed {
+		t.Fatal("operation A clock clamp refilled exhausted operation B")
+	}
+	if after := limiter.SubjectCountFor(operationA); after != beforeSubjects {
+		t.Fatalf("atomic denial created operation A subject: before=%d after=%d", beforeSubjects, after)
+	}
+}
+
+func TestLimiterReserveAllowsPerOperationConcurrentTimestampReordering(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{
+			OperationHumanRequestRead:  2,
+			OperationHumanRequestWrite: 2,
+		},
+		RefillPerSecond: map[Operation]float64{
+			OperationHumanRequestRead:  1,
+			OperationHumanRequestWrite: 1,
+		},
+	})
+	if !limiter.Allow(
+		"read-later", OperationHumanRequestRead, now.Add(time.Nanosecond),
+	).Allowed {
+		t.Fatal("failed to establish later read clock")
+	}
+	reservation, decision := limiter.Reserve([]LimitRequest{
+		{Subject: "read-earlier", Operation: OperationHumanRequestRead},
+		{Subject: "write-current", Operation: OperationHumanRequestWrite},
+	}, now)
+	if !decision.Allowed {
+		t.Fatalf("per-operation concurrent timestamp reorder denied: %+v", decision)
+	}
+	reservation.Commit()
+	if _, rollback := limiter.Reserve([]LimitRequest{{
+		Subject: "read-rollback", Operation: OperationHumanRequestRead,
+	}}, now.Add(-time.Second)); rollback.Allowed {
+		t.Fatal("material per-operation clock rollback did not fail closed")
+	}
+}
+
 func TestLimiterFixedWorkWithTenThousandEstablishedAndRotatingSubjects(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	const subjectCap = 10_000
