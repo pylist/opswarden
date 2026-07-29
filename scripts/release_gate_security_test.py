@@ -422,6 +422,17 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertNotIn("govulncheck@latest", makefile)
         self.assertNotIn("npm audit --audit-level=high", makefile)
 
+    def test_e2e_splits_real_jwt_sessions_and_fails_fast_on_sanitized_429s(self) -> None:
+        harness = (ROOT / "tests/e2e/harness.ts").read_text(encoding="utf-8")
+        budget = (ROOT / "tests/e2e/request-budget.mjs").read_text(encoding="utf-8")
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("loginWithTOTPAsNewSession", harness)
+        self.assertIn('this.uiSession = "ui-session-2"', harness)
+        self.assertIn("this.requestBudget.failure.then", harness)
+        self.assertIn("audit/ui-request-budget.json", harness)
+        self.assertNotIn("${rawURL}", budget)
+        self.assertIn("node --test tests/e2e/request-budget.test.mjs", makefile)
+
     def test_primary_e2e_uses_full_tls_compose_release_topology(self) -> None:
         runner = (ROOT / "scripts/verify-e2e.sh").read_text(encoding="utf-8")
         server = (ROOT / "tests/e2e/server.mjs").read_text(encoding="utf-8")

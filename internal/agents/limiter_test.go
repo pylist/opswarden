@@ -576,6 +576,36 @@ func TestLimiterGenerationPreservesSubjectUsedNearBoundary(t *testing.T) {
 	}
 }
 
+func TestLimiterClampsConcurrentTimestampReorderingWithoutRefill(t *testing.T) {
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	limiter := NewLimiter(LimiterConfig{
+		Capacity: map[Operation]int{OperationHumanRequestRead: 1},
+		RefillPerSecond: map[Operation]float64{
+			OperationHumanRequestRead: 1,
+		},
+	})
+	if !limiter.Allow(
+		"later-sampled", OperationHumanRequestRead, now.Add(time.Nanosecond),
+	).Allowed {
+		t.Fatal("later sampled request was denied")
+	}
+	if !limiter.Allow(
+		"earlier-sampled", OperationHumanRequestRead, now,
+	).Allowed {
+		t.Fatal("concurrent timestamp reordering was treated as clock rollback")
+	}
+	if limiter.Allow(
+		"later-sampled", OperationHumanRequestRead, now,
+	).Allowed {
+		t.Fatal("timestamp clamp refilled an exhausted subject")
+	}
+	if limiter.Allow(
+		"new-subject", OperationHumanRequestRead, now.Add(-time.Second),
+	).Allowed {
+		t.Fatal("material clock rollback did not fail closed")
+	}
+}
+
 func TestLimiterFixedWorkWithTenThousandEstablishedAndRotatingSubjects(t *testing.T) {
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	const subjectCap = 10_000

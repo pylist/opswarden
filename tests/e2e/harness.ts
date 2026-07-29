@@ -9,6 +9,7 @@ import {
   type Locator,
   type Page,
 } from "@playwright/test";
+import { HumanRequestBudget } from "./request-budget.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
 const runtime = resolve(process.env.OPSWARDEN_E2E_RUNTIME_DIR ?? "");
@@ -344,17 +345,36 @@ export class APIHarness {
 }
 
 export class E2EHarness extends APIHarness {
+  private readonly requestBudget = new HumanRequestBudget();
+  private uiSession = "ui-session-1";
+
   private constructor(
     request: APIRequestContext,
     state: Control,
     private readonly page: Page,
   ) {
     super(request, state);
+    page.on("response", (response) => {
+      this.requestBudget.record(
+        this.uiSession,
+        response.request().method(),
+        response.url(),
+        response.status(),
+        response.headers()["retry-after"] ?? null,
+      );
+    });
   }
 
   static async startWithPage(page: Page, request: APIRequestContext) {
     const state = await control();
     const harness = new E2EHarness(request, state, page);
+    await harness.guarded(harness.loginWithRecoveryCode(), "initial UI login");
+    return harness;
+  }
+
+  private async loginWithRecoveryCode() {
+    const state = this.state;
+    const page = this.page;
     await page.goto("/");
     await page.getByLabel("邮箱").fill(state.email);
     await page.getByLabel("密码").fill(state.password);
@@ -371,10 +391,55 @@ export class E2EHarness extends APIHarness {
     await page.getByLabel("当前空间").selectOption(state.primarySpaceID);
     await page.getByRole("link", { name: "凭据库" }).click();
     await page.getByRole("heading", { name: "凭据库" }).waitFor();
-    return harness;
+  }
+
+  private async loginWithTOTPAsNewSession() {
+    await this.page.getByRole("button", { name: "退出", exact: true }).click();
+    await this.page.getByLabel("邮箱").fill(this.state.email);
+    await this.page.getByLabel("密码").fill(this.state.password);
+    await this.page.getByRole("button", { name: "继续" }).click();
+    // Setup verified a TOTP moments earlier. Cross a counter boundary so the
+    // production replay guard sees a fresh code for this real second login.
+    const nextCounterDelay = 30_000 - (Date.now() % 30_000) + 500;
+    await new Promise((resolveWait) => setTimeout(resolveWait, nextCounterDelay));
+    await this.page.getByRole("textbox", { name: "动态验证码" }).fill(
+      totp(this.state.loginTOTPSeed),
+    );
+    const loginResponse = this.page.waitForResponse((response) =>
+      response.url().endsWith("/api/v1/auth/login/complete") &&
+      response.request().method() === "POST"
+    );
+    await this.page.getByRole("button", { name: "登录", exact: true }).click();
+    const completed = await loginResponse;
+    if (!completed.ok()) {
+      throw new Error(`second UI login failed: status=${completed.status()}`);
+    }
+    const loginBody = await completed.json();
+    await appendJWTPatterns(loginBody.token);
+    this.uiSession = "ui-session-2";
+    await this.page.getByLabel("当前空间").selectOption(this.state.primarySpaceID);
+    await this.page.getByRole("link", { name: "凭据库" }).click();
+    await this.page.getByRole("heading", { name: "凭据库" }).waitFor();
+  }
+
+  private async guarded<T>(action: Promise<T>, label: string): Promise<T> {
+    let active = true;
+    const rateLimit = this.requestBudget.failure.then((failure) => {
+      if (!active) return new Promise<T>(() => {});
+      throw new Error(`${label} aborted: ${failure.message}`);
+    });
+    try {
+      return await Promise.race([action, rateLimit]);
+    } finally {
+      active = false;
+    }
   }
 
   async createCredentialInUI() {
+    return this.guarded(this.createCredentialInUIUnsafe(), "Hermes handoff credential creation");
+  }
+
+  private async createCredentialInUIUnsafe() {
     await this.page.getByRole("link", { name: "凭据库" }).click();
     await this.page.getByRole("heading", { name: "凭据库" }).waitFor();
     await this.page.getByText("正在加载凭据元数据…").waitFor({ state: "detached" });
@@ -394,8 +459,19 @@ export class E2EHarness extends APIHarness {
   }
 
   async exerciseReactCredentialAndAssetCRUD() {
+    return this.guarded(
+      this.exerciseReactCredentialAndAssetCRUDUnsafe(),
+      "five-type React credential and asset CRUD",
+    );
+  }
+
+  private async exerciseReactCredentialAndAssetCRUDUnsafe() {
     const asset = await this.createAssetInUI();
-    const fixtures = [
+    const fixtures: Array<{
+      type: string;
+      name: string;
+      fields: Record<string, string>;
+    }> = [
       {
         type: "login",
         name: "ui-login",
@@ -440,15 +516,18 @@ export class E2EHarness extends APIHarness {
         },
       },
     ];
-    for (const [index, fixture] of fixtures.entries()) {
-      await this.credentialCRUDInUI(
-        fixture.type,
-        fixture.name,
-        fixture.fields,
-        index === 0 ? asset.id : "",
-      );
-    }
+    const first = fixtures[0];
+    await this.credentialCRUDInUI(first.type, first.name, first.fields, asset.id);
+    await this.assertRecycleBinRows([`${first.name}-updated`]);
     await this.updateAndDeleteAssetInUI(asset.id, asset.name);
+
+    await this.loginWithTOTPAsNewSession();
+    const secondSessionDeleted: string[] = [];
+    for (const fixture of fixtures.slice(1)) {
+      await this.credentialCRUDInUI(fixture.type, fixture.name, fixture.fields, "");
+      secondSessionDeleted.push(`${fixture.name}-updated`);
+    }
+    await this.assertRecycleBinRows(secondSessionDeleted);
   }
 
   private async createAssetInUI() {
@@ -480,9 +559,6 @@ export class E2EHarness extends APIHarness {
       );
     }
     await dialog.waitFor({ state: "detached" });
-    await this.page.getByRole("link", { name: "概览" }).click();
-    await this.page.getByRole("link", { name: "资产", exact: true }).click();
-    await this.page.getByText("正在加载资产…").waitFor({ state: "detached" });
     await this.page.getByRole("button", { name }).waitFor();
     return { id: body.id as string, name };
   }
@@ -546,8 +622,13 @@ export class E2EHarness extends APIHarness {
     await this.page.getByRole("button", { name: updatedName, exact: true }).waitFor({
       state: "detached",
     });
+  }
+
+  private async assertRecycleBinRows(updatedNames: string[]) {
     await this.page.getByRole("button", { name: "回收站" }).click();
-    await this.page.getByRole("row").filter({ hasText: updatedName }).waitFor();
+    for (const updatedName of updatedNames) {
+      await this.page.getByRole("row").filter({ hasText: updatedName }).waitFor();
+    }
     await this.page.getByRole("button", { name: "返回凭据列表" }).click();
   }
 
@@ -597,9 +678,11 @@ export class E2EHarness extends APIHarness {
       reason: "E2E Hermes lifecycle",
       idempotency_key: `delete-${randomBytes(12).toString("hex")}`,
     });
-    await this.page.getByRole("link", { name: "概览" }).click();
-    await this.page.getByRole("link", { name: "凭据库" }).click();
-    await this.page.getByRole("button", { name: "回收站" }).click();
+    await this.guarded((async () => {
+      await this.page.getByRole("link", { name: "概览" }).click();
+      await this.page.getByRole("link", { name: "凭据库" }).click();
+      await this.page.getByRole("button", { name: "回收站" }).click();
+    })(), "Hermes deletion recycle-bin refresh");
   }
 
   recycleBinRow(_id: string): Locator {
@@ -627,6 +710,12 @@ export class E2EHarness extends APIHarness {
       { mode: 0o600 },
     );
     const actions = body.items.map((item: { action: string }) => item.action);
+    this.requestBudget.assertWithinLimits();
+    await writeFile(
+      resolve(artifacts, "audit/ui-request-budget.json"),
+      JSON.stringify(this.requestBudget.snapshot()),
+      { mode: 0o600 },
+    );
     return ["credential.create", "credential.read", "credential.update", "credential.delete"]
       .filter((action) => actions.includes(action));
   }

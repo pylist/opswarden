@@ -128,6 +128,12 @@ type limiterBucket struct {
 	lastSeen time.Time
 }
 
+// Calls sample the clock before acquiring the limiter mutex, so concurrent
+// requests can arrive at the mutex in the opposite order. Clamp that bounded
+// scheduling skew without granting refill; a material clock rollback still
+// fails closed.
+const concurrentClockSkew = time.Second
+
 type Limiter struct {
 	mu               sync.Mutex
 	capacity         map[Operation]float64
@@ -300,7 +306,10 @@ func (limiter *Limiter) Reserve(
 	for _, request := range unique {
 		if last := limiter.lastNow[request.Operation]; !last.IsZero() &&
 			now.Before(last) {
-			return nil, Decision{RetryAfter: last.Sub(now)}
+			if last.Sub(now) >= concurrentClockSkew {
+				return nil, Decision{RetryAfter: last.Sub(now)}
+			}
+			now = last
 		}
 		operations[request.Operation] = struct{}{}
 	}
@@ -461,7 +470,10 @@ func (limiter *Limiter) decide(
 	defer limiter.mu.Unlock()
 
 	if last := limiter.lastNow[operation]; !last.IsZero() && now.Before(last) {
-		return Decision{RetryAfter: last.Sub(now)}
+		if last.Sub(now) >= concurrentClockSkew {
+			return Decision{RetryAfter: last.Sub(now)}
+		}
+		now = last
 	}
 	limiter.rotateGenerationLocked(operation, now)
 	limiter.lastNow[operation] = now

@@ -22,6 +22,7 @@ _verify-locked:
 	/usr/bin/python3 -I deploy/operations_test.py
 	/usr/bin/python3 -I scripts/scan_sensitive_fixtures_test.py
 	/usr/bin/python3 -I scripts/release_gate_security_test.py
+	node --test tests/e2e/request-budget.test.mjs
 	cd web && npm ci --no-audit --no-fund
 	cd web && npm audit --audit-level=moderate
 	cd web && npm test -- --run
