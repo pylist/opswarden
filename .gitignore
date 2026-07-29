@@ -29,6 +29,7 @@ coverage/
 bin/
 node_modules/
 *.tsbuildinfo
+__pycache__/
 
 # Hermetic acceptance-test output
 /.artifacts/

@@ -4,9 +4,21 @@ import { resolve } from "node:path";
 import type { FullConfig } from "@playwright/test";
 
 const root = resolve(import.meta.dirname, "../..");
-const runtime = resolve(root, ".tmp/e2e");
-const artifacts = resolve(root, ".artifacts/e2e");
-const baseURL = "http://127.0.0.1:18081";
+const runtime = resolve(process.env.OPSWARDEN_E2E_RUNTIME_DIR ?? "");
+const artifacts = resolve(process.env.OPSWARDEN_E2E_ARTIFACT_DIR ?? "");
+const secretPath = resolve(process.env.OPSWARDEN_E2E_SECRET_FILE ?? "");
+const appPort = Number(process.env.OPSWARDEN_E2E_APP_PORT);
+const baseURL = `http://127.0.0.1:${appPort}`;
+if (
+  !runtime.startsWith(resolve(root, ".tmp") + "/") ||
+  !artifacts.startsWith(resolve(root, ".artifacts") + "/") ||
+  secretPath !== resolve(runtime, "sensitive-patterns") ||
+  !Number.isInteger(appPort) ||
+  appPort < 1024 ||
+  appPort > 65535
+) {
+  throw new Error("validated E2E setup environment is required");
+}
 
 function unique(label: string) {
   return `OW_E2E_${label}_${randomBytes(18).toString("base64url")}`;
@@ -69,7 +81,9 @@ export default async function setup(_config: FullConfig) {
   const apiToken = unique("API_TOKEN");
   const privateKeyMarker = unique("PRIVATE_KEY");
   const privateKey = `-----BEGIN OPENSSH PRIVATE KEY-----\n${privateKeyMarker}\n-----END OPENSSH PRIVATE KEY-----`;
-  const connectionString = `postgresql://opswarden:${unique("DB_PASSWORD")}@db.invalid/e2e?application_name=${unique("CONNECTION")}`;
+  const databasePassword = unique("DB_PASSWORD");
+  const connectionMarker = unique("CONNECTION");
+  const connectionString = `postgresql://opswarden:${databasePassword}@db.invalid/e2e?application_name=${connectionMarker}`;
   const credentialTOTPSeed = base32(randomBytes(20));
   const loginTOTPSeed = base32(randomBytes(20));
   const email = `e2e-${randomBytes(8).toString("hex")}@example.invalid`;
@@ -140,22 +154,24 @@ export default async function setup(_config: FullConfig) {
     baseURL, email, password, loginTOTPSeed, credentialPassword,
     uiRecoveryCode: bootstrap.recoveryCodes[0],
     restoreRecoveryCode: bootstrap.recoveryCodes[1],
+    wrongKeyRecoveryCode: bootstrap.recoveryCodes[2],
     jwt: login.token, sessionID: claims.sid, userID: bootstrap.userId,
     primarySpaceID: primary.id, otherSpaceID: other.id,
     otherCredentialID: otherCredential.id,
     agentID: agent.id, agentTokenID: issued.id, agentToken: issued.token,
+    apiToken,
     fixtureCredentialID: otherCredential.id,
   };
   const controlPath = resolve(runtime, "control.json");
   await writeFile(controlPath, JSON.stringify(control), { mode: 0o600 });
   await chmod(controlPath, 0o600);
   const secrets = [
-    password, credentialPassword, apiToken, privateKeyMarker, connectionString,
+    password, credentialPassword, apiToken, privateKeyMarker,
+    databasePassword, connectionMarker, connectionString,
     credentialTOTPSeed, loginTOTPSeed, bootstrap.recoveryCodes[0],
     bootstrap.recoveryCodes[1],
-    claims.sid, issued.token, masterKey,
+    bootstrap.recoveryCodes[2], claims.sid, login.token, issued.token, masterKey,
   ];
-  const secretPath = resolve(artifacts, ".sensitive-values");
   await writeFile(secretPath, secrets.join("\n") + "\n", { mode: 0o600 });
   await chmod(secretPath, 0o600);
 }

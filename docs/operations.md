@@ -738,9 +738,9 @@ install-manifest/seal-env/seal-release/preflight 只能执行固定 root-owned h
 
 发布候选必须从仓库根目录执行 `make verify`。前置条件是 Go 1.24、Node.js 22、
 npm、Python 3、可用的 Docker/Compose，以及可访问 Playwright 和已锁定基础镜像的
-网络；首次运行会按 `tests/e2e/package-lock.json` 安装测试依赖和对应 Chromium。
-不要预先创建 `.tmp/e2e` 或 `.artifacts/e2e`，harness 只会清理并重建这两个仓库内
-专用目录。
+网络。首次使用或 Playwright 版本升级后，由操作员显式运行 `make e2e-bootstrap`；
+发布 gate 本身使用 `npx --no-install`，会核对锁定的 Playwright 版本与 Chromium
+可执行文件，绝不在验证期间主动下载浏览器。
 
 验证顺序固定为 Go vet/race 与部署辅助程序测试、React 单测和生产构建、Compose
 解析、固定参数镜像构建、三个串行 Playwright 场景及敏感值扫描。场景覆盖：
@@ -751,22 +751,32 @@ npm、Python 3、可用的 Docker/Compose，以及可访问 Playwright 和已锁
 - 使用 SQLite 在线 Backup API 产生一致快照，将快照和独立保存的匹配 key 副本放入
   独立 Compose project，验证解密，再离线吊销恢复环境中的浏览器会话和 Agent Token。
 
-成功时最后一行是
-`sensitive fixture scan: clean (7 required artifact classes)`。扫描器以 `grep -q`
-读取仅限当前用户的随机值文件，不会把密码、Token、私钥片段、连接串、TOTP seed、
-session ID 或主密钥写入参数和输出；它检查运行中 SQLite、在线备份、应用/恢复日志、
-审计导出、浏览器存储和捕获的 REST/MCP 错误体，并额外检查 Git 跟踪文件。
+每次执行生成独立的 `.tmp/opswarden-e2e.<随机值>`、
+`.artifacts/opswarden-e2e.<随机值>`、两个 loopback 端口、Compose project 和后端
+子网；所有值先验证格式与目录边界，测试不会清理其他执行的目录、容器或网络。
+构建镜像 tag 含当前完整 Git revision，恢复场景只用该 tag 且带 `--no-build`。
 
-失败时先保留 `.artifacts/e2e` 和 `.tmp/e2e` 调查：
+成功时最后一行是
+`sensitive fixture scan: clean (8 artifact classes)`。Playwright 的 trace、截图和
+视频全部禁用；扫描器仍递归检查 SQLite DB/WAL/SHM、所有备份、应用/恢复日志、
+审计导出、浏览器存储、捕获的 REST/MCP 错误体、残留的 Playwright
+test-results/report，以及 zip/tar/gzip 内部内容和 Git 跟踪文件。模式包含每个原子
+密码、JWT、Agent Token、私钥随机体、数据库密码、连接串/TOTP/recovery/session 和
+主密钥。自动负控会逐类注入模式，并在任何 false negative 时阻止 gate。
+
+失败时先保留本次输出显示的唯一 `.artifacts/opswarden-e2e.<随机值>` 和
+`.tmp/opswarden-e2e.<随机值>` 调查：
 
 - `application.log` 用于本地测试服务启动问题；
 - `restore-compose.log` 用于恢复容器、权限或 key 不匹配问题；
-- Playwright trace 位于 `tests/e2e/test-results`；
+- Playwright trace 已禁用；若工具异常留下 test-results/report，位于本次 artifact
+  的 `playwright/` 下并已被 scanner 覆盖；
 - 扫描失败只报告“发现泄漏”，不会打印匹配内容。此时把整套产物视为敏感材料，
   不要上传 CI artifact 或粘贴日志，定位后删除专用目录并重新运行。
 
-Playwright 的 webServer 退出时会终止本地服务；恢复测试的 `finally` 无条件执行
-`docker compose down --volumes --remove-orphans`。若进程被强制杀死，可用
-`docker compose -p opswarden-e2e-restore down --volumes --remove-orphans` 清理，
-确认没有 `opswarden-e2e-restore` 容器或网络后，再删除 `.tmp/e2e` 和
-`.artifacts/e2e`。
+Playwright 的 webServer 退出时先发 TERM，五秒后仍未退出才发 KILL；所有 Docker
+子进程都有输出与时间上限，并采用相同 TERM→KILL 顺序。恢复测试的 `finally`
+无条件对本次两个唯一 project 执行 `down --volumes --remove-orphans`。
+`verify-e2e.sh` 的 EXIT/INT/TERM trap 无论 Playwright 成败都先运行 scanner，再删除
+0600 pattern/control/key 文件并保留非秘密诊断产物。若 runner 被操作系统强制
+SIGKILL，使用失败输出中记录的唯一 project 名精确清理，不能按前缀批量删除其他执行。
