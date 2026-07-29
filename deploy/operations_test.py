@@ -25,6 +25,7 @@ OFFLINE_REVOKE = ROOT / "deploy" / "offline_revoke.py"
 RELEASE_EXPORT = ROOT / "deploy" / "release_export.py"
 OPERATIONS_DOC = ROOT / "docs" / "operations.md"
 RESTORE_OVERRIDE = ROOT / "deploy" / "restore.override.yaml"
+RESTORE_CADDYFILE = ROOT / "deploy" / "RestoreCaddyfile"
 USER_ID = base64.urlsafe_b64encode(bytes(16)).rstrip(b"=").decode("ascii")
 TOKEN_ID = "tok_" + "a" * 32
 
@@ -1277,8 +1278,27 @@ class OperationsDocumentationTest(unittest.TestCase):
         self.assertNotIn(
             "--env-file /srv/opswarden-restore/restore.env", restore
         )
-        for command in ("config --quiet", "up -d --build", "down"):
+        for command in (
+            "config --quiet",
+            "up -d --build --wait --wait-timeout 120",
+            "down",
+        ):
             self.assertIn(command, restore)
+
+    def test_restore_health_check_waits_and_uses_localhost_sni_and_host(self):
+        text = OPERATIONS_DOC.read_text(encoding="utf-8")
+        restore = text[text.index("## 8. 每季度隔离恢复演练") : text.index("## 9.")]
+        start = "up -d --build --wait --wait-timeout 120"
+        resolve = "--resolve localhost:8443:127.0.0.1"
+        health_url = "https://localhost:8443/health/live"
+        self.assertIn(start, restore)
+        self.assertIn(resolve, restore)
+        self.assertIn(health_url, restore)
+        self.assertLess(restore.index(start), restore.index(resolve))
+        self.assertLess(restore.index(resolve), restore.index(health_url))
+        self.assertNotIn("https://127.0.0.1:8443/health/live", restore)
+        caddy = RESTORE_CADDYFILE.read_text(encoding="utf-8")
+        self.assertRegex(caddy, r"(?m)^localhost \{$")
 
     def test_privileged_python_is_isolated_from_path_and_sitecustomize(self):
         text = OPERATIONS_DOC.read_text(encoding="utf-8")

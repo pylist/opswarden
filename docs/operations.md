@@ -593,8 +593,10 @@ preflight 成功后，只从 immutable release 构建和启动，不能引用
   --env-file /srv/opswarden-restore/restore.sealed.env \
   -f /srv/opswarden-restore/release/deploy/compose.yaml \
   -f /srv/opswarden-restore/release/deploy/restore.override.yaml \
-  up -d --build
-curl --insecure --fail --silent --show-error https://127.0.0.1:8443/health/live
+  up -d --build --wait --wait-timeout 120
+curl --insecure --fail --silent --show-error \
+  --resolve localhost:8443:127.0.0.1 \
+  https://localhost:8443/health/live
 ```
 
 浏览器只访问 `https://localhost:8443`，接受本次隔离演练的 Caddy 本地 CA。使用专用
