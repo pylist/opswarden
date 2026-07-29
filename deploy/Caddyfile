@@ -1,0 +1,35 @@
+{
+	email {$OPSWARDEN_TLS_EMAIL}
+	admin off
+	auto_https disable_redirects
+	grace_period 10s
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$OPSWARDEN_HOSTNAME} {
+	tls {
+		issuer acme {
+			disable_http_challenge
+		}
+	}
+
+	header {
+		-Server
+		-Via
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+		X-Frame-Options "DENY"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; manifest-src 'self'; worker-src 'none'; upgrade-insecure-requests"
+	}
+
+	reverse_proxy opswarden:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto https
+		header_up X-Forwarded-Host {host}
+		flush_interval -1
+	}
+}

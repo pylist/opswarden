@@ -1,14 +1,25 @@
 .superpowers/
 .worktrees/
 .env
+!.env.example
 
 # Runtime data and sensitive material
 data/
 backups/
 master.key
+secrets/
+certs/
+*.key
+*.pem
 *.db
 *.db-shm
 *.db-wal
+/deploy/.env
+!/deploy/.env.example
+/deploy/state/
+/deploy/caddy-data/
+/deploy/caddy-config/
+/deploy/certs/
 
 # Build output
 dist/

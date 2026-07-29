@@ -1,0 +1,101 @@
+name: opswarden
+
+services:
+  opswarden:
+    image: "opswarden:${OPSWARDEN_VERSION:?set OPSWARDEN_VERSION in deploy/.env}"
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        VERSION: "${OPSWARDEN_VERSION:?set OPSWARDEN_VERSION in deploy/.env}"
+        REVISION: "${OPSWARDEN_REVISION:?set OPSWARDEN_REVISION in deploy/.env}"
+        SOURCE_DATE_EPOCH: "${SOURCE_DATE_EPOCH:-0}"
+    user: "10001:10001"
+    environment:
+      OPSWARDEN_LISTEN_ADDR: "0.0.0.0:8080"
+      OPSWARDEN_DATA_DIR: "/var/lib/opswarden/data"
+      OPSWARDEN_MASTER_KEY_FILE: "/run/secrets/master.key"
+      OPSWARDEN_BACKUP_DIR: "/var/lib/opswarden/backups"
+      OPSWARDEN_TRUSTED_PROXY_CIDRS: "${OPSWARDEN_CADDY_IP:-172.31.250.3}/32"
+      OPSWARDEN_INTERNAL_CIDRS: "${OPSWARDEN_INTERNAL_CIDRS:-}"
+      OPSWARDEN_DISABLE_AUDIT_RETENTION: "false"
+    secrets:
+      - source: master_key
+        target: master.key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    volumes:
+      - type: bind
+        source: "${OPSWARDEN_STATE_PATH:?set OPSWARDEN_STATE_PATH in deploy/.env}"
+        target: /var/lib/opswarden
+    networks:
+      backend:
+        ipv4_address: "${OPSWARDEN_APP_IP:-172.31.250.2}"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10001,gid=10001
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  caddy:
+    image: "opswarden-caddy:2.10.2"
+    build:
+      context: ..
+      dockerfile: deploy/Caddy.Dockerfile
+    user: "10002:10002"
+    entrypoint: ["/usr/local/bin/caddy"]
+    command: ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      OPSWARDEN_HOSTNAME: "${OPSWARDEN_HOSTNAME:?set OPSWARDEN_HOSTNAME in deploy/.env}"
+      OPSWARDEN_TLS_EMAIL: "${OPSWARDEN_TLS_EMAIL:?set OPSWARDEN_TLS_EMAIL in deploy/.env}"
+    depends_on:
+      opswarden:
+        condition: service_healthy
+        restart: true
+    ports:
+      - "443:443/tcp"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - type: bind
+        source: "${CADDY_DATA_PATH:?set CADDY_DATA_PATH in deploy/.env}"
+        target: /data
+      - type: bind
+        source: "${CADDY_CONFIG_PATH:?set CADDY_CONFIG_PATH in deploy/.env}"
+        target: /config
+    networks:
+      backend:
+        ipv4_address: "${OPSWARDEN_CADDY_IP:-172.31.250.3}"
+      edge: {}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10002,gid=10002
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+secrets:
+  master_key:
+    file: "${OPSWARDEN_MASTER_KEY_PATH:?set OPSWARDEN_MASTER_KEY_PATH in deploy/.env}"
+
+networks:
+  backend:
+    internal: true
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "${OPSWARDEN_BACKEND_SUBNET:-172.31.250.0/29}"
+  edge:
+    driver: bridge
