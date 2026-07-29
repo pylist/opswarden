@@ -443,7 +443,9 @@ func (router *Router) handleCredentials(
 	case len(rest) == 2 && rest[0] != "" && rest[1] == "restore" &&
 		request.Method == http.MethodPost:
 		if principal.Agent != nil {
-			writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
+			router.rejectConcealedCredential(
+				writer, request, principal, credentials.OperationRestore,
+			)
 			return
 		}
 		var input credentialRestoreRequest
@@ -471,7 +473,9 @@ func (router *Router) handleCredentials(
 	case len(rest) == 2 && rest[0] != "" && rest[1] == "purge" &&
 		request.Method == http.MethodPost:
 		if principal.Agent != nil {
-			writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
+			router.rejectConcealedCredential(
+				writer, request, principal, credentials.OperationPurge,
+			)
 			return
 		}
 		var input credentialRestoreRequest
@@ -495,6 +499,26 @@ func (router *Router) handleCredentials(
 	default:
 		writeAPIError(writer, request, http.StatusNotFound, "NOT_FOUND", false, nil)
 	}
+}
+
+func (router *Router) rejectConcealedCredential(
+	writer http.ResponseWriter,
+	request *http.Request,
+	principal credentials.Principal,
+	operation credentials.Operation,
+) {
+	if err := router.deps.Credentials.RecordConcealedAttempt(
+		request.Context(), principal, operation,
+	); err != nil {
+		writeAPIError(
+			writer, request, http.StatusServiceUnavailable,
+			"STORAGE_UNAVAILABLE", true, nil,
+		)
+		return
+	}
+	writeAPIError(
+		writer, request, http.StatusNotFound, "NOT_FOUND", false, nil,
+	)
 }
 
 func (router *Router) rejectInvalidCredential(

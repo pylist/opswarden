@@ -4,6 +4,14 @@ FROM caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac523
 USER 0:0
 RUN setcap -r /usr/bin/caddy && test -z "$(getcap /usr/bin/caddy)"
 
+FROM caddy-source AS caddy-config
+COPY deploy/Caddyfile /etc/caddy/Caddyfile
+COPY deploy/OpsWardenProxy.caddy /etc/caddy/OpsWardenProxy.caddy
+RUN OPSWARDEN_HOSTNAME=opswarden.invalid \
+    OPSWARDEN_TLS_EMAIL=opswarden@example.invalid \
+    OPSWARDEN_FORWARDED_FOR='{remote_host}' \
+    caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+
 FROM golang:1.25.12-alpine3.23@sha256:cc985ef6f9c3bf9ece7488129c9abe0a150388ccdfa428d886fc709dca0b230a AS health-build
 ARG TARGETARCH
 ENV CGO_ENABLED=0 \
@@ -28,6 +36,8 @@ ENV XDG_CONFIG_HOME=/config \
     XDG_DATA_HOME=/data
 COPY --from=caddy-source --chown=10002:10002 /usr/bin/caddy /usr/local/bin/caddy
 COPY --from=health-build --chown=10002:10002 /out/caddy-healthcheck /usr/local/bin/caddy-healthcheck
+COPY --from=caddy-config --chown=10002:10002 /etc/caddy/Caddyfile /etc/caddy/Caddyfile
+COPY --from=caddy-config --chown=10002:10002 /etc/caddy/OpsWardenProxy.caddy /etc/caddy/OpsWardenProxy.caddy
 WORKDIR /data
 USER 10002:10002
 EXPOSE 443

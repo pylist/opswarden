@@ -957,6 +957,25 @@ func (s *Service) RecordInvalidAttemptAt(
 	)
 }
 
+// RecordConcealedAttempt records an authenticated request that is deliberately
+// answered as NOT_FOUND before the operation enters its business method. It
+// never accepts resource metadata from the transport layer.
+func (s *Service) RecordConcealedAttempt(
+	ctx context.Context,
+	principal Principal,
+	operation Operation,
+) error {
+	switch operation {
+	case OperationRestore, OperationPurge:
+	default:
+		return ErrInvalidInput
+	}
+	return s.appendCredentialFailure(
+		ctx, principal, string(operation), Metadata{}, ErrNotFound,
+		s.clock.Now().UTC(),
+	)
+}
+
 func verifyAuthoritativePurgeSession(
 	ctx context.Context,
 	tx *sql.Tx,

@@ -813,6 +813,35 @@ func TestTransportRejectedCredentialAttemptIsAuditedWithoutInput(t *testing.T) {
 	}
 }
 
+func TestConcealedCredentialAttemptIsAuditedWithoutInput(t *testing.T) {
+	h := newCredentialHarness(t)
+	for _, operation := range []Operation{OperationRestore, OperationPurge} {
+		if err := h.service.RecordConcealedAttempt(
+			h.ctx, h.agent, operation,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var spaceID, resourceID, metadata string
+		if err := h.db.Reader.QueryRowContext(h.ctx, `
+			SELECT COALESCE(space_id, ''), COALESCE(entity_id, ''), metadata_json
+			FROM audit_events WHERE action = ?
+			ORDER BY rowid DESC LIMIT 1
+		`, operation).Scan(&spaceID, &resourceID, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if spaceID != "" || resourceID != "" ||
+			!strings.Contains(metadata, `"success":false`) ||
+			!strings.Contains(metadata, `"error_code":"NOT_FOUND"`) {
+			t.Fatalf("concealed failure audit=%q %q %s", spaceID, resourceID, metadata)
+		}
+	}
+	if err := h.service.RecordConcealedAttempt(
+		h.ctx, h.agent, OperationRead,
+	); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("invalid operation error=%v", err)
+	}
+}
+
 func TestCredentialStorageFailureRollsBackAndWritesSanitizedFailureAudit(t *testing.T) {
 	h := newCredentialHarness(t)
 	if _, err := h.db.Writer.ExecContext(h.ctx, `

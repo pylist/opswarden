@@ -27,6 +27,7 @@ import (
 	"opswarden/internal/audit"
 	"opswarden/internal/authorization"
 	"opswarden/internal/credentials"
+	"opswarden/internal/cryptobox"
 	"opswarden/internal/identity"
 	"opswarden/internal/spaces"
 	"opswarden/internal/storage"
@@ -1224,16 +1225,20 @@ func (service fakeSpaceService) ResolveAuthorizationPrincipal(
 }
 
 type fakeCredentialService struct {
-	fixture       string
-	actualSpaceID string
-	createCalls   int
-	purgeCalls    int
-	purgeSpaceID  string
-	purgeID       string
-	purgeVersion  uint64
-	purgeError    error
-	invalidCalls  int
-	invalidOp     credentials.Operation
+	fixture        string
+	actualSpaceID  string
+	createCalls    int
+	restoreCalls   int
+	purgeCalls     int
+	purgeSpaceID   string
+	purgeID        string
+	purgeVersion   uint64
+	purgeError     error
+	invalidCalls   int
+	invalidOp      credentials.Operation
+	concealedCalls int
+	concealedOp    credentials.Operation
+	concealedError error
 }
 
 func (service *fakeCredentialService) RecordInvalidAttempt(
@@ -1244,6 +1249,16 @@ func (service *fakeCredentialService) RecordInvalidAttempt(
 	service.invalidCalls++
 	service.invalidOp = operation
 	return nil
+}
+
+func (service *fakeCredentialService) RecordConcealedAttempt(
+	_ context.Context,
+	_ credentials.Principal,
+	operation credentials.Operation,
+) error {
+	service.concealedCalls++
+	service.concealedOp = operation
+	return service.concealedError
 }
 
 func (service *fakeCredentialService) List(
@@ -1300,13 +1315,14 @@ func (*fakeCredentialService) Delete(
 	return nil
 }
 
-func (*fakeCredentialService) Restore(
+func (service *fakeCredentialService) Restore(
 	context.Context,
 	credentials.Principal,
 	string,
 	uint64,
 	credentials.WriteContext,
 ) (credentials.Metadata, error) {
+	service.restoreCalls++
 	return credentials.Metadata{}, nil
 }
 
@@ -1632,10 +1648,13 @@ func TestCredentialPurgeRESTConcealsAgentAndMapsRecentTOTPFailure(t *testing.T) 
 			"/api/v1/spaces/spc_test/credentials/cred_test/purge",
 			strings.NewReader(`{"expectedVersion":7}`),
 		)
-		if response.Code != http.StatusNotFound || service.purgeCalls != 0 {
+		if response.Code != http.StatusNotFound || service.purgeCalls != 0 ||
+			service.concealedCalls != 1 ||
+			service.concealedOp != credentials.OperationPurge {
 			t.Fatalf(
-				"status=%d body=%s calls=%d",
+				"status=%d body=%s calls=%d concealed=%d/%q",
 				response.Code, response.Body.String(), service.purgeCalls,
+				service.concealedCalls, service.concealedOp,
 			)
 		}
 	})
@@ -1656,6 +1675,131 @@ func TestCredentialPurgeRESTConcealsAgentAndMapsRecentTOTPFailure(t *testing.T) 
 			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 		}
 	})
+}
+
+func TestAgentCredentialRestoreAndPurgeConcealmentFailsClosedOnAudit(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		operation credentials.Operation
+		path      string
+	}{
+		{
+			name: "restore", operation: credentials.OperationRestore,
+			path: "/api/v1/spaces/spc_test/credentials/cred_test/restore",
+		},
+		{
+			name: "purge", operation: credentials.OperationPurge,
+			path: "/api/v1/spaces/spc_test/credentials/cred_test/purge",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &fakeCredentialService{
+				concealedError: audit.ErrAuditUnavailable,
+			}
+			handler := newTestHandler(Dependencies{
+				Identity: &fakeIdentityService{}, Spaces: systemOwnerSpaceService{},
+				Credentials: service, Agents: fakeAgentService{},
+				Clock: &fixedClock{now: time.Date(
+					2026, 7, 28, 12, 0, 0, 0, time.UTC,
+				)},
+				MasterKey: [32]byte{1},
+			})
+			response := serveAuthorized(
+				handler, "owat_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+				http.MethodPost, test.path,
+				strings.NewReader(`{"expectedVersion":7}`),
+			)
+			if response.Code != http.StatusServiceUnavailable ||
+				!strings.Contains(response.Body.String(), `"code":"STORAGE_UNAVAILABLE"`) ||
+				service.concealedCalls != 1 || service.concealedOp != test.operation ||
+				service.restoreCalls != 0 || service.purgeCalls != 0 {
+				t.Fatalf(
+					"status=%d body=%s concealed=%d/%q restore=%d purge=%d",
+					response.Code, response.Body.String(), service.concealedCalls,
+					service.concealedOp, service.restoreCalls, service.purgeCalls,
+				)
+			}
+		})
+	}
+}
+
+func TestAgentCredentialRestoreAndPurgeWriteRealConcealedAudit(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "concealed-credential.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	if _, err := db.Writer.Exec(`
+		INSERT INTO users
+			(id, email, normalized_email, password_hash, system_role)
+		VALUES
+			('usr_creator', 'creator@example.test', 'creator@example.test',
+			 X'01', 'system_owner');
+		INSERT INTO agents (id, name, created_by_user_id)
+		VALUES ('agt_test', 'Agent test', 'usr_creator');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	auditRepository, err := audit.NewRepository(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	credentialService, err := credentials.NewService(
+		db, cryptobox.New([32]byte{1}), auditRepository, &fixedClock{now: now},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(Dependencies{
+		Identity: &fakeIdentityService{}, Spaces: systemOwnerSpaceService{},
+		Credentials: credentialService, Agents: fakeAgentService{},
+		Clock: &fixedClock{now: now}, MasterKey: [32]byte{1},
+	})
+	for _, test := range []struct {
+		operation credentials.Operation
+		path      string
+	}{
+		{
+			operation: credentials.OperationRestore,
+			path:      "/api/v1/spaces/spc_untrusted/credentials/crd_untrusted/restore",
+		},
+		{
+			operation: credentials.OperationPurge,
+			path:      "/api/v1/spaces/spc_untrusted/credentials/crd_untrusted/purge",
+		},
+	} {
+		response := serveAuthorized(
+			handler, "owat_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+			http.MethodPost, test.path,
+			strings.NewReader(`{"expectedVersion":7}`),
+		)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("%s status=%d body=%s", test.operation, response.Code, response.Body.String())
+		}
+		var count int
+		var spaceID, resourceID, metadata string
+		if err := db.Reader.QueryRow(`
+			SELECT count(*), COALESCE(space_id, ''), COALESCE(entity_id, ''),
+			       metadata_json
+			FROM audit_events WHERE action = ?
+		`, test.operation).Scan(&count, &spaceID, &resourceID, &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 || spaceID != "" || resourceID != "" ||
+			!strings.Contains(metadata, `"success":false`) ||
+			!strings.Contains(metadata, `"error_code":"NOT_FOUND"`) ||
+			strings.Contains(metadata, "untrusted") {
+			t.Fatalf(
+				"%s audit count=%d space=%q resource=%q metadata=%s",
+				test.operation, count, spaceID, resourceID, metadata,
+			)
+		}
+	}
 }
 
 func TestAgentCredentialWriteRequiresIdempotencyHeader(t *testing.T) {

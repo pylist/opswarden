@@ -412,12 +412,13 @@ class ReleaseGateSecurityTest(unittest.TestCase):
             "go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./..."
         )
         web_install = "cd web && npm ci --no-audit --no-fund"
-        web_audit = "cd web && npm audit --omit=dev --audit-level=moderate"
-        e2e_audit = "cd tests/e2e && npm audit --omit=dev --audit-level=moderate"
+        web_audit = "cd web && npm audit --audit-level=moderate"
+        e2e_audit = "cd tests/e2e && npm audit --audit-level=moderate"
         self.assertEqual(makefile.count(vulnerability_scan), 1)
         self.assertEqual(makefile.count(web_audit), 1)
         self.assertEqual(makefile.count(e2e_audit), 1)
         self.assertLess(makefile.index(web_install), makefile.index(web_audit))
+        self.assertNotIn("npm audit --omit=dev", makefile)
         self.assertNotIn("govulncheck@latest", makefile)
         self.assertNotIn("npm audit --audit-level=high", makefile)
 
@@ -437,6 +438,10 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertIn("https://localhost:", config)
         self.assertIn("ignoreHTTPSErrors: true", config)
         self.assertIn("tls internal", server)
+        self.assertIn("import /etc/caddy/OpsWardenProxy.caddy", server)
+        self.assertIn("import opswarden_proxy", server)
+        self.assertNotIn("Content-Security-Policy", server)
+        self.assertNotIn("reverse_proxy opswarden:8080", server)
         self.assertIn('- "443:443/tcp"', compose)
         self.assertIn("ports: !override", server)
         self.assertIn("volumes: !override", server)
@@ -446,6 +451,50 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertIn('"down", "--volumes", "--remove-orphans"', cleanup)
         self.assertIn("`${project}-release`", cleanup)
         self.assertIn("`${project}-wrong`", cleanup)
+
+    def test_production_caddy_config_is_baked_validated_and_shared_with_e2e(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        dockerfile = (ROOT / "deploy/Caddy.Dockerfile").read_text(encoding="utf-8")
+        production = (ROOT / "deploy/Caddyfile").read_text(encoding="utf-8")
+        shared = (ROOT / "deploy/OpsWardenProxy.caddy").read_text(encoding="utf-8")
+        compose = (ROOT / "deploy/compose.yaml").read_text(encoding="utf-8")
+        server = (ROOT / "tests/e2e/server.mjs").read_text(encoding="utf-8")
+
+        self.assertIn("COPY deploy/Caddyfile /etc/caddy/Caddyfile", dockerfile)
+        self.assertIn(
+            "COPY deploy/OpsWardenProxy.caddy /etc/caddy/OpsWardenProxy.caddy",
+            dockerfile,
+        )
+        validate = (
+            "caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
+        )
+        self.assertEqual(dockerfile.count(validate), 1)
+        self.assertLess(dockerfile.index("COPY deploy/Caddyfile"), dockerfile.index(validate))
+        self.assertIn("docker build -f deploy/Caddy.Dockerfile", makefile)
+        self.assertIn(
+            "validate --config /etc/caddy/Caddyfile --adapter caddyfile",
+            makefile,
+        )
+        self.assertIn(
+            "adapt --validate --config /etc/caddy/Caddyfile --adapter caddyfile",
+            makefile,
+        )
+        self.assertIn(
+            "! printf '%s\\n' 'malformed {' | docker run",
+            makefile,
+        )
+        self.assertIn(
+            "adapt --validate --config - --adapter caddyfile",
+            makefile,
+        )
+        self.assertIn("import /etc/caddy/OpsWardenProxy.caddy", production)
+        self.assertIn("import opswarden_proxy", production)
+        self.assertIn("Content-Security-Policy", shared)
+        self.assertIn("reverse_proxy opswarden:8080", shared)
+        self.assertIn('OPSWARDEN_FORWARDED_FOR: "{remote_host}"', compose)
+        self.assertNotIn("${OPSWARDEN_FORWARDED_FOR", compose)
+        self.assertIn("OPSWARDEN_FORWARDED_FOR: 127.0.0.1", server)
+        self.assertNotIn("source: ./Caddyfile", compose)
 
     def test_mcp_artifact_symlink_cannot_write_outside(self) -> None:
         artifact = self.root / "artifact"

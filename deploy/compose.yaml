@@ -53,6 +53,7 @@ services:
     environment:
       OPSWARDEN_HOSTNAME: "${OPSWARDEN_HOSTNAME:?set OPSWARDEN_HOSTNAME in deploy/.env}"
       OPSWARDEN_TLS_EMAIL: "${OPSWARDEN_TLS_EMAIL:?set OPSWARDEN_TLS_EMAIL in deploy/.env}"
+      OPSWARDEN_FORWARDED_FOR: "{remote_host}"
     depends_on:
       opswarden:
         condition: service_healthy
@@ -60,10 +61,6 @@ services:
     ports:
       - "443:443/tcp"
     volumes:
-      - type: bind
-        source: ./Caddyfile
-        target: /etc/caddy/Caddyfile
-        read_only: true
       - type: bind
         source: "${CADDY_DATA_PATH:?set CADDY_DATA_PATH in deploy/.env}"
         target: /data

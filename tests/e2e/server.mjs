@@ -71,24 +71,11 @@ writeFileSync(caddyfilePath, `{
 \t}
 }
 
+import /etc/caddy/OpsWardenProxy.caddy
+
 localhost {
 \ttls internal
-\theader {
-\t\t-Server
-\t\t-Via
-\t\tStrict-Transport-Security "max-age=31536000; includeSubDomains"
-\t\tX-Content-Type-Options "nosniff"
-\t\tReferrer-Policy "no-referrer"
-\t\tPermissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
-\t\tX-Frame-Options "DENY"
-\t\tContent-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; manifest-src 'self'; worker-src 'none'; upgrade-insecure-requests"
-\t}
-\treverse_proxy opswarden:8080 {
-\t\theader_up X-Forwarded-For 127.0.0.1
-\t\theader_up X-Forwarded-Proto https
-\t\theader_up X-Forwarded-Host {host}
-\t\tflush_interval -1
-\t}
+\timport opswarden_proxy
 }
 `, { mode: 0o444 });
 writeFileSync(envPath, [
@@ -109,6 +96,10 @@ writeFileSync(envPath, [
 writeFileSync(overridePath, [
   "services:",
   "  caddy:",
+  "    environment:",
+  "      OPSWARDEN_HOSTNAME: localhost",
+  "      OPSWARDEN_TLS_EMAIL: e2e@example.invalid",
+  "      OPSWARDEN_FORWARDED_FOR: 127.0.0.1",
   "    ports: !override",
   `      - "127.0.0.1:${appPort}:443/tcp"`,
   "    volumes: !override",
@@ -241,7 +232,12 @@ try {
   ) {
     throw new Error("exact revision OpsWarden image label is missing");
   }
-  runDocker([...compose, "build", "caddy"], 300_000);
+  const caddyImage = JSON.parse(
+    runDocker(["image", "inspect", "opswarden-caddy:2.10.2"], 30_000),
+  );
+  if (!Array.isArray(caddyImage) || caddyImage.length !== 1) {
+    throw new Error("validated production Caddy image is missing");
+  }
   // Compose implements a local file secret as a bind mount and cannot honor
   // uid/gid. A pinned, network-isolated helper supplies the same 10001:0400
   // identity declared by production Compose, then restores host ownership.

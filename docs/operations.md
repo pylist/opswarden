@@ -334,6 +334,11 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml ps
 
 Caddy 自动支持 WebSocket upgrade；`flush_interval -1` 让 MCP Streamable HTTP
 响应低延迟透传。它不缓存或改写应用的 `Cache-Control: no-store` API 响应。
+Caddy 镜像内置 `deploy/Caddyfile`，其安全响应头与反向代理规则来自共享的
+`deploy/OpsWardenProxy.caddy`；生产 Compose 不从宿主机覆盖该配置。发布 gate 使用
+同一个最小 hardened 镜像实际执行 `caddy validate` 和 `caddy adapt --validate`，
+并用损坏配置负控确认解析失败。E2E 只用 `localhost`/`tls internal` 最小站点包装，
+仍导入同一组生产安全响应头与代理规则。
 Caddy 不重复实现请求体限制，以免代理与应用规则分叉：
 
 - 一般 JSON API：64 KiB。
@@ -741,8 +746,8 @@ npm、Python 3、可用的 Docker/Compose，以及可访问 Playwright 和已锁
 网络。首次使用或 Playwright 版本升级后，由操作员显式运行 `make e2e-bootstrap`；
 发布 gate 本身使用 `npx --no-install`，会核对锁定的 Playwright 版本与 Chromium
 可执行文件，绝不在验证期间主动下载浏览器。安全扫描使用固定 `go1.25.12` 工具链
-和固定版本的 `govulncheck`，并对 web 与 E2E lockfile 的生产依赖执行
-`npm audit --omit=dev --audit-level=moderate`。
+和固定版本的 `govulncheck`，并对 web 与 E2E lockfile 的完整依赖树（包含构建与测试
+依赖）执行 `npm audit --audit-level=moderate`。
 
 运行时会为每个已认证的凭据读取或变更失败另写一条
 `credential.read/create/update/delete/restore/purge` 审计事件，事件只包含固定错误
@@ -751,6 +756,8 @@ npm、Python 3、可用的 Docker/Compose，以及可访问 Playwright 和已锁
 记录为 `PERMISSION_DENIED`。失败事件在业务事务回滚
 后以独立事务写入；如果该审计无法持久化，请求会 fail closed 为
 `STORAGE_UNAVAILABLE`，不得把原存储/授权错误当作已完整审计的结果继续处理。
+Agent 对仅限人工用户的 restore/purge REST 路径也必须先写入标识已清空的
+`NOT_FOUND` 失败审计，再返回隐藏式 404；该提前拒绝不会调用 restore/purge 业务方法。
 
 验证顺序固定为 Go vet/race、固定生产工具链漏洞扫描与部署辅助程序测试、React
 单测、依赖审计和生产构建、Compose 解析、固定参数镜像构建、四个串行 Playwright

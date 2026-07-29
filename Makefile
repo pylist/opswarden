@@ -23,14 +23,38 @@ _verify-locked:
 	/usr/bin/python3 -I scripts/scan_sensitive_fixtures_test.py
 	/usr/bin/python3 -I scripts/release_gate_security_test.py
 	cd web && npm ci --no-audit --no-fund
-	cd web && npm audit --omit=dev --audit-level=moderate
+	cd web && npm audit --audit-level=moderate
 	cd web && npm test -- --run
 	cd web && npm run build
-	cd tests/e2e && npm audit --omit=dev --audit-level=moderate
+	cd tests/e2e && npm audit --audit-level=moderate
 	docker compose --env-file deploy/.env.example -f deploy/compose.yaml config >/dev/null
 	GIT_NO_REPLACE_OBJECTS=1 git --no-replace-objects archive --format=tar $(E2E_REVISION) | docker build -f deploy/Dockerfile \
 		--build-arg VERSION=$(E2E_VERSION) \
 		--build-arg REVISION=$(E2E_REVISION) \
 		--build-arg SOURCE_DATE_EPOCH=0 \
 		-t opswarden:$(E2E_VERSION) -
+	GIT_NO_REPLACE_OBJECTS=1 git --no-replace-objects archive --format=tar $(E2E_REVISION) | docker build -f deploy/Caddy.Dockerfile \
+		-t opswarden-caddy:2.10.2 -
+	docker run --rm --network none --read-only --cap-drop ALL \
+		--security-opt no-new-privileges:true \
+		--tmpfs /data:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=10002,gid=10002 \
+		--tmpfs /config:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=10002,gid=10002 \
+		-e OPSWARDEN_HOSTNAME=opswarden.invalid \
+		-e OPSWARDEN_TLS_EMAIL=opswarden@example.invalid \
+		-e 'OPSWARDEN_FORWARDED_FOR={remote_host}' \
+		--entrypoint /usr/local/bin/caddy opswarden-caddy:2.10.2 \
+		validate --config /etc/caddy/Caddyfile --adapter caddyfile
+	docker run --rm --network none --read-only --cap-drop ALL \
+		--security-opt no-new-privileges:true \
+		--tmpfs /data:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=10002,gid=10002 \
+		--tmpfs /config:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=10002,gid=10002 \
+		-e OPSWARDEN_HOSTNAME=opswarden.invalid \
+		-e OPSWARDEN_TLS_EMAIL=opswarden@example.invalid \
+		-e 'OPSWARDEN_FORWARDED_FOR={remote_host}' \
+		--entrypoint /usr/local/bin/caddy opswarden-caddy:2.10.2 \
+		adapt --validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+	! printf '%s\n' 'malformed {' | docker run --rm -i --network none --read-only --cap-drop ALL \
+		--security-opt no-new-privileges:true \
+		--entrypoint /usr/local/bin/caddy opswarden-caddy:2.10.2 \
+		adapt --validate --config - --adapter caddyfile >/dev/null 2>&1
 	OPSWARDEN_E2E_IMAGE_VERSION=$(E2E_VERSION) ./scripts/verify-e2e.sh
