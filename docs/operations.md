@@ -13,8 +13,9 @@
 - 规范主机名同时用于内外网；推荐 split-horizon DNS。
 - 入站只放行 TCP 443。Caddy 通过 443 上的 TLS-ALPN-01 获取证书，不要求映射 80。
 - Caddy 需要出站 DNS 与 HTTPS 访问证书颁发机构。
-- 主机安装 `openssl`、`sqlite3`、`sha256sum`、`python3`、`findmnt`；它们只用于
-  主机运维，不进入应用镜像。
+- 主机在标准 `/usr/bin` 安装 `git`、`gpg`、`sqlite3`，并安装 `openssl`、
+  `sha256sum`、`python3`、`findmnt`；它们只用于主机运维，不进入应用镜像。release
+  tag 使用受信 OpenPGP key 验证。
 
 以 root 执行一次目录准备。`10001` 是 OpsWarden 容器 UID/GID，`10002` 是 Caddy
 容器 UID/GID：
@@ -219,28 +220,24 @@ JWT 写入命令参数、历史或长期文件。
 ## 7. 升级前备份、升级与回滚
 
 升级前先在设置页确认最近在线备份已验证。为得到与升级时刻一致的额外快照，优雅
-停止应用后使用 `sqlite3 .backup`（SQLite Backup API），不要直接复制数据库文件：
+停止应用后运行仓库内受测试的离线辅助程序。辅助程序只接受规范绝对路径上的
+`10001:10001`、`0600`、非空普通文件，拒绝符号链接、缺失/空文件、错误权限和损坏
+数据库；它捕获 `PRAGMA integrity_check` 的完整输出并要求字节级恰好为 `ok\n`。
+随后用 SQLite Backup API 建立 `0600` 快照，再次执行相同完整性检查，最后以独占
+创建的 `0600` 文件保存 SHA-256 清单并同步到磁盘。任何一步失败都会删除不完整输出
+并以非零状态退出，应用保持停止：
 
 ```bash
 set -euo pipefail
 cd /opt/opswarden
-stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 docker compose --env-file deploy/.env -f deploy/compose.yaml stop opswarden
-sudo -u '#10001' env \
-  DATABASE=/srv/opswarden/state/data/opswarden.db \
-  SNAPSHOT="/srv/opswarden/preupgrade/opswarden-${stamp}.sqlite3" \
-  sh -c 'umask 077; sqlite3 "$DATABASE" ".timeout 5000" ".backup $SNAPSHOT"'
-sudo -u '#10001' chmod 0600 \
-  "/srv/opswarden/preupgrade/opswarden-${stamp}.sqlite3"
-sudo -u '#10001' sqlite3 \
-  "file:/srv/opswarden/preupgrade/opswarden-${stamp}.sqlite3?mode=ro&immutable=1" \
-  'PRAGMA integrity_check;'
-sudo -u '#10001' env SNAPSHOT="/srv/opswarden/preupgrade/opswarden-${stamp}.sqlite3" \
-  sh -c 'sha256sum "$SNAPSHOT" > "$SNAPSHOT.sha256"'
+sudo -u '#10001' -- python3 deploy/offline_ops.py snapshot
 ```
 
-`integrity_check` 必须只输出 `ok`。然后检出已审核的固定 release，填写其真实版本、
-commit 和 commit 时间，验证后启动：
+命令只在源库、快照、清单三者都验证成功后输出两个明确文件名。立即把这两个文件名、
+清单中的 SHA-256、当前完整 `git rev-parse HEAD` 和当前已验证 release tag 写入变更
+记录；不得用“最新文件”通配符代替明确文件名。然后检出已审核的固定 release，填写
+其真实版本、commit 和 commit 时间，验证后启动：
 
 ```bash
 git fetch --tags --force
@@ -292,10 +289,45 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml \
 ## 8. 每季度隔离恢复演练
 
 演练使用独立 Compose project、独立后端网段、独立目录、从离线保管恢复的匹配密钥，
-并只把 Caddy 暴露到 loopback `127.0.0.1:8443`。绝不能复用生产在线密钥文件或
-生产读写目录。
+并只把 Caddy 暴露到 loopback `127.0.0.1:8443`。绝不能复用生产在线密钥文件、生产
+读写目录或当前工作副本。选择快照时必须同时取得备份时记录的 SHA-256、与该快照
+schema 兼容的签名 release tag，以及该 tag 对应的完整 HEAD revision；缺少任一项
+就拒绝恢复。
+
+先验证签名 tag 与完整 revision，并把该 revision 检出为独立、detached Git
+worktree。以下三个占位值必须从受保护的备份/发布记录中逐字替换：
 
 ```bash
+set -euo pipefail
+cd /opt/opswarden
+release_ref='<recorded-signed-release-tag>'
+expected_revision='<recorded-full-head-revision>'
+recorded_sha256='<recorded-lowercase-snapshot-sha256>'
+case "$expected_revision" in
+  ''|*[!0-9a-f]*) echo "完整 revision 格式无效" >&2; exit 1 ;;
+esac
+case "${#expected_revision}" in 40|64) ;; *) echo "必须使用完整 revision" >&2; exit 1 ;; esac
+case "$recorded_sha256" in
+  ''|*[!0-9a-f]*) echo "SHA-256 格式无效" >&2; exit 1 ;;
+esac
+[ "${#recorded_sha256}" -eq 64 ] || { echo "SHA-256 长度无效" >&2; exit 1; }
+[ ! -e /srv/opswarden-restore ] || {
+  echo "隔离恢复目录已存在；先人工调查并按本节清理流程处理" >&2
+  exit 1
+}
+git fetch --tags --force
+git verify-tag "refs/tags/$release_ref"
+tag_revision="$(git rev-parse "refs/tags/${release_ref}^{commit}")"
+[ "$tag_revision" = "$expected_revision" ] || {
+  echo "签名 tag 与备份记录 revision 不一致" >&2
+  exit 1
+}
+git worktree add --detach /srv/opswarden-restore/source "$expected_revision"
+if [ "$(git -C /srv/opswarden-restore/source rev-parse HEAD)" != "$expected_revision" ]; then
+  echo "隔离 worktree HEAD 与记录 revision 不一致" >&2
+  exit 1
+fi
+
 sudo install -d -o 10001 -g 10001 -m 0700 \
   /srv/opswarden-restore/state/data \
   /srv/opswarden-restore/state/backups \
@@ -310,7 +342,8 @@ sudo install -o 10001 -g 10001 -m 0400 \
   '/path/from/independent-key-backup/matching-master.key' \
   /srv/opswarden-restore/secrets/master.key
 sudo install -o "$(id -u)" -g "$(id -g)" -m 0600 \
-  /opt/opswarden/deploy/.env.example /srv/opswarden-restore/.env
+  /srv/opswarden-restore/source/deploy/.env.example \
+  /srv/opswarden-restore/.env
 ```
 
 在 `/srv/opswarden-restore/.env` 中写入被恢复版本对应的固定
@@ -372,17 +405,30 @@ services:
       - /srv/opswarden-restore/caddy/config:/config
 ```
 
-启动并验证：
+在任何 Compose 配置、构建或启动之前执行统一 preflight。它再次要求 isolated
+worktree 为 detached HEAD，内部再次验证签名 tag 恰好解析到记录 revision，拒绝
+tracked 或 untracked 修改，并验证恢复副本是 `10001:10001`、`0600`、规范、非空、
+非符号链接的普通文件；实际 SHA-256 必须与记录值恒定时间比较相等，SQLite 完整性
+输出必须恰好为 `ok\n`。任一步不满足都会非零退出，且此时还没有启动任何容器：
 
 ```bash
-cd /opt/opswarden
+sudo -- python3 /srv/opswarden-restore/source/deploy/offline_ops.py restore-preflight \
+  "$release_ref" "$expected_revision" "$recorded_sha256"
+```
+
+preflight 成功后，只从隔离 worktree 构建和启动，不能引用
+`/opt/opswarden/deploy/compose.yaml`：
+
+```bash
 docker compose -p opswarden-restore \
   --env-file /srv/opswarden-restore/.env \
-  -f deploy/compose.yaml -f /srv/opswarden-restore/override.yaml \
+  -f /srv/opswarden-restore/source/deploy/compose.yaml \
+  -f /srv/opswarden-restore/override.yaml \
   config --quiet
 docker compose -p opswarden-restore \
   --env-file /srv/opswarden-restore/.env \
-  -f deploy/compose.yaml -f /srv/opswarden-restore/override.yaml \
+  -f /srv/opswarden-restore/source/deploy/compose.yaml \
+  -f /srv/opswarden-restore/override.yaml \
   up -d --build
 curl --insecure --fail --silent --show-error https://127.0.0.1:8443/health/live
 ```
@@ -398,28 +444,45 @@ curl --insecure --fail --silent --show-error https://127.0.0.1:8443/health/live
 set -euo pipefail
 docker compose -p opswarden-restore \
   --env-file /srv/opswarden-restore/.env \
-  -f /opt/opswarden/deploy/compose.yaml \
+  -f /srv/opswarden-restore/source/deploy/compose.yaml \
   -f /srv/opswarden-restore/override.yaml down
 remaining="$(
   docker compose -p opswarden-restore \
     --env-file /srv/opswarden-restore/.env \
-    -f /opt/opswarden/deploy/compose.yaml \
+    -f /srv/opswarden-restore/source/deploy/compose.yaml \
     -f /srv/opswarden-restore/override.yaml \
-    ps --status running --quiet
+    ps --all --quiet
 )"
 if [ -n "$remaining" ]; then
-  echo "恢复演练容器仍在运行；拒绝删除演练 state 或密钥" >&2
+  echo "恢复演练仍有关联容器；拒绝删除 worktree、state 或密钥" >&2
   exit 1
 fi
-sudo rm -f /srv/opswarden-restore/secrets/master.key
-sudo rm -rf /srv/opswarden-restore/state \
-  /srv/opswarden-restore/caddy \
-  /srv/opswarden-restore/.env \
+restore_root="$(readlink -f -- /srv/opswarden-restore)"
+[ "$restore_root" = /srv/opswarden-restore ] &&
+  [ -d /srv/opswarden-restore ] &&
+  [ ! -L /srv/opswarden-restore ] || {
+    echo "恢复根目录不是预期的规范非符号链接目录；拒绝删除" >&2
+    exit 1
+  }
+if findmnt --noheadings --mountpoint /srv/opswarden-restore >/dev/null 2>&1; then
+  echo "恢复根目录仍是挂载点；拒绝删除" >&2
+  exit 1
+fi
+git -C /opt/opswarden worktree remove /srv/opswarden-restore/source
+sudo rm -f -- /srv/opswarden-restore/secrets/master.key
+sudo rm -rf -- /srv/opswarden-restore/state \
+  /srv/opswarden-restore/secrets \
+  /srv/opswarden-restore/caddy
+sudo rm -f -- /srv/opswarden-restore/.env \
   /srv/opswarden-restore/Caddyfile \
   /srv/opswarden-restore/override.yaml
+sudo rmdir -- /srv/opswarden-restore
+git -C /opt/opswarden worktree prune
 ```
 
-上述删除不可从应用恢复；数据库快照与匹配密钥的权威副本必须仍在独立备份系统。
+不得给 `git worktree remove` 加 `--force`；如果它报告 tracked/untracked 修改，先保留
+现场调查。上述删除不可从应用恢复；数据库快照、其受保护 checksum 记录、对应
+release/revision 和匹配密钥的权威副本必须仍在独立备份系统。
 
 ## 9. 紧急吊销
 
@@ -432,64 +495,18 @@ Token”；调用实际的 `DELETE /api/v1/agents/{agentID}/tokens/{tokenID}`，
 失败。v1 列表只显示汇总，不能从 UI 找回旧 Token ID。
 
 如果 UI/API 不可用或无法定位泄漏 Token，只能执行以下离线、事务化应急流程。它不
-伪造应用审计事件；必须同步记录到外部事故日志。先停止应用，脚本只显示非敏感 ID、
-邮箱、Agent 名称和 Token 前缀，然后通过隐藏输入选择用户邮箱或 Agent ID：
+伪造应用审计事件；必须同步记录到外部事故日志。先从受保护的事故记录中取得准确的
+用户邮箱或 Agent ID，不要把选择值放入参数、环境变量、shell history、管道或日志。
+辅助程序必须以 root 启动：它先由 root 打开 root-owned `/dev/tty`，关闭回显并读取
+kind 与选择值；随后依次清空 supplementary groups、降 GID/UID 至 `10001:10001` 并
+验证实际/有效 UID、GID 和 groups，最后才打开规范、非符号链接、`10001:10001`、
+`0600` 的 SQLite 文件。
 
 ```bash
 set -euo pipefail
 cd /opt/opswarden
 docker compose --env-file deploy/.env -f deploy/compose.yaml stop opswarden
-if sudo -u '#10001' python3 - /srv/opswarden/state/data/opswarden.db <<'PY'
-import datetime
-import getpass
-import sqlite3
-import sys
-
-db = sys.argv[1]
-conn = sqlite3.connect(f"file:{db}?mode=rw", uri=True, isolation_level=None)
-conn.execute("PRAGMA foreign_keys=ON")
-print("Users:")
-for row in conn.execute("SELECT id, email FROM users WHERE deleted_at IS NULL ORDER BY email"):
-    print(row)
-print("Agents and token prefixes:")
-for row in conn.execute("""
-    SELECT a.id, a.name, t.id, t.token_prefix, t.revoked_at
-      FROM agents a JOIN agent_tokens t ON t.agent_id = a.id
-     ORDER BY a.name, t.created_at
-"""):
-    print(row)
-with open("/dev/tty", "r", encoding="utf-8") as tty:
-    print("revoke kind [user/agent]: ", end="", flush=True)
-    kind = tty.readline().strip()
-value = getpass.getpass("user email or exact agent id (hidden): ").strip()
-now = datetime.datetime.now(datetime.timezone.utc).isoformat(
-    timespec="microseconds"
-).replace("+00:00", "Z")
-conn.execute("BEGIN IMMEDIATE")
-if kind == "user":
-    cur = conn.execute("""
-        UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?)
-         WHERE user_id = (
-             SELECT id FROM users WHERE normalized_email = lower(trim(?))
-         )
-           AND revoked_at IS NULL
-    """, (now, value))
-elif kind == "agent":
-    cur = conn.execute("""
-        UPDATE agent_tokens SET revoked_at = COALESCE(revoked_at, ?)
-         WHERE agent_id = ?
-           AND revoked_at IS NULL
-    """, (now, value))
-else:
-    conn.rollback()
-    raise SystemExit("invalid kind")
-if cur.rowcount <= 0:
-    conn.rollback()
-    raise SystemExit("no active rows matched; application remains stopped")
-conn.commit()
-print(f"revoked rows: {cur.rowcount}")
-conn.close()
-PY
+if sudo -- python3 deploy/offline_revoke.py
 then
   docker compose --env-file deploy/.env -f deploy/compose.yaml up -d
 else
@@ -498,8 +515,12 @@ else
 fi
 ```
 
-必须确认 `revoked rows` 大于 0，并在启动后检查登录/Agent 请求已经失败。该流程不会
-读取、输出或修改凭据载荷，不会在应用运行时直接编辑 SQLite。
+程序在 `BEGIN IMMEDIATE` 中先计算仍未吊销的匹配行，要求数量大于 0，随后更新并
+要求实际 row count 完全相同；零行、计数变化、SQL/commit 错误或输入错误都会
+rollback 并返回失败。只有确认 commit 后程序才以 0 退出，因此上面的 `then` 才会
+重启服务。必须确认输出的 `revoked active rows` 大于 0，并在启动后检查登录/Agent
+请求已经失败。选择值从不出现在 argv、env 或成功/失败输出；该流程不会读取、输出
+或修改凭据载荷，也不会在应用运行时直接编辑 SQLite。
 
 ## 10. 主密钥丢失、轮换限制与灾难恢复
 
@@ -508,9 +529,12 @@ hash 和密文都不能重建密钥。不要生成新密钥覆盖原文件，这
 v1 内部具备数据密钥 rewrap 原语，但没有经过支持的在线轮换 API/CLI；不要手工修改
 密文或数据库。轮换需要单独发布流程、安全评审、全量验证和可回滚计划。
 
-灾难恢复使用与季度演练相同的顺序：在隔离主机部署快照对应的固定版本，恢复已验证
-SQLite snapshot，从独立保管恢复匹配主密钥，以不开放公网的方式启动，验证
-`integrity_check`、测试凭据解密和审计查询。确认接管后再切换规范 DNS/443；如果
-恢复环境成为生产，立即吊销恢复期间产生的会话与 Agent Token，签发新 Token，并
-重新建立独立数据库备份和主密钥备份。未经验证不得删除原主机、原 snapshot 或原
-密钥副本。
+灾难恢复必须逐条执行第 8 节的同一顺序和同一个 `offline_ops.py
+restore-preflight`，不能简化为从当前 source 构建：先取得快照记录的 SHA-256、
+签名 release tag 和完整 HEAD revision；验证 tag 后建立 isolated detached
+worktree；恢复匹配密钥与快照；在任何 Compose 启动前验证 worktree/revision、
+checksum 和字节级恰好为 `ok\n` 的完整性结果；最后只从该 isolated worktree
+构建。先以不开放公网的方式验证测试凭据解密和审计查询，确认接管后再切换规范
+DNS/443。如果恢复环境成为生产，立即吊销恢复期间产生的会话与 Agent Token，签发
+新 Token，并重新建立独立数据库备份、受保护 checksum/版本记录和主密钥备份。
+未经验证不得删除原主机、原 snapshot 或原密钥副本。
