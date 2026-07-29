@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -14,12 +15,14 @@ import tempfile
 import threading
 import time
 import unittest
+import zlib
 from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 OFFLINE_OPS = ROOT / "deploy" / "offline_ops.py"
 OFFLINE_REVOKE = ROOT / "deploy" / "offline_revoke.py"
+RELEASE_EXPORT = ROOT / "deploy" / "release_export.py"
 OPERATIONS_DOC = ROOT / "docs" / "operations.md"
 RESTORE_OVERRIDE = ROOT / "deploy" / "restore.override.yaml"
 USER_ID = base64.urlsafe_b64encode(bytes(16)).rstrip(b"=").decode("ascii")
@@ -54,6 +57,7 @@ class OfflineOpsTest(unittest.TestCase):
             if OFFLINE_OPS.is_file()
             else None
         )
+        cls.exporter = load_module("release_export", RELEASE_EXPORT)
 
     def setUp(self):
         self.assertIsNotNone(
@@ -149,19 +153,56 @@ class OfflineOpsTest(unittest.TestCase):
             path.chmod(0o444)
         deploy.chmod(0o555)
         release.chmod(0o555)
-        revision = "a" * 40
-        tree = "b" * 40
+        repository = self.root / f"manifest-repository-{self.fixture_count}"
+        subprocess.run(["git", "init", "-q", repository], check=True)
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.email", "fixture@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.name", "Fixture"], check=True
+        )
+        for relative, content in files.items():
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        subprocess.run(["git", "-C", repository, "add", "."], check=True)
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "GIT_AUTHOR_DATE": "1700000000 +0000",
+                "GIT_COMMITTER_DATE": "1700000000 +0000",
+            }
+        )
+        subprocess.run(
+            ["git", "-C", repository, "commit", "-qm", "fixture"],
+            check=True,
+            env=environment,
+        )
+        revision = subprocess.check_output(
+            ["git", "-C", repository, "rev-parse", "HEAD"], text=True
+        ).strip()
+        tree = subprocess.check_output(
+            ["git", "-C", repository, "rev-parse", "HEAD^{tree}"], text=True
+        ).strip()
         epoch = 1700000000
         lines = [
             self.ops.MANIFEST_HEADER,
-            "tag v1.0.0",
-            f"revision {revision}",
-            f"tree {tree}",
+            "object-format sha1",
+            "tag-name v1.0.0",
+            f"tag-oid {'c' * 40}",
+            f"commit-oid {revision}",
+            f"tree-oid {tree}",
             f"epoch {epoch}",
         ]
         for relative, content in sorted(files.items()):
+            blob_oid = subprocess.check_output(
+                ["git", "-C", repository, "rev-parse", f"HEAD:{relative}"],
+                text=True,
+            ).strip()
             lines.append(
-                f"100644 {len(content)} {hashlib.sha256(content).hexdigest()} {relative}"
+                f"100644 {blob_oid} {len(content)} "
+                f"{hashlib.sha256(content).hexdigest()} {relative}"
             )
         manifest = self.root / f"release-{self.fixture_count}.manifest"
         manifest.write_text("\n".join(lines) + "\n", encoding="ascii")
@@ -493,6 +534,272 @@ class OfflineOpsTest(unittest.TestCase):
             os.close(descriptor)
         self.assertEqual(destination.read_bytes(), genuine)
         self.assertNotEqual(destination.read_bytes(), source.read_bytes())
+
+    def test_signed_tag_export_captures_real_object_graph_and_stable_blobs(self):
+        repository = self.root / "signed-repository"
+        staging = self.root / "signed-staging"
+        staging.mkdir(mode=0o700)
+        subprocess.run(["git", "init", "-q", repository], check=True)
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.email", "fixture@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.name", "Fixture"], check=True
+        )
+        (repository / "deploy").mkdir()
+        (repository / "deploy" / "Dockerfile").write_bytes(b"FROM scratch\n")
+        (repository / "release.txt").write_bytes(b"genuine\n")
+        subprocess.run(["git", "-C", repository, "add", "."], check=True)
+        subprocess.run(["git", "-C", repository, "commit", "-qm", "signed"], check=True)
+        revision = subprocess.check_output(
+            ["git", "-C", repository, "rev-parse", "HEAD"], text=True
+        ).strip()
+        key = self.root / "signing-key"
+        subprocess.run(
+            ["/usr/bin/ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key],
+            check=True,
+        )
+        allowed = self.root / "allowed-signers"
+        allowed.write_text(
+            "fixture@example.com " + key.with_suffix(".pub").read_text(encoding="ascii"),
+            encoding="ascii",
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                repository,
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                f"user.signingkey={key}",
+                "tag",
+                "-s",
+                "-m",
+                "signed fixture",
+                "v1.0.0",
+            ],
+            check=True,
+        )
+
+        def verify_signed_tag(_, tag_oid):
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repository,
+                    "-c",
+                    "gpg.format=ssh",
+                    "-c",
+                    f"gpg.ssh.allowedSignersFile={allowed}",
+                    "verify-tag",
+                    tag_oid,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        manifest = self.exporter.export_release(
+            repository,
+            staging,
+            "v1.0.0",
+            revision,
+            git_binary="/usr/bin/git",
+            signature_verifier=verify_signed_tag,
+        )
+        metadata, entries = self.ops.parse_release_manifest_bytes(manifest)
+        self.assertEqual(metadata["commit-oid"], revision)
+        self.assertEqual(
+            metadata["tree-oid"],
+            subprocess.check_output(
+                ["git", "-C", repository, "rev-parse", "HEAD^{tree}"], text=True
+            ).strip(),
+        )
+        self.assertEqual((staging / "release.txt").read_bytes(), b"genuine\n")
+        self.assertIn("release.txt", entries)
+
+        (repository / "release.txt").write_bytes(b"later mutation\n")
+        subprocess.run(["git", "-C", repository, "commit", "-qam", "later"], check=True)
+        self.assertEqual((staging / "release.txt").read_bytes(), b"genuine\n")
+        metadata_after, entries_after = self.ops.parse_release_manifest_bytes(manifest)
+        self.assertEqual(metadata_after, metadata)
+        self.assertEqual(entries_after, entries)
+
+    def test_manifest_rejects_blob_oid_path_and_tree_replacement(self):
+        release, manifest_path, _, _ = self.make_release()
+        raw = manifest_path.read_bytes()
+        for replacement in (
+            raw.replace(b"100644 ", b"100644 " + b"0" * 40 + b" ", 1),
+            raw.replace(b"tree-oid ", b"tree-oid " + b"0" * 40 + b" ", 1),
+            raw + b"100644 " + b"0" * 40 + b" 1 " + b"0" * 64 + b" ../evil\n",
+        ):
+            with self.subTest(replacement=replacement[-80:]):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    self.ops.parse_release_manifest_bytes(replacement)
+
+    def test_manifest_install_consumes_captured_pipe_not_replaced_file(self):
+        _, manifest_path, revision, _ = self.make_release()
+        genuine = manifest_path.read_bytes()
+        manifest_path.chmod(0o644)
+        manifest_path.write_bytes(genuine.replace(revision.encode(), b"0" * 40))
+        destination = self.root / "sealed.manifest"
+        read_descriptor, write_descriptor = os.pipe()
+        try:
+            os.write(write_descriptor, genuine)
+        finally:
+            os.close(write_descriptor)
+        try:
+            with mock.patch.object(
+                self.ops, "RESTORE_RELEASE_MANIFEST", destination
+            ), mock.patch.object(self.ops.os, "fchown"):
+                self.ops.install_release_manifest(
+                    read_descriptor, destination, "v1.0.0", revision
+                )
+        finally:
+            os.close(read_descriptor)
+        self.assertEqual(destination.read_bytes(), genuine)
+        self.assertNotEqual(destination.read_bytes(), manifest_path.read_bytes())
+
+    def test_raw_object_reader_rejects_object_store_mutation(self):
+        repository = self.root / "mutated-object-repository"
+        subprocess.run(["git", "init", "-q", repository], check=True)
+        payload = repository / "payload"
+        payload.write_bytes(b"genuine\n")
+        oid = subprocess.check_output(
+            ["git", "-C", repository, "hash-object", "-w", "payload"], text=True
+        ).strip()
+        loose = repository / ".git" / "objects" / oid[:2] / oid[2:]
+        loose.chmod(0o600)
+        loose.write_bytes(zlib.compress(b"blob 10\0malicious\n"))
+        git = self.exporter.RawGit(repository, "/usr/bin/git")
+        with self.assertRaises((RuntimeError, subprocess.SubprocessError)):
+            git.read_object(oid, "sha1")
+
+    def test_fd_enumeration_rejects_symlink_swap_depth_and_entry_dos(self):
+        root = self.root / "fd-tree"
+        root.mkdir(mode=0o700)
+        target = root / "directory"
+        target.mkdir(mode=0o700)
+        descriptor = os.open(root, os.O_RDONLY)
+        target.rmdir()
+        target.symlink_to("/tmp")
+        try:
+            with self.assertRaises((OSError, ValueError)):
+                self.ops._enumerate_tree_fd(
+                    descriptor, self.uid, self.gid, 0o700, 0o600
+                )
+        finally:
+            os.close(descriptor)
+
+        deep = self.root / "deep-tree"
+        deep.mkdir(mode=0o700)
+        cursor = deep
+        for index in range(self.ops.MAX_RELEASE_DEPTH + 1):
+            cursor = cursor / f"d{index}"
+            cursor.mkdir(mode=0o700)
+        descriptor = os.open(deep, os.O_RDONLY)
+        try:
+            with self.assertRaises(ValueError):
+                self.ops._enumerate_tree_fd(
+                    descriptor, self.uid, self.gid, 0o700, 0o600
+                )
+        finally:
+            os.close(descriptor)
+
+        bounded = self.root / "bounded-tree"
+        bounded.mkdir(mode=0o700)
+        for name in ("a", "b", "c"):
+            (bounded / name).write_bytes(b"x")
+            (bounded / name).chmod(0o600)
+        descriptor = os.open(bounded, os.O_RDONLY)
+        try:
+            with mock.patch.object(self.ops, "MAX_RELEASE_ENTRIES", 1):
+                with self.assertRaises(ValueError):
+                    self.ops._enumerate_tree_fd(
+                        descriptor, self.uid, self.gid, 0o700, 0o600
+                    )
+        finally:
+            os.close(descriptor)
+
+    def test_sealed_environment_ignores_source_replacement_and_shell_injection(self):
+        revision = "a" * 40
+        sealed = self.root / "restore.sealed.env"
+        source = self.root / "restore.env"
+        payload = self.valid_restore_env(revision, 1700000000)
+        source.write_text(payload, encoding="ascii")
+        source.chmod(0o600)
+        sealed.write_bytes(source.read_bytes())
+        sealed.chmod(0o444)
+        source.write_text(
+            payload.replace(
+                "/srv/opswarden-restore/state", "/srv/opswarden/state"
+            ),
+            encoding="ascii",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OPSWARDEN_STATE_PATH": "/srv/opswarden/state",
+                "OPSWARDEN_MASTER_KEY_PATH": "/srv/opswarden/secrets/master.key",
+                "OPSWARDEN_REVISION": "0" * 40,
+            },
+            clear=False,
+        ):
+            self.ops.verify_restore_environment(
+                sealed,
+                self.uid,
+                self.gid,
+                "v1.0.0",
+                revision,
+                1700000000,
+                0o444,
+            )
+        self.assertEqual(sealed.read_text(encoding="ascii"), payload)
+
+    def test_effective_compose_config_uses_only_sealed_environment(self):
+        docker = shutil.which("docker")
+        if docker is None:
+            self.skipTest("docker is unavailable")
+        sealed = self.root / "restore.sealed.env"
+        sealed.write_text(
+            self.valid_restore_env("a" * 40, 1700000000), encoding="ascii"
+        )
+        injected = {
+            "OPSWARDEN_STATE_PATH": "/srv/opswarden/state",
+            "OPSWARDEN_MASTER_KEY_PATH": "/srv/opswarden/secrets/master.key",
+            "OPSWARDEN_REVISION": "0" * 40,
+        }
+        with mock.patch.dict(os.environ, injected, clear=False):
+            configured = subprocess.check_output(
+                [
+                    docker,
+                    "compose",
+                    "-p",
+                    "opswarden-restore-test",
+                    "--env-file",
+                    str(sealed),
+                    "-f",
+                    str(ROOT / "deploy" / "compose.yaml"),
+                    "-f",
+                    str(ROOT / "deploy" / "restore.override.yaml"),
+                    "config",
+                ],
+                env={
+                    # The macOS test Docker plugin lives in the user CLI path;
+                    # production runbook pins Linux /usr/bin/docker and a
+                    # minimal HOME/PATH.
+                    "HOME": os.environ.get("HOME", "/nonexistent"),
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "LC_ALL": "C",
+                },
+                text=True,
+            )
+        self.assertIn("/srv/opswarden-restore/state", configured)
+        self.assertIn("/srv/opswarden-restore/secrets/master.key", configured)
+        self.assertNotIn("/srv/opswarden/state", configured)
+        self.assertNotIn("0000000000000000000000000000000000000000", configured)
 
     def test_restore_env_rejects_template_defaults_duplicates_and_symlink(self):
         env_path = self.root / "restore.env"
@@ -917,22 +1224,22 @@ class OperationsDocumentationTest(unittest.TestCase):
     def test_runbook_uses_hardened_helpers_before_compose_restore(self):
         text = OPERATIONS_DOC.read_text(encoding="utf-8")
         restore = text[text.index("## 8. 每季度隔离恢复演练") : text.index("## 9.")]
-        self.assertIn("offline_ops.py restore-preflight", restore)
-        preflight = restore.index("offline_ops.py restore-preflight")
-        compose = restore.index("docker compose")
+        self.assertIn("restore-preflight \"$release_ref\"", restore)
+        preflight = restore.index("restore-preflight \"$release_ref\"")
+        compose = restore.index("/usr/bin/docker compose")
         self.assertLess(preflight, compose)
-        self.assertIn("offline_ops.py seal-release", restore)
-        self.assertIn("safe_git ls-tree -r -z --full-tree", restore)
+        self.assertIn("seal-release \"$release_ref\"", restore)
+        self.assertIn("/usr/local/libexec/opswarden/release_export.py", restore)
+        self.assertIn("install-manifest \"$release_ref\"", restore)
         self.assertNotIn("safe_git worktree add", restore)
         self.assertNotIn("safe_git checkout", restore)
-        self.assertIn('safe_git verify-tag "refs/tags/$release_ref"', restore)
-        self.assertIn('rev-parse "${expected_revision}^{tree}"', restore)
 
     def test_runbook_uses_root_first_offline_revocation_helper(self):
         text = OPERATIONS_DOC.read_text(encoding="utf-8")
         revoke = text[text.index("## 9. 紧急吊销") : text.index("## 10.")]
+        self.assertIn("sudo -- /usr/bin/env -i", revoke)
         self.assertIn(
-            "sudo -- python3 /usr/local/libexec/opswarden/offline_revoke.py",
+            "/usr/bin/python3 -I /usr/local/libexec/opswarden/offline_revoke.py",
             revoke,
         )
         self.assertNotIn("sudo -u '#10001' python3 -", revoke)
@@ -941,44 +1248,61 @@ class OperationsDocumentationTest(unittest.TestCase):
         text = OPERATIONS_DOC.read_text(encoding="utf-8")
         self.assertIn("/usr/local/libexec/opswarden/offline_ops.py", text)
         self.assertIn("/usr/local/libexec/opswarden/offline_revoke.py", text)
+        self.assertIn("/usr/local/libexec/opswarden/release_export.py", text)
         self.assertNotIn(
             "sudo -- python3 /srv/opswarden-restore/source/deploy/offline_ops.py",
             text,
         )
         self.assertNotIn("sudo -- python3 deploy/offline_revoke.py", text)
 
-    def test_restore_uses_hermetic_git_and_private_operator_staging(self):
+    def test_restore_uses_sealed_export_and_private_operator_staging(self):
         text = OPERATIONS_DOC.read_text(encoding="utf-8")
         restore = text[text.index("## 8. 每季度隔离恢复演练") : text.index("## 9.")]
         for required in (
-            "env -i",
-            "GIT_NO_REPLACE_OBJECTS=1",
-            "GIT_CONFIG_NOSYSTEM=1",
-            "GIT_CONFIG_GLOBAL=/dev/null",
-            "GNUPGHOME=/etc/opswarden/release-gnupg",
-            "--no-replace-objects",
-            "safe.directory=/opt/opswarden",
-            "core.hooksPath=/dev/null",
-            "core.fsmonitor=false",
-            "core.attributesFile=/dev/null",
-            "diff.external=",
-            "fsck.skipList=/dev/null",
-            "receive.fsck.skipList=/dev/null",
-            "fetch.fsck.skipList=/dev/null",
-            "gpg.program=/usr/bin/gpg",
-            "gpg.minTrustLevel=fully",
+            "/usr/bin/env -i",
+            "/usr/bin/python3 -I",
+            "release_export.py",
+            "install-manifest",
+            "seal-release",
+            "seal-env",
+            "restore.sealed.env",
+            "/usr/bin/docker compose",
         ):
             self.assertIn(required, restore)
-        self.assertIn("refs/replace/", restore)
         self.assertIn("-m 0700", restore)
         self.assertIn("RESTORE_OPERATOR_UID", restore)
-        self.assertIn(
-            "/usr/local/libexec/opswarden/offline_ops.py restore-preflight",
-            restore,
-        )
         self.assertIn("/srv/opswarden-restore/restore.env", restore)
         self.assertNotIn("/srv/opswarden-restore/override.yaml", restore)
         self.assertNotIn("/srv/opswarden-restore-worktree", restore)
+        self.assertNotIn(
+            "--env-file /srv/opswarden-restore/restore.env", restore
+        )
+        for command in ("config --quiet", "up -d --build", "down"):
+            self.assertIn(command, restore)
+
+    def test_privileged_python_is_isolated_from_path_and_sitecustomize(self):
+        text = OPERATIONS_DOC.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"sudo(?: -u [^ ]+)? -- python3")
+        self.assertNotRegex(text, r"sudo(?: -u [^ ]+)? -- /usr/bin/python3(?! -I)")
+        malicious = tempfile.TemporaryDirectory()
+        try:
+            marker = Path(malicious.name) / "marker"
+            (Path(malicious.name) / "sitecustomize.py").write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
+            environment = {
+                "PATH": malicious.name,
+                "PYTHONPATH": malicious.name,
+            }
+            subprocess.run(
+                ["/usr/bin/python3", "-I", "-c", "pass"],
+                env=environment,
+                check=True,
+            )
+            self.assertFalse(marker.exists())
+        finally:
+            malicious.cleanup()
 
     def test_trust_anchor_install_streams_exact_blob_atomically(self):
         text = OPERATIONS_DOC.read_text(encoding="utf-8")

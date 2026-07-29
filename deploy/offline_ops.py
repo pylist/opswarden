@@ -21,9 +21,9 @@ PREUPGRADE_DIR = Path("/srv/opswarden/preupgrade")
 RESTORE_RELEASE = Path("/srv/opswarden-restore/release")
 RESTORE_RELEASE_MANIFEST = Path("/srv/opswarden-restore/release.manifest")
 RESTORE_STAGING = Path("/srv/opswarden-restore-staging/release")
-RESTORE_STAGING_MANIFEST = Path("/srv/opswarden-restore-staging/release.manifest")
 RESTORE_DB = Path("/srv/opswarden-restore/state/data/opswarden.db")
 RESTORE_ENV = Path("/srv/opswarden-restore/restore.env")
+RESTORE_SEALED_ENV = Path("/srv/opswarden-restore/restore.sealed.env")
 TRUSTED_OPS_HELPER = Path("/usr/local/libexec/opswarden/offline_ops.py")
 PRODUCTION_STATE = Path("/srv/opswarden/state")
 PRODUCTION_KEY = Path("/srv/opswarden/secrets/master.key")
@@ -35,8 +35,12 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_REVISION_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 RELEASE_TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+~-]{0,254}")
 SQLITE_BINARY = "/usr/bin/sqlite3"
-MANIFEST_HEADER = "OPSWARDEN-RELEASE-MANIFEST-V1"
+MANIFEST_HEADER = "OPSWARDEN-RELEASE-MANIFEST-V2"
 MANIFEST_PATH_RE = re.compile(r"[A-Za-z0-9._+@/-]{1,4096}")
+MAX_RELEASE_ENTRIES = 20_000
+MAX_RELEASE_DEPTH = 32
+MAX_RELEASE_FILE_SIZE = 64 * 1024 * 1024
+MAX_RELEASE_TOTAL_SIZE = 512 * 1024 * 1024
 RESTORE_ENV_KEYS = {
     "OPSWARDEN_HOSTNAME",
     "OPSWARDEN_TLS_EMAIL",
@@ -124,10 +128,10 @@ def assert_private_directory(
 
 
 def parse_environment_file(
-    path: Path, expected_uid: int, expected_gid: int
+    path: Path, expected_uid: int, expected_gid: int, expected_mode: int = PRIVATE_FILE_MODE
 ) -> dict[str, str]:
     metadata = assert_secure_regular(
-        path, expected_uid, expected_gid, PRIVATE_FILE_MODE
+        path, expected_uid, expected_gid, expected_mode
     )
     descriptor = os.open(
         path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -179,8 +183,9 @@ def verify_restore_environment(
     release_tag: str,
     expected_revision: str,
     expected_epoch: int,
+    expected_mode: int = PRIVATE_FILE_MODE,
 ) -> None:
-    values = parse_environment_file(path, expected_uid, expected_gid)
+    values = parse_environment_file(path, expected_uid, expected_gid, expected_mode)
     expected_version = release_tag[1:] if release_tag.startswith("v") else release_tag
     exact = {
         "OPSWARDEN_HOSTNAME": "localhost",
@@ -470,49 +475,64 @@ def _read_exact_regular(
     return bytes(chunks)
 
 
-def parse_release_manifest(
-    path: Path, expected_uid: int, expected_gid: int, expected_mode: int = 0o444
-) -> tuple[str, str, str, int, dict[str, tuple[int, int, str]]]:
-    raw = _read_exact_regular(
-        path, expected_uid, expected_gid, expected_mode, 8 * 1024 * 1024
-    )
+def parse_release_manifest_bytes(
+    raw: bytes,
+) -> tuple[dict[str, str], dict[str, tuple[int, str, int, str]]]:
     if b"\x00" in raw or b"\r" in raw or not raw.endswith(b"\n"):
         raise ValueError("release manifest encoding is invalid")
     try:
         lines = raw.decode("ascii").splitlines()
     except UnicodeDecodeError as error:
         raise ValueError("release manifest must be ASCII") from error
-    if len(lines) < 6 or lines[0] != MANIFEST_HEADER:
+    if len(lines) < 8 or lines[0] != MANIFEST_HEADER:
         raise ValueError("release manifest header is invalid")
     metadata: dict[str, str] = {}
-    for key, line in zip(("tag", "revision", "tree", "epoch"), lines[1:5]):
+    metadata_keys = (
+        "object-format",
+        "tag-name",
+        "tag-oid",
+        "commit-oid",
+        "tree-oid",
+        "epoch",
+    )
+    for key, line in zip(metadata_keys, lines[1:7]):
         prefix = f"{key} "
         if not line.startswith(prefix) or line == prefix:
             raise ValueError("release manifest metadata is invalid")
         metadata[key] = line[len(prefix) :]
-    tag = metadata["tag"]
-    revision = metadata["revision"]
-    tree = metadata["tree"]
+    object_format = metadata["object-format"]
+    tag = metadata["tag-name"]
+    tag_oid = metadata["tag-oid"]
+    revision = metadata["commit-oid"]
+    tree = metadata["tree-oid"]
     epoch_text = metadata["epoch"]
+    oid_length = 40 if object_format == "sha1" else 64 if object_format == "sha256" else 0
     if RELEASE_TAG_RE.fullmatch(tag) is None or tag.startswith("-"):
         raise ValueError("release manifest tag is invalid")
-    if GIT_REVISION_RE.fullmatch(revision) is None:
-        raise ValueError("release manifest revision is invalid")
-    if GIT_REVISION_RE.fullmatch(tree) is None:
-        raise ValueError("release manifest tree is invalid")
+    if any(
+        len(value) != oid_length or GIT_REVISION_RE.fullmatch(value) is None
+        for value in (tag_oid, revision, tree)
+    ):
+        raise ValueError("release manifest object ID is invalid")
     if not epoch_text.isdecimal():
         raise ValueError("release manifest epoch is invalid")
 
-    entries: dict[str, tuple[int, int, str]] = {}
+    entries: dict[str, tuple[int, str, int, str]] = {}
     previous_path = ""
-    for line in lines[5:]:
-        fields = line.split(" ", 3)
-        if len(fields) != 4:
+    total_size = 0
+    for line in lines[7:]:
+        fields = line.split(" ", 4)
+        if len(fields) != 5:
             raise ValueError("release manifest entry is invalid")
-        git_mode_text, size_text, digest, relative = fields
+        git_mode_text, blob_oid, size_text, digest, relative = fields
         if git_mode_text not in ("100644", "100755"):
             raise ValueError("release contains a symlink, submodule, or special mode")
-        if not size_text.isdecimal() or SHA256_RE.fullmatch(digest) is None:
+        if (
+            len(blob_oid) != oid_length
+            or GIT_REVISION_RE.fullmatch(blob_oid) is None
+            or not size_text.isdecimal()
+            or SHA256_RE.fullmatch(digest) is None
+        ):
             raise ValueError("release manifest size or digest is invalid")
         if (
             MANIFEST_PATH_RE.fullmatch(relative) is None
@@ -524,21 +544,99 @@ def parse_release_manifest(
             raise ValueError("release manifest path is unsafe")
         if relative <= previous_path or relative in entries:
             raise ValueError("release manifest paths must be unique and sorted")
-        for existing in entries:
-            if relative.startswith(existing + "/") or existing.startswith(relative + "/"):
-                raise ValueError("release manifest has a file/directory collision")
+        depth = relative.count("/") + 1
+        size = int(size_text)
+        if depth > MAX_RELEASE_DEPTH or size > MAX_RELEASE_FILE_SIZE:
+            raise ValueError("release manifest path or file exceeds limits")
+        total_size += size
+        if len(entries) >= MAX_RELEASE_ENTRIES or total_size > MAX_RELEASE_TOTAL_SIZE:
+            raise ValueError("release manifest exceeds bounded limits")
         previous_path = relative
-        entries[relative] = (int(git_mode_text, 8), int(size_text), digest)
+        entries[relative] = (int(git_mode_text, 8), blob_oid, size, digest)
     if not entries:
         raise ValueError("release manifest has no files")
-    return tag, revision, tree, int(epoch_text), entries
+    _canonical_tree_oid(entries, object_format, tree)
+    return metadata, entries
 
 
-def _open_private_staged_file(
+def parse_release_manifest(
+    path: Path, expected_uid: int, expected_gid: int, expected_mode: int = 0o444
+) -> tuple[dict[str, str], dict[str, tuple[int, str, int, str]]]:
+    raw = _read_exact_regular(
+        path, expected_uid, expected_gid, expected_mode, 8 * 1024 * 1024
+    )
+    return parse_release_manifest_bytes(raw)
+
+
+def _git_object_oid(object_type: str, raw: bytes, object_format: str) -> str:
+    digest = hashlib.sha1() if object_format == "sha1" else hashlib.sha256()
+    digest.update(
+        object_type.encode("ascii")
+        + b" "
+        + str(len(raw)).encode("ascii")
+        + b"\0"
+        + raw
+    )
+    return digest.hexdigest()
+
+
+def _canonical_tree_oid(
+    entries: dict[str, tuple[int, str, int, str]],
+    object_format: str,
+    expected_tree: str,
+) -> str:
+    root: dict[str, object] = {}
+    for relative, entry in entries.items():
+        node = root
+        parts = relative.split("/")
+        for component in parts[:-1]:
+            existing = node.setdefault(component, {})
+            if not isinstance(existing, dict):
+                raise ValueError("release manifest has a path collision")
+            node = existing
+        if parts[-1] in node:
+            raise ValueError("release manifest has a duplicate path")
+        node[parts[-1]] = entry
+
+    oid_size = 20 if object_format == "sha1" else 32
+
+    def calculate(node: dict[str, object]) -> str:
+        records: list[tuple[bytes, bytes]] = []
+        for name, value in node.items():
+            encoded = name.encode("ascii")
+            if isinstance(value, dict):
+                child_oid = calculate(value)
+                records.append((encoded + b"/", b"40000 " + encoded + b"\0" + bytes.fromhex(child_oid)))
+            else:
+                mode, blob_oid, _, _ = value
+                if len(bytes.fromhex(blob_oid)) != oid_size:
+                    raise ValueError("release manifest blob ID has wrong width")
+                records.append(
+                    (
+                        encoded,
+                        f"{mode:o}".encode("ascii")
+                        + b" "
+                        + encoded
+                        + b"\0"
+                        + bytes.fromhex(blob_oid),
+                    )
+                )
+        raw = b"".join(record for _, record in sorted(records, key=lambda item: item[0]))
+        return _git_object_oid("tree", raw, object_format)
+
+    actual = calculate(root)
+    if not hmac.compare_digest(actual, expected_tree):
+        raise RuntimeError("manifest entries do not reconstruct the signed tree")
+    return actual
+
+
+def _open_beneath_regular(
     root_descriptor: int,
     relative: str,
     expected_uid: int,
     expected_gid: int,
+    directory_mode: int,
+    file_mode: int,
 ) -> tuple[int, os.stat_result]:
     directory_descriptor = os.dup(root_descriptor)
     try:
@@ -558,7 +656,7 @@ def _open_private_staged_file(
                 not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != expected_uid
                 or metadata.st_gid != expected_gid
-                or stat.S_IMODE(metadata.st_mode) != 0o700
+                or stat.S_IMODE(metadata.st_mode) != directory_mode
             ):
                 raise PermissionError("staged path ancestor is not private")
         descriptor = os.open(
@@ -573,7 +671,7 @@ def _open_private_staged_file(
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != expected_uid
             or metadata.st_gid != expected_gid
-            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or stat.S_IMODE(metadata.st_mode) != file_mode
         ):
             os.close(descriptor)
             raise PermissionError("staged release file is not a private regular file")
@@ -582,11 +680,83 @@ def _open_private_staged_file(
         os.close(directory_descriptor)
 
 
+def _enumerate_tree_fd(
+    root_descriptor: int,
+    expected_uid: int,
+    expected_gid: int,
+    directory_mode: int,
+    file_mode: int,
+) -> tuple[set[str], set[str]]:
+    files: set[str] = set()
+    directories: set[str] = set()
+    seen_entries = 0
+
+    def walk(descriptor: int, prefix: str, depth: int) -> None:
+        nonlocal seen_entries
+        if depth > MAX_RELEASE_DEPTH:
+            raise ValueError("release filesystem is too deep")
+        names = os.listdir(descriptor)
+        seen_entries += len(names)
+        if seen_entries > MAX_RELEASE_ENTRIES * 2:
+            raise ValueError("release filesystem has too many entries")
+        for name in names:
+            try:
+                name.encode("ascii")
+            except UnicodeEncodeError as error:
+                raise ValueError("release filesystem path is not ASCII") from error
+            if name in ("", ".", "..", ".git") or "/" in name:
+                raise ValueError("release filesystem path is unsafe")
+            relative = f"{prefix}/{name}" if prefix else name
+            metadata = os.stat(
+                name, dir_fd=descriptor, follow_symlinks=False
+            )
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("release filesystem contains a symlink")
+            if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid:
+                raise PermissionError("release filesystem ownership is invalid")
+            if stat.S_ISDIR(metadata.st_mode):
+                if stat.S_IMODE(metadata.st_mode) != directory_mode:
+                    raise PermissionError("release directory mode is invalid")
+                child = os.open(
+                    name,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+                try:
+                    opened = os.fstat(child)
+                    if (
+                        (opened.st_dev, opened.st_ino)
+                        != (metadata.st_dev, metadata.st_ino)
+                        or not stat.S_ISDIR(opened.st_mode)
+                    ):
+                        raise RuntimeError("release directory changed while opening")
+                    directories.add(relative)
+                    walk(child, relative, depth + 1)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(metadata.st_mode):
+                if (
+                    stat.S_IMODE(metadata.st_mode) != file_mode
+                    and not (
+                        file_mode == -1
+                        and stat.S_IMODE(metadata.st_mode) in (0o444, 0o555)
+                    )
+                ):
+                    raise PermissionError("release file mode is invalid")
+                files.add(relative)
+            else:
+                raise ValueError("release filesystem contains a special file")
+
+    walk(root_descriptor, "", 0)
+    return files, directories
+
+
 def seal_release(
     staging_root: Path,
-    staging_manifest: Path,
     destination_root: Path,
-    destination_manifest: Path,
+    sealed_manifest: Path,
     expected_tag: str,
     expected_revision: str,
     expected_tree: str,
@@ -597,21 +767,33 @@ def seal_release(
     """Copy a manifest-exact unprivileged export into an immutable root release."""
     staging_root = Path(staging_root)
     destination_root = Path(destination_root)
-    destination_manifest = Path(destination_manifest)
+    sealed_manifest = Path(sealed_manifest)
     if (
         not staging_root.is_absolute()
-        or staging_root.resolve(strict=True) != staging_root
+        or Path(os.path.normpath(str(staging_root))) != staging_root
         or not destination_root.is_absolute()
-        or destination_root.parent.resolve(strict=True) != destination_root.parent
-        or destination_manifest.parent != destination_root.parent
+        or Path(os.path.normpath(str(destination_root.parent)))
+        != destination_root.parent
         or os.path.lexists(destination_root)
-        or os.path.lexists(destination_manifest)
     ):
         raise ValueError("release sealing paths are unsafe or already exist")
-    assert_private_directory(staging_root, operator_uid, operator_gid)
-    tag, revision, tree, epoch, entries = parse_release_manifest(
-        staging_manifest, operator_uid, operator_gid, 0o400
+    staging_metadata = os.lstat(staging_root)
+    if (
+        stat.S_ISLNK(staging_metadata.st_mode)
+        or not stat.S_ISDIR(staging_metadata.st_mode)
+        or staging_metadata.st_uid != operator_uid
+        or staging_metadata.st_gid != operator_gid
+        or stat.S_IMODE(staging_metadata.st_mode) != 0o700
+    ):
+        raise PermissionError("staging root is not the private operator directory")
+    metadata_values, entries = parse_release_manifest(
+        sealed_manifest, 0, 0, 0o444
     )
+    tag = metadata_values["tag-name"]
+    revision = metadata_values["commit-oid"]
+    tree = metadata_values["tree-oid"]
+    epoch = int(metadata_values["epoch"])
+    object_format = metadata_values["object-format"]
     if (
         not hmac.compare_digest(tag, expected_tag)
         or not hmac.compare_digest(revision, expected_revision)
@@ -624,33 +806,6 @@ def seal_release(
     for relative in entries:
         parts = relative.split("/")
         expected_directories.update("/".join(parts[:index]) for index in range(1, len(parts)))
-    observed_files: set[str] = set()
-    observed_directories: set[str] = set()
-    stack = [(staging_root, "")]
-    while stack:
-        directory, prefix = stack.pop()
-        with os.scandir(directory) as children:
-            for child in children:
-                relative = f"{prefix}/{child.name}" if prefix else child.name
-                metadata = child.stat(follow_symlinks=False)
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise ValueError("staged release contains a symlink")
-                if metadata.st_uid != operator_uid or metadata.st_gid != operator_gid:
-                    raise PermissionError("staged release ownership is invalid")
-                if stat.S_ISDIR(metadata.st_mode):
-                    if stat.S_IMODE(metadata.st_mode) != 0o700:
-                        raise PermissionError("staged release directory must be 0700")
-                    observed_directories.add(relative)
-                    stack.append((Path(child.path), relative))
-                elif stat.S_ISREG(metadata.st_mode):
-                    if stat.S_IMODE(metadata.st_mode) != 0o600:
-                        raise PermissionError("staged release file must be 0600")
-                    observed_files.add(relative)
-                else:
-                    raise ValueError("staged release contains a special file")
-    if observed_files != set(entries) or observed_directories != expected_directories:
-        raise RuntimeError("staged release has missing or unexpected paths")
-
     staging_descriptor = os.open(
         staging_root,
         os.O_RDONLY
@@ -668,12 +823,14 @@ def seal_release(
     ):
         os.close(staging_descriptor)
         raise RuntimeError("staging root changed while opening")
+    observed_files, observed_directories = _enumerate_tree_fd(
+        staging_descriptor, operator_uid, operator_gid, 0o700, 0o600
+    )
+    if observed_files != set(entries) or observed_directories != expected_directories:
+        os.close(staging_descriptor)
+        raise RuntimeError("staged release has missing or unexpected paths")
     temporary_root = Path(
         tempfile.mkdtemp(prefix=".release.", dir=destination_root.parent)
-    )
-    temporary_manifest_fd = -1
-    temporary_manifest = destination_manifest.parent / (
-        f".{destination_manifest.name}.{os.getpid()}"
     )
     try:
         os.chown(temporary_root, 0, 0)
@@ -682,9 +839,20 @@ def seal_release(
             directory = temporary_root / relative
             directory.mkdir(mode=0o700)
             os.chown(directory, 0, 0)
-        for relative, (git_mode, expected_size, expected_digest) in entries.items():
-            descriptor, opened = _open_private_staged_file(
-                staging_descriptor, relative, operator_uid, operator_gid
+        actual_entries: dict[str, tuple[int, str, int, str]] = {}
+        for relative, (
+            git_mode,
+            expected_blob_oid,
+            expected_size,
+            expected_digest,
+        ) in entries.items():
+            descriptor, opened = _open_beneath_regular(
+                staging_descriptor,
+                relative,
+                operator_uid,
+                operator_gid,
+                0o700,
+                0o600,
             )
             target = temporary_root / relative
             target_descriptor = os.open(
@@ -723,6 +891,22 @@ def seal_release(
                     digest.hexdigest(), expected_digest
                 ):
                     raise RuntimeError("staged file differs from signed raw blob")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                raw = bytearray()
+                while len(raw) < expected_size:
+                    chunk = os.read(descriptor, expected_size - len(raw))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                actual_blob_oid = _git_object_oid("blob", bytes(raw), object_format)
+                if not hmac.compare_digest(actual_blob_oid, expected_blob_oid):
+                    raise RuntimeError("staged file Git blob ID differs from signed tree")
+                actual_entries[relative] = (
+                    git_mode,
+                    actual_blob_oid,
+                    expected_size,
+                    digest.hexdigest(),
+                )
                 os.fchown(target_descriptor, 0, 0)
                 os.fchmod(target_descriptor, 0o555 if git_mode == 0o100755 else 0o444)
                 os.fsync(target_descriptor)
@@ -734,24 +918,7 @@ def seal_release(
         ):
             os.chmod(temporary_root / relative, 0o555)
         os.chmod(temporary_root, 0o555)
-
-        manifest_raw = _read_exact_regular(
-            staging_manifest, operator_uid, operator_gid, 0o400, 8 * 1024 * 1024
-        )
-        temporary_manifest_fd = os.open(
-            temporary_manifest,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        view = memoryview(manifest_raw)
-        while view:
-            view = view[os.write(temporary_manifest_fd, view) :]
-        os.fchown(temporary_manifest_fd, 0, 0)
-        os.fchmod(temporary_manifest_fd, 0o444)
-        os.fsync(temporary_manifest_fd)
-        os.close(temporary_manifest_fd)
-        temporary_manifest_fd = -1
-        os.replace(temporary_manifest, destination_manifest)
+        _canonical_tree_oid(actual_entries, object_format, expected_tree)
         os.replace(temporary_root, destination_root)
         parent_descriptor = os.open(
             destination_root.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -762,17 +929,13 @@ def seal_release(
             os.close(parent_descriptor)
         verify_release_filesystem(
             destination_root,
-            destination_manifest,
+            sealed_manifest,
             expected_tag,
             expected_revision,
             0,
             0,
         )
     except BaseException:
-        if temporary_manifest_fd >= 0:
-            os.close(temporary_manifest_fd)
-        if os.path.lexists(temporary_manifest) and not temporary_manifest.is_symlink():
-            temporary_manifest.unlink()
         # The private temporary is retained on failure if nonempty for forensic review.
         raise
     finally:
@@ -790,7 +953,7 @@ def verify_release_filesystem(
     release_root = Path(release_root)
     if (
         not release_root.is_absolute()
-        or release_root.resolve(strict=True) != release_root
+        or Path(os.path.normpath(str(release_root))) != release_root
     ):
         raise ValueError("release root must be an existing canonical path")
     root_metadata = os.lstat(release_root)
@@ -802,9 +965,13 @@ def verify_release_filesystem(
         or stat.S_IMODE(root_metadata.st_mode) != 0o555
     ):
         raise PermissionError("release root must be immutable and trust-owned")
-    tag, revision, _, epoch, entries = parse_release_manifest(
+    metadata_values, entries = parse_release_manifest(
         manifest_path, expected_uid, expected_gid
     )
+    tag = metadata_values["tag-name"]
+    revision = metadata_values["commit-oid"]
+    epoch = int(metadata_values["epoch"])
+    object_format = metadata_values["object-format"]
     if not hmac.compare_digest(tag, expected_tag):
         raise RuntimeError("release manifest tag does not match the recorded tag")
     if not hmac.compare_digest(revision, expected_revision):
@@ -814,45 +981,213 @@ def verify_release_filesystem(
     for relative in entries:
         parts = relative.split("/")
         expected_directories.update("/".join(parts[:index]) for index in range(1, len(parts)))
-    observed_files: set[str] = set()
-    observed_directories: set[str] = set()
-    stack = [(release_root, "")]
-    while stack:
-        directory, prefix = stack.pop()
-        with os.scandir(directory) as children:
-            for child in children:
-                relative = f"{prefix}/{child.name}" if prefix else child.name
-                child_metadata = child.stat(follow_symlinks=False)
-                if stat.S_ISLNK(child_metadata.st_mode):
-                    raise ValueError("release filesystem contains a symlink")
-                if stat.S_ISDIR(child_metadata.st_mode):
-                    if (
-                        child_metadata.st_uid != expected_uid
-                        or child_metadata.st_gid != expected_gid
-                        or stat.S_IMODE(child_metadata.st_mode) != 0o555
-                    ):
-                        raise PermissionError("release directory is not immutable")
-                    observed_directories.add(relative)
-                    stack.append((Path(child.path), relative))
-                elif stat.S_ISREG(child_metadata.st_mode):
-                    observed_files.add(relative)
-                else:
-                    raise ValueError("release filesystem contains a special file")
+    root_descriptor = os.open(
+        release_root,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    opened_root = os.fstat(root_descriptor)
+    if (opened_root.st_dev, opened_root.st_ino) != (
+        root_metadata.st_dev,
+        root_metadata.st_ino,
+    ):
+        os.close(root_descriptor)
+        raise RuntimeError("release root changed while opening")
+    observed_files, observed_directories = _enumerate_tree_fd(
+        root_descriptor, expected_uid, expected_gid, 0o555, -1
+    )
     if observed_files != set(entries) or observed_directories != expected_directories:
+        os.close(root_descriptor)
         raise RuntimeError("release filesystem has missing or unexpected paths")
 
-    for relative, (git_mode, expected_size, expected_digest) in entries.items():
-        path = release_root / relative
+    actual_entries: dict[str, tuple[int, str, int, str]] = {}
+    for relative, (
+        git_mode,
+        expected_blob_oid,
+        expected_size,
+        expected_digest,
+    ) in entries.items():
         required_mode = 0o555 if git_mode == 0o100755 else 0o444
-        raw = _read_exact_regular(
-            path, expected_uid, expected_gid, required_mode, expected_size
+        descriptor, opened = _open_beneath_regular(
+            root_descriptor,
+            relative,
+            expected_uid,
+            expected_gid,
+            0o555,
+            required_mode,
         )
-        if len(raw) != expected_size:
-            raise RuntimeError("release file size does not match manifest")
-        actual_digest = hashlib.sha256(raw).hexdigest()
-        if not hmac.compare_digest(actual_digest, expected_digest):
-            raise RuntimeError("release file digest does not match manifest")
+        try:
+            if opened.st_size != expected_size:
+                raise RuntimeError("release file size does not match manifest")
+            raw = bytearray()
+            while len(raw) < expected_size:
+                chunk = os.read(descriptor, expected_size - len(raw))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            if len(raw) != expected_size:
+                raise RuntimeError("release file is truncated")
+            actual_digest = hashlib.sha256(raw).hexdigest()
+            actual_blob_oid = _git_object_oid("blob", bytes(raw), object_format)
+            if (
+                not hmac.compare_digest(actual_digest, expected_digest)
+                or not hmac.compare_digest(actual_blob_oid, expected_blob_oid)
+            ):
+                raise RuntimeError("release file does not match signed blob")
+            actual_entries[relative] = (
+                git_mode,
+                actual_blob_oid,
+                expected_size,
+                actual_digest,
+            )
+        finally:
+            os.close(descriptor)
+    os.close(root_descriptor)
+    _canonical_tree_oid(
+        actual_entries, object_format, metadata_values["tree-oid"]
+    )
     return epoch
+
+
+def install_release_manifest(
+    source_descriptor: int,
+    destination: Path,
+    expected_tag: str,
+    expected_revision: str,
+) -> tuple[str, int]:
+    raw = bytearray()
+    while len(raw) <= 8 * 1024 * 1024:
+        chunk = os.read(
+            source_descriptor, min(1024 * 1024, 8 * 1024 * 1024 + 1 - len(raw))
+        )
+        if not chunk:
+            break
+        raw.extend(chunk)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError("release manifest stream exceeds limit")
+    metadata, _ = parse_release_manifest_bytes(bytes(raw))
+    if (
+        metadata["tag-name"] != expected_tag
+        or metadata["commit-oid"] != expected_revision
+    ):
+        raise RuntimeError("manifest stream does not match recorded release")
+    destination = Path(destination)
+    if destination != RESTORE_RELEASE_MANIFEST or os.path.lexists(destination):
+        raise ValueError("sealed manifest destination is invalid or already exists")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".release.manifest.", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        view = memoryview(raw)
+        while view:
+            view = view[os.write(descriptor, view) :]
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, destination)
+        parent = os.open(
+            destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if os.path.lexists(temporary):
+            temporary.unlink()
+        raise
+    return metadata["tree-oid"], int(metadata["epoch"])
+
+
+def seal_restore_environment(
+    source: Path,
+    destination: Path,
+    operator_uid: int,
+    operator_gid: int,
+    release_tag: str,
+    expected_revision: str,
+    expected_epoch: int,
+) -> None:
+    source_metadata = assert_secure_regular(
+        source, operator_uid, operator_gid, PRIVATE_FILE_MODE
+    )
+    source_descriptor = os.open(
+        source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    )
+    if destination != RESTORE_SEALED_ENV or os.path.lexists(destination):
+        os.close(source_descriptor)
+        raise ValueError("sealed restore environment destination is invalid")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".restore.sealed.env.", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        opened = os.fstat(source_descriptor)
+        if (opened.st_dev, opened.st_ino) != (
+            source_metadata.st_dev,
+            source_metadata.st_ino,
+        ):
+            raise RuntimeError("restore environment changed while opening")
+        total = 0
+        while total <= 16 * 1024:
+            chunk = os.read(source_descriptor, min(4096, 16 * 1024 + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(descriptor, view) :]
+        if total > 16 * 1024:
+            raise ValueError("restore environment exceeds limit")
+        after = os.fstat(source_descriptor)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ):
+            raise RuntimeError("restore environment changed while sealing")
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        verify_restore_environment(
+            temporary,
+            0,
+            0,
+            release_tag,
+            expected_revision,
+            expected_epoch,
+            0o444,
+        )
+        os.replace(temporary, destination)
+        parent = os.open(
+            destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if os.path.lexists(temporary):
+            temporary.unlink()
+        raise
+    finally:
+        os.close(source_descriptor)
 
 
 def restore_preflight(
@@ -891,6 +1226,7 @@ def restore_preflight(
             release_tag,
             expected_revision,
             release_epoch,
+            0o444 if release_uid == 0 else PRIVATE_FILE_MODE,
         )
     assert_secure_regular(
         Path(snapshot), expected_uid, expected_gid, PRIVATE_FILE_MODE
@@ -920,18 +1256,9 @@ def restore_preflight_command(
     release_tag: str,
     expected_revision: str,
     expected_sha256: str,
-    env_path: str,
-    operator_uid: str,
-    operator_gid: str,
 ) -> None:
     if os.geteuid() != 0:
         raise PermissionError("restore preflight must run as root")
-    if not operator_uid.isdecimal() or not operator_gid.isdecimal():
-        raise ValueError("restore operator UID and GID must be decimal")
-    if int(operator_uid) == 0:
-        raise PermissionError("restore operator UID must be non-root")
-    if Path(env_path) != RESTORE_ENV:
-        raise ValueError("restore preflight requires the fixed Compose env file")
     restore_preflight(
         RESTORE_RELEASE,
         RESTORE_RELEASE_MANIFEST,
@@ -941,9 +1268,9 @@ def restore_preflight_command(
         expected_sha256,
         OPSWARDEN_UID,
         OPSWARDEN_GID,
-        Path(env_path),
-        int(operator_uid),
-        int(operator_gid),
+        RESTORE_SEALED_ENV,
+        0,
+        0,
         0,
         0,
     )
@@ -953,8 +1280,6 @@ def restore_preflight_command(
 def seal_release_command(
     release_tag: str,
     expected_revision: str,
-    expected_tree: str,
-    expected_epoch: str,
     operator_uid: str,
     operator_gid: str,
 ) -> None:
@@ -962,27 +1287,66 @@ def seal_release_command(
         raise PermissionError("release sealing must run as root")
     if (
         GIT_REVISION_RE.fullmatch(expected_revision) is None
-        or GIT_REVISION_RE.fullmatch(expected_tree) is None
-        or not expected_epoch.isdecimal()
         or not operator_uid.isdecimal()
         or not operator_gid.isdecimal()
     ):
         raise ValueError("release sealing metadata is invalid")
     if int(operator_uid) == 0:
         raise PermissionError("release staging owner must be non-root")
+    sealed_metadata, _ = parse_release_manifest(RESTORE_RELEASE_MANIFEST, 0, 0)
+    expected_tree = sealed_metadata["tree-oid"]
+    expected_epoch = int(sealed_metadata["epoch"])
     seal_release(
         RESTORE_STAGING,
-        RESTORE_STAGING_MANIFEST,
         RESTORE_RELEASE,
         RESTORE_RELEASE_MANIFEST,
         release_tag,
         expected_revision,
         expected_tree,
-        int(expected_epoch),
+        expected_epoch,
         int(operator_uid),
         int(operator_gid),
     )
     print("sealed release: raw manifest and immutable filesystem verified")
+
+
+def install_manifest_command(release_tag: str, expected_revision: str) -> None:
+    if os.geteuid() != 0:
+        raise PermissionError("manifest installation must run as root")
+    install_release_manifest(
+        sys.stdin.buffer.fileno(),
+        RESTORE_RELEASE_MANIFEST,
+        release_tag,
+        expected_revision,
+    )
+    print("sealed manifest: signed object graph installed", file=sys.stderr)
+
+
+def seal_env_command(
+    release_tag: str,
+    expected_revision: str,
+    operator_uid: str,
+    operator_gid: str,
+) -> None:
+    if os.geteuid() != 0:
+        raise PermissionError("restore environment sealing must run as root")
+    if (
+        not operator_uid.isdecimal()
+        or not operator_gid.isdecimal()
+        or int(operator_uid) == 0
+    ):
+        raise ValueError("restore environment sealing metadata is invalid")
+    sealed_metadata, _ = parse_release_manifest(RESTORE_RELEASE_MANIFEST, 0, 0)
+    seal_restore_environment(
+        RESTORE_ENV,
+        RESTORE_SEALED_ENV,
+        int(operator_uid),
+        int(operator_gid),
+        release_tag,
+        expected_revision,
+        int(sealed_metadata["epoch"]),
+    )
+    print("sealed restore environment: effective Compose inputs verified")
 
 
 def main(argv: list[str]) -> int:
@@ -990,21 +1354,26 @@ def main(argv: list[str]) -> int:
         verify_trusted_helper(Path(__file__), TRUSTED_OPS_HELPER)
         if argv == ["snapshot"]:
             snapshot_command()
-        elif len(argv) == 7 and argv[0] == "restore-preflight":
+        elif len(argv) == 4 and argv[0] == "restore-preflight":
             restore_preflight_command(
-                argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]
+                argv[1], argv[2], argv[3]
             )
-        elif len(argv) == 7 and argv[0] == "seal-release":
+        elif len(argv) == 5 and argv[0] == "seal-release":
             seal_release_command(
-                argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]
+                argv[1], argv[2], argv[3], argv[4]
             )
+        elif len(argv) == 3 and argv[0] == "install-manifest":
+            install_manifest_command(argv[1], argv[2])
+        elif len(argv) == 5 and argv[0] == "seal-env":
+            seal_env_command(argv[1], argv[2], argv[3], argv[4])
         else:
             raise ValueError(
                 "usage: offline_ops.py snapshot | "
-                "seal-release RELEASE_TAG EXPECTED_REVISION EXPECTED_TREE "
-                "EXPECTED_EPOCH OPERATOR_UID OPERATOR_GID | "
-                "restore-preflight RELEASE_TAG EXPECTED_REVISION RECORDED_SHA256 "
-                "ENV_FILE OPERATOR_UID OPERATOR_GID"
+                "install-manifest RELEASE_TAG EXPECTED_REVISION | "
+                "seal-release RELEASE_TAG EXPECTED_REVISION "
+                "OPERATOR_UID OPERATOR_GID | "
+                "seal-env RELEASE_TAG EXPECTED_REVISION OPERATOR_UID OPERATOR_GID | "
+                "restore-preflight RELEASE_TAG EXPECTED_REVISION RECORDED_SHA256"
             )
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"offline operation refused: {error}", file=sys.stderr)

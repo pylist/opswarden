@@ -103,7 +103,7 @@ verified_blob_sha256() {
   local object_id="$1" object_size
   object_size="$(safe_git cat-file -s "$object_id")"
   safe_git cat-file blob "$object_id" |
-    env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -c '
+    env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -I -c '
 import hashlib, sys
 object_id, size = sys.argv[1], int(sys.argv[2])
 raw = sys.stdin.buffer.read(size + 1)
@@ -142,8 +142,8 @@ install_signed_blob() {
   expected_size="$(safe_git cat-file -s "$object_id")"
   expected_sha256="$(verified_blob_sha256 "$object_id")"
   safe_git cat-file blob "$object_id" |
-    sudo env -i PATH=/usr/bin:/bin LC_ALL=C \
-      /usr/bin/python3 -c '
+    sudo /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+      /usr/bin/python3 -I -c '
 import hashlib, os, pathlib, stat, sys, tempfile
 destination = pathlib.Path(sys.argv[1])
 expected = sys.argv[2]
@@ -194,16 +194,20 @@ finally:
 }
 ops_blob="$(safe_git rev-parse "${expected_revision}:deploy/offline_ops.py")"
 revoke_blob="$(safe_git rev-parse "${expected_revision}:deploy/offline_revoke.py")"
+export_blob="$(safe_git rev-parse "${expected_revision}:deploy/release_export.py")"
 install_signed_blob "$ops_blob" \
   /usr/local/libexec/opswarden/offline_ops.py
 install_signed_blob "$revoke_blob" \
   /usr/local/libexec/opswarden/offline_revoke.py
+install_signed_blob "$export_blob" \
+  /usr/local/libexec/opswarden/release_export.py
 sudo stat -c '%U:%G %a %n' \
   /usr/local/libexec/opswarden/offline_ops.py \
-  /usr/local/libexec/opswarden/offline_revoke.py
+  /usr/local/libexec/opswarden/offline_revoke.py \
+  /usr/local/libexec/opswarden/release_export.py
 ```
 
-预期两行均为 `root:root 755`。辅助程序启动时还会自行拒绝符号链接、非普通文件、
+预期三行均为 `root:root 755`。辅助程序启动时还会自行拒绝符号链接、非普通文件、
 非固定路径、非 root 所有或 group/other 可写的副本。不能先 `cmp` worktree 文件再
 `sudo install` 同一路径；即使该路径在比较后被并发替换，以上安装器读取的仍是
 `cat-file blob <OID>` 的单一对象流。
@@ -382,7 +386,9 @@ JWT 写入命令参数、历史或长期文件。
 set -euo pipefail
 cd /opt/opswarden
 docker compose --env-file deploy/.env -f deploy/compose.yaml stop opswarden
-sudo -u '#10001' -- python3 \
+sudo -u '#10001' -- /usr/bin/env -i \
+  HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+  /usr/bin/python3 -I \
   /usr/local/libexec/opswarden/offline_ops.py snapshot
 ```
 
@@ -447,12 +453,12 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml \
 schema 兼容的签名 release tag，以及该 tag 对应的完整 HEAD revision；缺少任一项
 就拒绝恢复。
 
-先在非 root 操作员 shell 中重新定义第 1 节完全相同的 `SAFE_GIT_CONFIG` 和
-`safe_git`，验证签名 tag 与完整 revision；禁止 checkout/worktree-add。随后从已验证
-commit 的原始 blob 建立严格 manifest，并将 archive 仅解到操作员私有 staging。
-`.gitattributes` 的 `export-ignore`/`export-subst` 即使影响 archive，也会在 root
-seal 时因 missing/unexpected/size/SHA-256 不符而失败。以下三个占位值必须从受保护的
-备份/发布记录中逐字替换：
+使用已安装的 root-owned exporter，但以非 root 操作员身份和 isolated Python
+执行。exporter 自己建立 hermetic Git 环境，验证 captured annotated tag OID 的
+签名，逐个读取并立即重算 tag/commit/tree/blob 的 Git object ID，递归解析 canonical
+tree，并从同一批已验证 blob 建立私有 staging。完成的 V2 manifest（object format、
+tag/commit/tree/blob OID、mode、size、SHA-256、raw path）只经 stdout pipe 进入固定
+root installer，不落到 operator-writable 文件：
 
 ```bash
 set -euo pipefail
@@ -479,109 +485,22 @@ esac
   echo "隔离恢复目录已存在；先人工调查并按本节清理流程处理" >&2
   exit 1
 }
-SAFE_GIT_CONFIG=(
-  -c safe.directory=/opt/opswarden
-  -c core.hooksPath=/dev/null
-  -c core.fsmonitor=false
-  -c core.attributesFile=/dev/null
-  -c diff.external=
-  -c fsck.skipList=/dev/null
-  -c receive.fsck.skipList=/dev/null
-  -c fetch.fsck.skipList=/dev/null
-  -c gpg.format=openpgp
-  -c gpg.program=/usr/bin/gpg
-  -c gpg.minTrustLevel=fully
-)
-safe_git() {
-  env -i \
-    HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
-    GIT_NO_REPLACE_OBJECTS=1 \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    GNUPGHOME=/etc/opswarden/release-gnupg \
-    /usr/bin/git --no-replace-objects \
-    "${SAFE_GIT_CONFIG[@]}" -C /opt/opswarden "$@"
-}
-verified_blob_sha256() {
-  local object_id="$1" object_size
-  object_size="$(safe_git cat-file -s "$object_id")"
-  safe_git cat-file blob "$object_id" |
-    env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -c '
-import hashlib, sys
-object_id, size = sys.argv[1], int(sys.argv[2])
-raw = sys.stdin.buffer.read(size + 1)
-if len(raw) != size:
-    raise SystemExit("raw blob size mismatch")
-git_hash = hashlib.sha1() if len(object_id) == 40 else hashlib.sha256()
-git_hash.update(b"blob " + str(size).encode("ascii") + b"\0" + raw)
-if git_hash.hexdigest() != object_id:
-    raise SystemExit("raw blob object ID mismatch")
-print(hashlib.sha256(raw).hexdigest())
-' "$object_id" "$object_size"
-}
-[ -z "$(safe_git for-each-ref --format='%(refname)' refs/replace/)" ] || {
-  echo "source repository 存在 refs/replace；拒绝恢复" >&2
-  exit 1
-}
-[ "$(safe_git cat-file -t "refs/tags/$release_ref")" = tag ] || {
-  echo "release 必须是 annotated tag" >&2
-  exit 1
-}
-safe_git verify-tag "refs/tags/$release_ref"
-tag_revision="$(safe_git rev-parse "refs/tags/${release_ref}^{commit}")"
-[ "$tag_revision" = "$expected_revision" ] || {
-  echo "签名 tag 与备份记录 revision 不一致" >&2
-  exit 1
-}
-safe_git fsck --strict --no-reflogs "$expected_revision"
-tag_tree="$(safe_git rev-parse "${expected_revision}^{tree}")"
-expected_epoch="$(safe_git show -s --format=%ct "$expected_revision")"
 sudo install -d -o root -g root -m 0755 /srv/opswarden-restore
 sudo install -d -o "$RESTORE_OPERATOR_UID" -g "$RESTORE_OPERATOR_GID" -m 0700 \
   /srv/opswarden-restore-staging
 install -d -m 0700 /srv/opswarden-restore-staging/release
-safe_git archive --format=tar "$expected_revision" |
-  /usr/bin/tar -x -C /srv/opswarden-restore-staging/release \
-    --no-same-owner --no-same-permissions
-/usr/bin/find /srv/opswarden-restore-staging/release -type d -exec chmod 0700 {} +
-/usr/bin/find /srv/opswarden-restore-staging/release -type f -exec chmod 0600 {} +
-manifest=/srv/opswarden-restore-staging/release.manifest
-{
-  printf '%s\n' OPSWARDEN-RELEASE-MANIFEST-V1
-  printf 'tag %s\nrevision %s\ntree %s\nepoch %s\n' \
-    "$release_ref" "$expected_revision" "$tag_tree" "$expected_epoch"
-  while IFS= read -r -d '' mode &&
-        IFS= read -r -d '' object_type &&
-        IFS= read -r -d '' object_id &&
-        IFS= read -r -d '' object_path; do
-    case "$mode:$object_type" in
-      100644:blob|100755:blob) ;;
-      *) echo "release 含 symlink/submodule/special mode" >&2; exit 1 ;;
-    esac
-    case "$object_path" in
-      ''|/*|*'//'*) echo "不安全 release path" >&2; exit 1 ;;
-      *[!A-Za-z0-9._+@/-]*) echo "release path 字符不受支持" >&2; exit 1 ;;
-    esac
-    case "/$object_path/" in
-      *'/../'*|*'/./'*|*'/.git/'*) echo "不安全 release path segment" >&2; exit 1 ;;
-    esac
-    object_size="$(safe_git cat-file -s "$object_id")"
-    object_sha256="$(verified_blob_sha256 "$object_id")"
-    printf '%s %s %s %s\n' \
-      "$mode" "$object_size" "$object_sha256" "$object_path"
-  done < <(
-    safe_git ls-tree -r -z --full-tree \
-      --format='%(objectmode)%x00%(objecttype)%x00%(objectname)%x00%(path)%x00' \
-      "$expected_revision"
-  )
-} >"$manifest"
-chmod 0400 "$manifest"
-
-# root helper 不执行 Git，也不信任 staging 的路径稳定性。它以 O_NOFOLLOW 打开每个
-# manifest 项，复制期间校验 inode/owner/mode/size/mtime/raw SHA-256，只创建
-# root:root 0444/0555 目标；拒绝 symlink、special、unexpected、missing，fsync 后
-# atomic rename，并再次遍历最终 release。
-sudo -- python3 /usr/local/libexec/opswarden/offline_ops.py seal-release \
-  "$release_ref" "$expected_revision" "$tag_tree" "$expected_epoch" \
+sudo -u "#${RESTORE_OPERATOR_UID}" -- /usr/bin/env -i \
+  HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+  /usr/bin/python3 -I /usr/local/libexec/opswarden/release_export.py \
+  "$release_ref" "$expected_revision" |
+  sudo -- /usr/bin/env -i \
+    HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+    /usr/bin/python3 -I /usr/local/libexec/opswarden/offline_ops.py \
+    install-manifest "$release_ref" "$expected_revision"
+sudo -- /usr/bin/env -i \
+  HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+  /usr/bin/python3 -I /usr/local/libexec/opswarden/offline_ops.py \
+  seal-release "$release_ref" "$expected_revision" \
   "$RESTORE_OPERATOR_UID" "$RESTORE_OPERATOR_GID"
 
 sudo install -d -o 10001 -g 10001 -m 0700 \
@@ -621,6 +540,18 @@ OPSWARDEN_INTERNAL_CIDRS=
 OPSWARDEN_RESTORE_HOST_PORT=127.0.0.1:8443:443/tcp
 ```
 
+写完后立即把实际文件封存。helper 从单一 `O_NOFOLLOW` fd 复制并验证，写入
+root-owned、`0444`、规范固定的 `restore.sealed.env`；之后即使操作员替换
+`restore.env`、符号链接或修改 shell 环境也不会改变有效 Compose 输入：
+
+```bash
+sudo -- /usr/bin/env -i \
+  HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+  /usr/bin/python3 -I /usr/local/libexec/opswarden/offline_ops.py \
+  seal-env "$release_ref" "$expected_revision" \
+  "$RESTORE_OPERATOR_UID" "$RESTORE_OPERATOR_GID"
+```
+
 隔离 Caddy 配置与 Compose override 固定为 immutable release 中的
 `deploy/RestoreCaddyfile` 和 `deploy/restore.override.yaml`。不要在
 `/srv/opswarden-restore` 另建或修改 override；preflight 验证 manifest-exact export，
@@ -636,28 +567,30 @@ root 身份执行，Dockerfile、Compose、Caddy 和全部 build context 都来�
 `10001:10001`、`0600`、规范、非空、
 非符号链接的普通文件；实际 SHA-256 必须与记录值恒定时间比较相等，SQLite 完整性
 输出必须恰好为 `ok\n`。它还以无 shell evaluation 的严格 parser 读取随后 Compose
-使用的同一个 `restore.env`，拒绝重复/未知 key、模板默认值、生产 state/key、错误
+使用的同一个 root-owned `restore.sealed.env`，拒绝重复/未知 key、模板默认值、生产 state/key、错误
 revision/version/epoch、非私有文件、非 loopback 端口、错误私网/IP 或非空 bootstrap
 CIDR。任一步不满足都会非零退出，且此时还没有启动任何容器：
 
 ```bash
-sudo -- python3 /usr/local/libexec/opswarden/offline_ops.py restore-preflight \
-  "$release_ref" "$expected_revision" "$recorded_sha256" \
-  /srv/opswarden-restore/restore.env \
-  "$RESTORE_OPERATOR_UID" "$RESTORE_OPERATOR_GID"
+sudo -- /usr/bin/env -i \
+  HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+  /usr/bin/python3 -I /usr/local/libexec/opswarden/offline_ops.py \
+  restore-preflight "$release_ref" "$expected_revision" "$recorded_sha256"
 ```
 
 preflight 成功后，只从 immutable release 构建和启动，不能引用
 `/opt/opswarden/deploy/compose.yaml`：
 
 ```bash
-docker compose -p opswarden-restore \
-  --env-file /srv/opswarden-restore/restore.env \
+/usr/bin/env -i HOME=/nonexistent PATH=/usr/bin:/bin \
+  /usr/bin/docker compose -p opswarden-restore \
+  --env-file /srv/opswarden-restore/restore.sealed.env \
   -f /srv/opswarden-restore/release/deploy/compose.yaml \
   -f /srv/opswarden-restore/release/deploy/restore.override.yaml \
   config --quiet
-docker compose -p opswarden-restore \
-  --env-file /srv/opswarden-restore/restore.env \
+/usr/bin/env -i HOME=/nonexistent PATH=/usr/bin:/bin \
+  /usr/bin/docker compose -p opswarden-restore \
+  --env-file /srv/opswarden-restore/restore.sealed.env \
   -f /srv/opswarden-restore/release/deploy/compose.yaml \
   -f /srv/opswarden-restore/release/deploy/restore.override.yaml \
   up -d --build
@@ -673,13 +606,15 @@ curl --insecure --fail --silent --show-error https://127.0.0.1:8443/health/live
 
 ```bash
 set -euo pipefail
-docker compose -p opswarden-restore \
-  --env-file /srv/opswarden-restore/restore.env \
+/usr/bin/env -i HOME=/nonexistent PATH=/usr/bin:/bin \
+  /usr/bin/docker compose -p opswarden-restore \
+  --env-file /srv/opswarden-restore/restore.sealed.env \
   -f /srv/opswarden-restore/release/deploy/compose.yaml \
   -f /srv/opswarden-restore/release/deploy/restore.override.yaml down
 remaining="$(
-  docker compose -p opswarden-restore \
-    --env-file /srv/opswarden-restore/restore.env \
+  /usr/bin/env -i HOME=/nonexistent PATH=/usr/bin:/bin \
+    /usr/bin/docker compose -p opswarden-restore \
+    --env-file /srv/opswarden-restore/restore.sealed.env \
     -f /srv/opswarden-restore/release/deploy/compose.yaml \
     -f /srv/opswarden-restore/release/deploy/restore.override.yaml \
     ps --all --quiet
@@ -712,10 +647,10 @@ sudo rm -rf -- /srv/opswarden-restore/state \
   /srv/opswarden-restore/caddy \
   /srv/opswarden-restore/release
 sudo rm -f -- /srv/opswarden-restore/restore.env \
+  /srv/opswarden-restore/restore.sealed.env \
   /srv/opswarden-restore/release.manifest
 sudo rmdir -- /srv/opswarden-restore
 sudo rm -rf -- /srv/opswarden-restore-staging/release
-sudo rm -f -- /srv/opswarden-restore-staging/release.manifest
 sudo rmdir -- /srv/opswarden-restore-staging
 ```
 
@@ -749,7 +684,9 @@ kind 与选择值；随后依次清空 supplementary groups、降 GID/UID 至 `1
 set -euo pipefail
 cd /opt/opswarden
 docker compose --env-file deploy/.env -f deploy/compose.yaml stop opswarden
-if sudo -- python3 /usr/local/libexec/opswarden/offline_revoke.py
+if sudo -- /usr/bin/env -i \
+  HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+  /usr/bin/python3 -I /usr/local/libexec/opswarden/offline_revoke.py
 then
   docker compose --env-file deploy/.env -f deploy/compose.yaml up -d
 else
@@ -774,9 +711,10 @@ v1 内部具备数据密钥 rewrap 原语，但没有经过支持的在线轮换
 
 灾难恢复必须逐条执行第 8 节的同一顺序和同一个 `offline_ops.py
 restore-preflight`，不能简化为从当前 source 构建：先取得快照记录的 SHA-256、
-签名 release tag 和完整 revision；在 hermetic 非 root Git 环境验证 tag 后，从
-raw blob 建立 manifest 和 staging，由固定 root helper seal 成 immutable
-root-owned release；恢复匹配密钥与快照；在任何 Compose 启动前验证
+签名 release tag 和完整 revision；由 root-owned exporter 在 isolated 非 root
+Python 中验证 tag 并从同一批重哈希 raw objects 建立 pipe-only manifest 与
+staging，再由固定 root helper seal 成 immutable root-owned release；恢复匹配密钥、
+快照并封存实际 Compose env；在任何 Compose 启动前验证
 release/revision、checksum 和字节级恰好为 `ok\n` 的完整性结果；最后只从该
 immutable release 构建。先以不开放公网的方式验证测试凭据解密和审计查询，确认接管后再切换规范
 DNS/443。如果恢复环境成为生产，立即吊销恢复期间产生的会话与 Agent Token，签发
@@ -787,7 +725,9 @@ DNS/443。如果恢复环境成为生产，立即吊销恢复期间产生的会�
 `/usr/bin/git`、`/usr/bin/gpg` 和受信 release 公钥；把核对过的公钥导入固定
 `/etc/opswarden/release-gnupg`，不执行任何仓库文件。以非 root 操作员逐字执行第
 1 节的 `env -i` hermetic Git、拒绝 replace refs、annotated tag 验证和 raw
-`cat-file blob <OID>` 流程；两个 helper 都只能经固定 stdin atomic installer
+`cat-file blob <OID>` 流程；三个 helper 都只能经固定 stdin atomic installer
 写入 `/usr/local/libexec/opswarden/`，不能从 checkout/worktree 路径复制。第一次
-privileged seal/preflight 也只能执行这个 root-owned 固定副本；它自身绝不运行
-Git。任何一步失败都不得安装辅助程序、启动 Compose 或接触生产 DNS。
+export 必须以非 root isolated Python 执行固定 exporter；privileged
+install-manifest/seal-env/seal-release/preflight 只能执行固定 root-owned helper，
+且 root helper 自身绝不运行 Git。任何一步失败都不得安装辅助程序、启动 Compose
+或接触生产 DNS。
