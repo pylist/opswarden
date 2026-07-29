@@ -1,7 +1,7 @@
 .NOTPARALLEL:
 .PHONY: verify e2e-bootstrap
 
-E2E_REVISION := $(shell git rev-parse --verify HEAD)
+E2E_REVISION := $(shell GIT_NO_REPLACE_OBJECTS=1 git --no-replace-objects rev-parse --verify HEAD)
 E2E_VERSION := e2e-$(E2E_REVISION)
 
 e2e-bootstrap:
@@ -19,7 +19,7 @@ verify:
 	cd web && npm test -- --run
 	cd web && npm run build
 	docker compose --env-file deploy/.env.example -f deploy/compose.yaml config >/dev/null
-	git archive --format=tar $(E2E_REVISION) | docker build -f deploy/Dockerfile \
+	GIT_NO_REPLACE_OBJECTS=1 git --no-replace-objects archive --format=tar $(E2E_REVISION) | docker build -f deploy/Dockerfile \
 		--build-arg VERSION=$(E2E_VERSION) \
 		--build-arg REVISION=$(E2E_REVISION) \
 		--build-arg SOURCE_DATE_EPOCH=0 \

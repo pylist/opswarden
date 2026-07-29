@@ -9,22 +9,11 @@ image_version="${OPSWARDEN_E2E_IMAGE_VERSION:?set the image version built by mak
 }
 
 mkdir -p -- "${repo_root}/.tmp" "${repo_root}/.artifacts"
-lock_dir="${repo_root}/.tmp/opswarden-e2e.global-lock"
-if ! mkdir -- "${lock_dir}" 2>/dev/null; then
-  echo "E2E release gate refused: another run owns ${lock_dir}" >&2
-  exit 75
+lock_file="${repo_root}/.tmp/opswarden-e2e.lock"
+if [[ "${OPSWARDEN_E2E_LOCK_HELD:-}" != "1" ]]; then
+  exec /usr/bin/python3 -I "${repo_root}/scripts/e2e_lock.py" \
+    "${lock_file}" "${repo_root}/scripts/verify-e2e.sh"
 fi
-early_finish() {
-  rmdir -- "${lock_dir}" 2>/dev/null || true
-}
-early_signal() {
-  status="$1"
-  early_finish
-  exit "${status}"
-}
-trap early_finish EXIT
-trap 'early_signal 130' INT
-trap 'early_signal 143' TERM
 runtime_dir="$(mktemp -d "${repo_root}/.tmp/opswarden-e2e.XXXXXXXX")"
 artifact_dir="$(mktemp -d "${repo_root}/.artifacts/opswarden-e2e.XXXXXXXX")"
 chmod 0700 "${runtime_dir}" "${artifact_dir}"
@@ -55,13 +44,36 @@ read -r app_port restore_port < <(
 [[ "${app_port}" != "${restore_port}" ]] || exit 2
 subnet_checksum="$(printf '%s' "${run_suffix}" | cksum | awk '{print $1}')"
 subnet_index="$((subnet_checksum % 2048))"
-used_subnets="$(
-  network_ids="$(docker network ls -q 2>/dev/null || true)"
-  if [[ -n "${network_ids}" ]]; then
-    docker network inspect ${network_ids} \
-      --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' 2>/dev/null || true
-  fi
+docker_bin="$(command -v docker)"
+[[ "${docker_bin}" = /* ]] || {
+  echo "E2E release gate refused: docker executable is not absolute" >&2
+  exit 2
+}
+network_output="$(
+  /usr/bin/python3 -I "${repo_root}/scripts/bounded_command.py" \
+    15 "${docker_bin}" network ls -q
 )"
+network_args=()
+while IFS= read -r network_id; do
+  [[ -z "${network_id}" ]] && continue
+  [[ "${network_id}" =~ ^[0-9a-f]{12,64}$ ]] || {
+    echo "E2E release gate refused: Docker returned an unsafe network ID" >&2
+    exit 2
+  }
+  network_args+=("${network_id}")
+  ((${#network_args[@]} <= 4096)) || {
+    echo "E2E release gate refused: Docker network count exceeds bound" >&2
+    exit 2
+  }
+done <<<"${network_output}"
+used_subnets=""
+if ((${#network_args[@]} > 0)); then
+  used_subnets="$(
+    /usr/bin/python3 -I "${repo_root}/scripts/bounded_command.py" \
+      15 "${docker_bin}" network inspect "${network_args[@]}" \
+      --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}'
+  )"
+fi
 subnet=""
 for ((attempt = 0; attempt < 2048; attempt++)); do
   candidate="$(((subnet_index + attempt) % 2048))"
@@ -75,7 +87,6 @@ for ((attempt = 0; attempt < 2048; attempt++)); do
 done
 [[ -n "${subnet}" ]] || {
   echo "E2E release gate refused: no isolated backend subnet is available" >&2
-  rmdir -- "${lock_dir}"
   exit 75
 }
 
@@ -107,7 +118,6 @@ finish() {
       /usr/bin/python3 -I "${repo_root}/scripts/cleanup_e2e_secrets.py" \
       "${runtime_dir}" "${relative}" || cleanup_status=$?
   done
-  rmdir -- "${lock_dir}" || cleanup_status=$?
   if [[ "${signal_status}" -ne 0 ]]; then
     exit "${signal_status}"
   fi

@@ -28,6 +28,35 @@ def fail(message: str) -> None:
     raise RuntimeError(message)
 
 
+def open_absolute_directory(path: Path) -> int:
+    if not path.is_absolute():
+        fail("runtime directory must be absolute")
+    components = path.parts[1:]
+    if not components or any(
+        component in ("", ".", "..") or "/" in component or "\0" in component
+        for component in components
+    ):
+        fail("runtime directory components are unsafe")
+    current = os.open("/", DIRECTORY_FLAGS)
+    try:
+        for component in components:
+            before = os.stat(component, dir_fd=current, follow_symlinks=False)
+            following = os.open(component, DIRECTORY_FLAGS, dir_fd=current)
+            opened = os.fstat(following)
+            if (
+                not stat.S_ISDIR(before.st_mode)
+                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                os.close(following)
+                fail("runtime path changed or linked while opening")
+            os.close(current)
+            current = following
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2 or not Path(argv[0]).is_absolute():
         fail("usage: cleanup_e2e_secrets.py ABSOLUTE_RUNTIME RELATIVE_TARGET")
@@ -37,7 +66,7 @@ def main(argv: list[str]) -> int:
     root = Path(argv[0])
     if root.parent.name != ".tmp" or not root.name.startswith("opswarden-e2e."):
         fail("runtime directory is outside the E2E namespace")
-    root_fd = os.open(root, DIRECTORY_FLAGS)
+    root_fd = open_absolute_directory(root)
     try:
         root_metadata = os.fstat(root_fd)
         if (

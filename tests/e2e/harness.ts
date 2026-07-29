@@ -205,17 +205,18 @@ async function mcpCall(request: APIRequestContext, state: Control, name: string,
 }
 
 async function recordMCPFailure(name: string, status: number, body: string) {
-  const target = resolve(artifacts, "errors/mcp-failures.jsonl");
+  const target = resolve(artifacts, "errors/mcp-failures.bin");
+  const raw = Buffer.from(body, "utf8");
+  const header = Buffer.alloc(8);
+  header.writeBigUInt64BE(BigInt(raw.length));
   await appendFile(
     target,
-    JSON.stringify({
-      name,
-      status,
-      bodyBase64: Buffer.from(body, "utf8").toString("base64"),
-    }) + "\n",
+    Buffer.concat([header, raw]),
     { mode: 0o600 },
   );
   await chmod(target, 0o600);
+  void name;
+  void status;
 }
 
 export class APIHarness {

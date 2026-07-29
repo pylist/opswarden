@@ -751,16 +751,22 @@ npm、Python 3、可用的 Docker/Compose，以及可访问 Playwright 和已锁
 - 使用 SQLite 在线 Backup API 产生一致快照，将快照和独立保存的匹配 key 副本放入
   独立 Compose project，验证解密，再离线吊销恢复环境中的浏览器会话和 Agent Token。
 
-每次执行先取得仓库级 `.tmp/opswarden-e2e.global-lock`，因此同一 checkout 的
-并发 gate 不会争用端口、容器或清理范围；若锁已被占用，第二个执行立即以 75
-失败。取得锁后立即输出本次 runtime、artifact、Compose project、两个 loopback
+每次执行先由 isolated Python wrapper 在 `.tmp/opswarden-e2e.lock` 上取得
+`fcntl.flock` OS lock，因此同一 checkout 的并发 gate 不会争用端口、容器或清理
+范围；若锁已被占用，第二个执行立即以 75 失败。lock FD 贯穿整个 runner，正常退出、
+signal 或 SIGKILL 都由内核自动释放，不依赖可遗留的 PID/目录锁。取得锁后立即输出
+本次 runtime、artifact、Compose project、两个 loopback
 端口和后端子网标识，便于信号中断或宿主异常后的精确处置。每次执行生成独立的
 `.tmp/opswarden-e2e.<随机值>`、
 `.artifacts/opswarden-e2e.<随机值>`、两个 loopback 端口、Compose project 和后端
-子网；子网会检查现有 Docker networks 并在完整候选池中寻找未占用项，不只依赖
+子网；`docker network ls/inspect` 均由限制 4 MiB 输出、15 秒运行时间且超时执行
+TERM→KILL 的 helper 调用。子网会检查现有 Docker networks 并在完整候选池中寻找未占用项，不只依赖
 随机后缀哈希。所有值先验证格式与目录边界，测试不会清理其他执行的目录、容器或
-网络。发布 gate 拒绝任何 tracked 或 untracked source drift，镜像 build context
-直接来自 `git archive <完整 HEAD revision>`，因此镜像内容和 label 中的 revision
+网络。发布 gate 拒绝任何 tracked 或 untracked source drift；revision verifier、
+tracked-file scanner 和 archive 命令均同时设置 `GIT_NO_REPLACE_OBJECTS=1` 和
+`git --no-replace-objects`。镜像 build context 直接来自
+`git archive <完整 HEAD revision>`，因此 replace refs 无法替换 commit 内容，镜像
+内容和 label 中的 revision
 绑定到同一个真实提交；恢复场景只用该 tag 且带 `--no-build`。
 
 成功时最后一行是
@@ -768,12 +774,15 @@ npm、Python 3、可用的 Docker/Compose，以及可访问 Playwright 和已锁
 视频全部禁用；扫描器仍递归检查 SQLite DB/WAL/SHM、所有备份、应用/恢复日志、
 审计导出、浏览器存储、捕获的 REST/MCP 错误体、残留的 Playwright
 test-results/report，以及 zip/tar/gzip 内部内容和 Git 跟踪文件。扫描器从固定
-directory FD 出发，以 openat/O_NOFOLLOW 打开每一级目录和文件，并在读取前后核对
-inode、owner、mode、size 与 mtime；嵌套 archive 共享总 member 和 expanded-byte
-预算，任何 symlink、路径替换或压缩炸弹均 fail closed。模式包含每个原子
+directory FD 出发，以 openat/O_NOFOLLOW 打开每一级目录和文件；枚举到 child 时
+立即保留其 FD 并从该 FD 扫描，不再按路径重开。pattern 文件同样只能相对已固定的
+runtime FD 打开。读取前后核对 inode、owner、mode、size 与 mtime；整个 scan
+共享唯一 archive member/expanded-byte 预算（跨所有顶层文件与嵌套层），任何
+symlink、runtime/目录替换或聚合压缩炸弹均 fail closed。模式包含每个原子
 密码、JWT、Agent Token、私钥随机体、数据库密码、连接串/TOTP/recovery/session 和
 全部十个初始 recovery codes、主密钥。control 文件只保存三个确实被场景消费的
-recovery code。MCP 失败的原始 body 只以 0600 写入受扫描 artifact，Playwright
+recovery code。MCP 失败的原始 body 使用 8 字节长度前缀和原始字节、仅以 0600
+写入受扫描 artifact，因此 scanner 能直接匹配其中的敏感模式；Playwright
 异常和 reporter 只显示状态与净化后的错误摘要。自动负控会逐类注入模式，并在任何
 false negative 时阻止 gate。
 
@@ -791,7 +800,8 @@ Playwright 的 webServer 退出时先发 TERM，五秒后仍未退出才发 KILL
 子进程都有输出与时间上限，并采用相同 TERM→KILL 顺序。恢复测试的 `finally`
 无条件对本次两个唯一 project 执行 `down --volumes --remove-orphans`。
 `verify-e2e.sh` 的 EXIT/INT/TERM trap 无论 Playwright 成败都先运行 scanner，再由
-isolated Python helper 通过固定 runtime directory FD、逐级 O_NOFOLLOW 和精确
+isolated Python helper 从 `/` FD 开始逐组件 openat/O_DIRECTORY/O_NOFOLLOW，
+核对每个 component identity，再通过固定 runtime directory FD 和精确
 相对路径白名单删除 0600 pattern/control/key 文件，并保留非秘密诊断产物。INT/TERM
 分别保留 130/143 非零退出状态，不会被成功扫描覆盖。若 runner 被操作系统强制
 SIGKILL，使用失败输出中记录的唯一 project 名精确清理，不能按前缀批量删除其他执行。

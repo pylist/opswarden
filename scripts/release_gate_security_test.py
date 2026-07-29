@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import os
+import io
 from pathlib import Path
 import shutil
 import signal
 import subprocess
 import tempfile
+import tarfile
 import time
 import unittest
 
@@ -58,7 +60,37 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertEqual(self.source_gate(repository, revision).returncode, 0)
         (repository / "tracked").write_text("dirty\n", encoding="ascii")
         self.assertEqual(self.source_gate(repository, revision).returncode, 2)
-        (repository / "tracked").write_text("exact\n", encoding="ascii")
+
+    def test_real_replace_ref_cannot_change_verified_or_archived_commit(self) -> None:
+        repository, original = self.make_git_repo()
+        (repository / "tracked").write_text("replacement\n", encoding="ascii")
+        subprocess.run(["/usr/bin/git", "commit", "-qam", "replacement"], cwd=repository, check=True)
+        revision = subprocess.check_output(
+            ["/usr/bin/git", "rev-parse", "HEAD"], cwd=repository, text=True
+        ).strip()
+        subprocess.run(["/usr/bin/git", "replace", revision, original], cwd=repository, check=True)
+        default_body = subprocess.check_output(
+            ["/usr/bin/git", "show", f"{revision}:tracked"], cwd=repository
+        )
+        self.assertEqual(default_body, b"exact\n")
+        self.assertEqual(self.source_gate(repository, revision).returncode, 0)
+        archive = subprocess.check_output(
+            [
+                "/usr/bin/env",
+                "GIT_NO_REPLACE_OBJECTS=1",
+                "/usr/bin/git",
+                "--no-replace-objects",
+                "archive",
+                "--format=tar",
+                revision,
+            ],
+            cwd=repository,
+        )
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
+            handle = bundle.extractfile("tracked")
+            self.assertIsNotNone(handle)
+            self.assertEqual(handle.read(), b"replacement\n")
+        (repository / "tracked").write_text("replacement\n", encoding="ascii")
         (repository / "untracked").write_text("drift\n", encoding="ascii")
         self.assertEqual(self.source_gate(repository, revision).returncode, 2)
 
@@ -66,6 +98,7 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         runtime = self.root / ".tmp" / "opswarden-e2e.ABCDEFGH"
         outside = self.root / "outside"
         runtime.mkdir(parents=True)
+        runtime.chmod(0o700)
         outside.mkdir()
         secret = outside / "master.key"
         secret.write_text("protected\n", encoding="ascii")
@@ -85,7 +118,31 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertTrue(secret.exists())
 
-    def make_runner_fixture(self) -> tuple[Path, dict[str, str]]:
+    def test_cleanup_refuses_symlinked_tmp_component(self) -> None:
+        real_tmp = self.root / "real-tmp"
+        runtime = real_tmp / "opswarden-e2e.ABCDEFGH"
+        runtime.mkdir(parents=True)
+        runtime.chmod(0o700)
+        secret = runtime / "master.key"
+        secret.write_text("protected\n", encoding="ascii")
+        secret.chmod(0o600)
+        (self.root / ".tmp").symlink_to(real_tmp, target_is_directory=True)
+        lexical_runtime = self.root / ".tmp" / runtime.name
+        completed = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(ROOT / "scripts/cleanup_e2e_secrets.py"),
+                str(lexical_runtime),
+                "master.key",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertTrue(secret.exists())
+
+    def make_runner_fixture(self, all_subnets: bool = False) -> tuple[Path, dict[str, str]]:
         fixture = self.root / "runner"
         scripts = fixture / "scripts"
         tests = fixture / "tests/e2e"
@@ -98,34 +155,51 @@ class ReleaseGateSecurityTest(unittest.TestCase):
             "scan-sensitive-fixtures.sh",
             "scan_sensitive_fixtures.py",
             "cleanup_e2e_secrets.py",
+            "e2e_lock.py",
+            "bounded_command.py",
         ):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         (binary / "node").write_text("#!/bin/sh\nprintf '31001 31002\\n'\n", encoding="ascii")
+        collision_script = (
+            "printf 'abc123def456\\n'\n" if all_subnets else ""
+        )
+        inspect_script = (
+            "second=20\n"
+            "while [ \"$second\" -le 27 ]; do\n"
+            "  third=0\n"
+            "  while [ \"$third\" -le 255 ]; do\n"
+            "    printf '172.%s.%s.0/29\\n' \"$second\" \"$third\"\n"
+            "    third=$((third + 1))\n"
+            "  done\n"
+            "  second=$((second + 1))\n"
+            "done\n"
+            if all_subnets
+            else ""
+        )
         (binary / "docker").write_text(
             "#!/bin/sh\n"
             "if [ \"$1 $2\" = 'network ls' ]; then\n"
-            "  [ \"${FAKE_ALL_SUBNETS:-}\" = 1 ] && printf 'occupied\\n'\n"
+            f"  {collision_script or ':'}\n"
             "  exit 0\n"
             "fi\n"
-            "if [ \"$1 $2\" = 'network inspect' ] && [ \"${FAKE_ALL_SUBNETS:-}\" = 1 ]; then\n"
-            "  second=20\n"
-            "  while [ \"$second\" -le 27 ]; do\n"
-            "    third=0\n"
-            "    while [ \"$third\" -le 255 ]; do\n"
-            "      printf '172.%s.%s.0/29\\n' \"$second\" \"$third\"\n"
-            "      third=$((third + 1))\n"
-            "    done\n"
-            "    second=$((second + 1))\n"
-            "  done\n"
+            "if [ \"$1 $2\" = 'network inspect' ]; then\n"
+            f"{inspect_script}"
             "  exit 0\n"
             "fi\n"
             "exit 0\n",
             encoding="ascii",
         )
+        (binary / "ready_child.py").write_text(
+            "#!/usr/bin/python3\n"
+            "import pathlib,signal,sys\n"
+            "pathlib.Path(sys.argv[1]).touch()\n"
+            "signal.pause()\n",
+            encoding="ascii",
+        )
         (binary / "npm").write_text(
             "#!/bin/sh\n"
-            "touch \"$(dirname \"$0\")/../npm-started\"\n"
-            "sleep 30\n",
+            "exec /usr/bin/python3 -I \"$(dirname \"$0\")/ready_child.py\" "
+            "\"$(dirname \"$0\")/../npm-started\"\n",
             encoding="ascii",
         )
         (binary / "npx").write_text("#!/bin/sh\nsleep 30\n", encoding="ascii")
@@ -171,7 +245,7 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertEqual(process.returncode, expected, stderr)
         runtime = Path(identifiers.split("runtime=", 1)[1].split(" artifact=", 1)[0])
         self.assertFalse((runtime / "master.key").exists())
-        self.assertFalse((fixture / ".tmp/opswarden-e2e.global-lock").exists())
+        self.assertTrue((fixture / ".tmp/opswarden-e2e.lock").exists())
 
     def test_term_exit_is_nonzero_after_scan_and_cleanup(self) -> None:
         self.assert_signal_exit(signal.SIGTERM, 143)
@@ -195,11 +269,35 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         self.assertEqual(second.returncode, 75, second_stderr)
         os.killpg(first.pid, signal.SIGTERM)
         first.communicate(timeout=15)
-        self.assertFalse((fixture / ".tmp/opswarden-e2e.global-lock").exists())
+        self.assertTrue((fixture / ".tmp/opswarden-e2e.lock").exists())
+
+    def test_sigkill_automatically_releases_lock_for_restart(self) -> None:
+        fixture, environment = self.make_runner_fixture()
+        first = self.start_runner(fixture, environment)
+        assert first.stdout is not None
+        first.stdout.readline()
+        marker = fixture / "npm-started"
+        for _ in range(100):
+            if marker.exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(marker.exists())
+        os.killpg(first.pid, signal.SIGKILL)
+        first.communicate(timeout=10)
+        marker.unlink()
+        second = self.start_runner(fixture, environment)
+        assert second.stdout is not None
+        self.assertIn("runtime=", second.stdout.readline())
+        for _ in range(100):
+            if marker.exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(marker.exists())
+        os.killpg(second.pid, signal.SIGTERM)
+        second.communicate(timeout=15)
 
     def test_subnet_collision_exhaustion_fails_closed_and_releases_lock(self) -> None:
-        fixture, environment = self.make_runner_fixture()
-        environment["FAKE_ALL_SUBNETS"] = "1"
+        fixture, environment = self.make_runner_fixture(all_subnets=True)
         completed = subprocess.run(
             ["/bin/bash", str(fixture / "scripts/verify-e2e.sh")],
             cwd=fixture,
@@ -211,22 +309,50 @@ class ReleaseGateSecurityTest(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 75, completed.stderr)
         self.assertIn("no isolated backend subnet", completed.stderr)
-        self.assertFalse((fixture / ".tmp/opswarden-e2e.global-lock").exists())
+        self.assertTrue((fixture / ".tmp/opswarden-e2e.lock").exists())
 
     def test_mcp_reporter_and_recovery_pattern_contracts_are_sanitized(self) -> None:
         harness = (ROOT / "tests/e2e/harness.ts").read_text(encoding="utf-8")
         setup = (ROOT / "tests/e2e/setup.ts").read_text(encoding="utf-8")
-        self.assertIn("errors/mcp-failures.jsonl", harness)
-        self.assertIn('bodyBase64: Buffer.from(body, "utf8").toString("base64")', harness)
+        self.assertIn("errors/mcp-failures.bin", harness)
+        self.assertIn("header.writeBigUInt64BE(BigInt(raw.length))", harness)
+        self.assertNotIn("bodyBase64", harness)
         self.assertNotIn("status()}: ${body}", harness)
         self.assertNotIn("failed: ${body}", harness)
         self.assertIn("...bootstrap.recoveryCodes", setup)
         self.assertNotIn("recoveryCodes: bootstrap.recoveryCodes", setup)
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         runner = (ROOT / "scripts/verify-e2e.sh").read_text(encoding="utf-8")
-        self.assertIn("git archive --format=tar $(E2E_REVISION) | docker build", makefile)
+        self.assertIn("git --no-replace-objects archive --format=tar $(E2E_REVISION)", makefile)
+        self.assertIn("GIT_NO_REPLACE_OBJECTS=1", makefile)
         self.assertIn("verify_source_tree.py $(E2E_REVISION)", makefile)
         self.assertIn("E2E runtime=%s artifact=%s project=%s", runner)
+
+    def test_bounded_command_terminates_unresponsive_child(self) -> None:
+        child = self.root / "unresponsive.py"
+        child.write_text(
+            "#!/usr/bin/python3\n"
+            "import signal\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "signal.pause()\n",
+            encoding="ascii",
+        )
+        child.chmod(0o755)
+        started = time.monotonic()
+        completed = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                str(ROOT / "scripts/bounded_command.py"),
+                "1",
+                str(child),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertLess(time.monotonic() - started, 8)
 
 
 if __name__ == "__main__":

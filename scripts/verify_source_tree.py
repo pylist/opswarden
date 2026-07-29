@@ -11,9 +11,14 @@ import sys
 
 def git(*args: str) -> bytes:
     return subprocess.check_output(
-        ["/usr/bin/git", *args],
+        ["/usr/bin/git", "--no-replace-objects", *args],
         stderr=subprocess.DEVNULL,
-        env={"HOME": "/nonexistent", "PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        env={
+            "HOME": "/nonexistent",
+            "PATH": "/usr/bin:/bin",
+            "LC_ALL": "C",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        },
         timeout=30,
     )
 

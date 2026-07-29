@@ -25,10 +25,11 @@ class SensitiveFixtureScannerTest(unittest.TestCase):
         self.root = root
         self.runtime = root / "runtime"
         self.artifacts = root / "artifacts"
-        self.pattern = root / "patterns"
+        self.pattern = self.runtime / "sensitive-patterns"
         self.repo = Path(__file__).resolve().parent.parent
         patterns = [f"SCANNER_SECRET_{index:02d}_UNIQUE".encode() for index in range(16)]
         self.secret = patterns[0]
+        self.pattern.parent.mkdir(parents=True)
         self.pattern.write_bytes(b"\n".join(patterns) + b"\n")
         self.pattern.chmod(0o600)
         self.targets = [
@@ -81,6 +82,13 @@ class SensitiveFixtureScannerTest(unittest.TestCase):
         archive = self.artifacts / "playwright" / "test-results" / "trace.zip"
         with zipfile.ZipFile(archive, "w") as output:
             output.writestr("trace/network-body.txt", self.secret)
+        self.assertEqual(self.run_scan(), 1)
+
+    def test_raw_length_prefixed_mcp_failure_is_scanned(self) -> None:
+        body = b"raw MCP failure: " + self.secret
+        target = self.artifacts / "errors" / "mcp-failures.bin"
+        target.write_bytes(len(body).to_bytes(8, "big") + body)
+        target.chmod(0o600)
         self.assertEqual(self.run_scan(), 1)
 
     def test_pattern_file_requires_private_mode(self) -> None:
@@ -138,6 +146,65 @@ class SensitiveFixtureScannerTest(unittest.TestCase):
             with mock.patch.object(scanner.os, "read", side_effect=swapping_read):
                 with self.assertRaises(scanner.ScanRefused):
                     scanner.scan_file(root_fd, "errors/captured-errors.json", (self.secret,))
+        finally:
+            os.close(root_fd)
+
+    def test_pinned_tree_fd_scans_original_after_runtime_path_swap(self) -> None:
+        data = self.runtime / "data"
+        (data / "escaped.log").write_bytes(self.secret)
+        runtime_fd = os.open(self.runtime, scanner.DIRECTORY_FLAGS)
+        root_fd = os.open(data, scanner.DIRECTORY_FLAGS)
+        moved = self.root / "pinned-original"
+        self.runtime.rename(moved)
+        self.runtime.mkdir()
+        (self.runtime / "data").mkdir()
+        (self.runtime / "data" / "escaped.log").write_bytes(b"safe replacement")
+        try:
+            leaked, count = scanner.scan_tree(
+                root_fd, (self.secret,), scanner.ArchiveBudget()
+            )
+            self.assertTrue(leaked)
+            self.assertGreater(count, 0)
+            with self.assertRaises(scanner.ScanRefused):
+                scanner.verify_pinned_directory(self.runtime, runtime_fd)
+        finally:
+            os.close(root_fd)
+            os.close(runtime_fd)
+
+    def test_pattern_file_is_read_from_pinned_runtime_fd_after_path_swap(self) -> None:
+        runtime_fd = os.open(self.runtime, scanner.DIRECTORY_FLAGS)
+        moved = self.root / "runtime-original"
+        self.runtime.rename(moved)
+        self.runtime.mkdir()
+        (self.runtime / "sensitive-patterns").write_bytes(b"attacker replacement\n")
+        (self.runtime / "sensitive-patterns").chmod(0o600)
+        try:
+            patterns = scanner.private_pattern_file(
+                runtime_fd, self.runtime, str(self.runtime / "sensitive-patterns")
+            )
+            self.assertIn(self.secret, patterns)
+            self.assertNotIn(b"attacker replacement", patterns)
+        finally:
+            os.close(runtime_fd)
+
+    def test_archive_budget_is_shared_across_top_level_files(self) -> None:
+        first = self.artifacts / "errors" / "first.zip"
+        second = self.artifacts / "errors" / "second.zip"
+        for target in (first, second):
+            with zipfile.ZipFile(target, "w") as output:
+                for index in range(6):
+                    output.writestr(f"safe-{index}.txt", b"safe")
+        root_fd = os.open(self.artifacts, scanner.DIRECTORY_FLAGS)
+        budget = scanner.ArchiveBudget()
+        try:
+            with mock.patch.object(scanner, "MAX_ARCHIVE_MEMBERS", 10):
+                self.assertFalse(
+                    scanner.scan_file(root_fd, "errors/first.zip", (self.secret,), budget)
+                )
+                with self.assertRaises(scanner.ScanRefused):
+                    scanner.scan_file(
+                        root_fd, "errors/second.zip", (self.secret,), budget
+                    )
         finally:
             os.close(root_fd)
 
