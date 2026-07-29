@@ -786,6 +786,46 @@ func TestReconcileRestoresRetiredMetadataWhenCanonicalFileStillExists(t *testing
 	}
 }
 
+func TestReconcileRetiredRowsIterationFailureDoesNotRecoverMetadata(t *testing.T) {
+	service, path := runTestBackup(t)
+	name := filepath.Base(path)
+	id := canonicalNamePattern.FindStringSubmatch(name)[2]
+	if _, err := service.db.Writer.Exec(`
+		UPDATE backup_runs
+		SET retained = 0, deleted_at = ?,
+		    verification_status = 'retired', verified_at = ?
+		WHERE id = ?
+	`, formatTime(time.Now().UTC()), formatTime(time.Now().UTC()), id); err != nil {
+		t.Fatal(err)
+	}
+	iterationErr := errors.New("retired iteration failed")
+	service.reconcileRetiredRowScannedHook = func() error {
+		return iterationErr
+	}
+	if err := service.reconcileRetiredRows(
+		context.Background(),
+	); !errors.Is(err, iterationErr) {
+		t.Fatalf("reconcile err=%v", err)
+	}
+	var retained int
+	var verificationStatus string
+	if err := service.db.Reader.QueryRow(`
+		SELECT retained, verification_status
+		FROM backup_runs WHERE id = ?
+	`, id).Scan(&retained, &verificationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if retained != 0 || verificationStatus != "retired" {
+		t.Fatalf(
+			"retained=%d verification_status=%q",
+			retained, verificationStatus,
+		)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("retired file changed: %v", err)
+	}
+}
+
 func TestReconcileClosesPrePublishRunAndRemovesPartialFile(t *testing.T) {
 	db, err := storage.Open(filepath.Join(t.TempDir(), "source.db"))
 	if err != nil {
@@ -818,6 +858,52 @@ func TestReconcileClosesPrePublishRunAndRemovesPartialFile(t *testing.T) {
 	}
 	if _, err := service.root.Lstat(temp); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("partial file remains: %v", err)
+	}
+}
+
+func TestReconcileRunningRowsIterationFailureDoesNotMutateRunOrPartial(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	clock := fixedClock{
+		now: time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC),
+	}
+	service, err := NewService(db, backupDir(t), clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Close() })
+	const id = "bkp_11111111111111111111111111111111"
+	if err := service.recordStart(context.Background(), id, clock.now); err != nil {
+		t.Fatal(err)
+	}
+	name := canonicalFilename(clock.now, id)
+	partial := "." + name + ".partial"
+	if err := service.reserveTemp(partial); err != nil {
+		t.Fatal(err)
+	}
+	iterationErr := errors.New("running iteration failed")
+	service.reconcileRunningRowScannedHook = func() error {
+		return iterationErr
+	}
+	if err := service.reconcileRunningRows(
+		context.Background(),
+	); !errors.Is(err, iterationErr) {
+		t.Fatalf("reconcile err=%v", err)
+	}
+	var status string
+	if err := db.Reader.QueryRow(
+		`SELECT status FROM backup_runs WHERE id = ?`, id,
+	).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "running" {
+		t.Fatalf("status=%q", status)
+	}
+	if _, err := service.root.Lstat(partial); err != nil {
+		t.Fatalf("partial changed: %v", err)
 	}
 }
 

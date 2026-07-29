@@ -74,6 +74,9 @@ type Service struct {
 	runMu   sync.Mutex
 
 	beforeOnlineCopy func()
+	// Reconciliation hooks inject row-iteration failures in package tests.
+	reconcileRetiredRowScannedHook func() error
+	reconcileRunningRowScannedHook func() error
 }
 
 func NewService(db *storage.DB, directory string, clock platform.Clock) (*Service, error) {
@@ -788,6 +791,7 @@ func (s *Service) reconcileRetiredRows(ctx context.Context) error {
 		size                   int64
 	}
 	var records []retired
+	var injectedIterationErr error
 	for rows.Next() {
 		var record retired
 		if err := rows.Scan(
@@ -797,9 +801,23 @@ func (s *Service) reconcileRetiredRows(ctx context.Context) error {
 			return err
 		}
 		records = append(records, record)
+		if s.reconcileRetiredRowScannedHook != nil {
+			injectedIterationErr = s.reconcileRetiredRowScannedHook()
+			if injectedIterationErr != nil {
+				break
+			}
+		}
 	}
-	if err := rows.Close(); err != nil {
-		return err
+	closeErr := rows.Close()
+	iterationErr := rows.Err()
+	if closeErr != nil {
+		return closeErr
+	}
+	if iterationErr != nil {
+		return iterationErr
+	}
+	if injectedIterationErr != nil {
+		return injectedIterationErr
 	}
 	for _, record := range records {
 		if !validRunID(record.id) ||
@@ -857,6 +875,7 @@ func (s *Service) reconcileRunningRows(ctx context.Context) error {
 	}
 	type running struct{ id, started string }
 	var runs []running
+	var injectedIterationErr error
 	for rows.Next() {
 		var run running
 		if err := rows.Scan(&run.id, &run.started); err != nil {
@@ -864,9 +883,23 @@ func (s *Service) reconcileRunningRows(ctx context.Context) error {
 			return err
 		}
 		runs = append(runs, run)
+		if s.reconcileRunningRowScannedHook != nil {
+			injectedIterationErr = s.reconcileRunningRowScannedHook()
+			if injectedIterationErr != nil {
+				break
+			}
+		}
 	}
-	if err := rows.Close(); err != nil {
-		return err
+	closeErr := rows.Close()
+	iterationErr := rows.Err()
+	if closeErr != nil {
+		return closeErr
+	}
+	if iterationErr != nil {
+		return iterationErr
+	}
+	if injectedIterationErr != nil {
+		return injectedIterationErr
 	}
 	for _, run := range runs {
 		started, err := parseTime(run.started)
