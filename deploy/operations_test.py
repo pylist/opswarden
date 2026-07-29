@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import hashlib
+import base64
 import importlib.util
 import os
 from pathlib import Path
@@ -20,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 OFFLINE_OPS = ROOT / "deploy" / "offline_ops.py"
 OFFLINE_REVOKE = ROOT / "deploy" / "offline_revoke.py"
 OPERATIONS_DOC = ROOT / "docs" / "operations.md"
+RESTORE_OVERRIDE = ROOT / "deploy" / "restore.override.yaml"
+USER_ID = base64.urlsafe_b64encode(bytes(16)).rstrip(b"=").decode("ascii")
+TOKEN_ID = "tok_" + "a" * 32
 
 
 def load_module(name: str, path: Path):
@@ -141,7 +145,25 @@ class OfflineOpsTest(unittest.TestCase):
             check=True,
         )
         (repository / "release.txt").write_text("fixture\n", encoding="utf-8")
-        subprocess.run(["git", "-C", repository, "add", "release.txt"], check=True)
+        (repository / "deploy").mkdir()
+        (repository / "deploy" / "Dockerfile").write_text(
+            "FROM scratch\n", encoding="utf-8"
+        )
+        (repository / ".gitignore").write_text(
+            "ignored-build-input\n", encoding="utf-8"
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                repository,
+                "add",
+                "release.txt",
+                "deploy/Dockerfile",
+                ".gitignore",
+            ],
+            check=True,
+        )
         subprocess.run(
             ["git", "-C", repository, "commit", "-q", "-m", "fixture"], check=True
         )
@@ -150,10 +172,24 @@ class OfflineOpsTest(unittest.TestCase):
             check=True,
             stdout=subprocess.DEVNULL,
         )
+        checkout.chmod(0o700)
         revision = subprocess.check_output(
             ["git", "-C", checkout, "rev-parse", "HEAD"], text=True
         ).strip()
         return checkout, revision
+
+    def checkout_tree(self, checkout: Path) -> str:
+        return subprocess.check_output(
+            [
+                "git",
+                "--no-replace-objects",
+                "-C",
+                checkout,
+                "rev-parse",
+                "HEAD^{tree}",
+            ],
+            text=True,
+        ).strip()
 
     def make_restore_fixture(self) -> tuple[Path, str, Path, str]:
         checkout, revision = self.create_git_checkout()
@@ -171,7 +207,11 @@ class OfflineOpsTest(unittest.TestCase):
 
     def test_restore_preflight_rejects_missing_snapshot(self):
         checkout, revision = self.create_git_checkout()
-        with mock.patch.object(self.ops, "verify_release_tag"):
+        with mock.patch.object(
+            self.ops,
+            "verify_release_tag",
+            return_value=(self.checkout_tree(checkout), 0),
+        ):
             with self.assertRaises((OSError, RuntimeError, ValueError)):
                 self.ops.restore_preflight(
                     checkout,
@@ -188,7 +228,11 @@ class OfflineOpsTest(unittest.TestCase):
         snapshot = self.root / "empty-restore.sqlite3"
         snapshot.touch(mode=0o600)
         digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
-        with mock.patch.object(self.ops, "verify_release_tag"):
+        with mock.patch.object(
+            self.ops,
+            "verify_release_tag",
+            return_value=(self.checkout_tree(checkout), 0),
+        ):
             with self.assertRaises((OSError, RuntimeError, ValueError)):
                 self.ops.restore_preflight(
                     checkout,
@@ -202,7 +246,11 @@ class OfflineOpsTest(unittest.TestCase):
 
     def test_restore_preflight_rejects_wrong_checksum(self):
         checkout, revision, snapshot, _ = self.make_restore_fixture()
-        with mock.patch.object(self.ops, "verify_release_tag"):
+        with mock.patch.object(
+            self.ops,
+            "verify_release_tag",
+            return_value=(self.checkout_tree(checkout), 0),
+        ):
             with self.assertRaises((OSError, RuntimeError, ValueError)):
                 self.ops.restore_preflight(
                     checkout,
@@ -220,7 +268,11 @@ class OfflineOpsTest(unittest.TestCase):
         snapshot.write_bytes(b"not a sqlite database")
         snapshot.chmod(0o600)
         digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
-        with mock.patch.object(self.ops, "verify_release_tag"):
+        with mock.patch.object(
+            self.ops,
+            "verify_release_tag",
+            return_value=(self.checkout_tree(checkout), 0),
+        ):
             with self.assertRaises((OSError, RuntimeError, ValueError)):
                 self.ops.restore_preflight(
                     checkout,
@@ -234,7 +286,11 @@ class OfflineOpsTest(unittest.TestCase):
 
     def test_restore_preflight_accepts_exact_revision_checksum_and_database(self):
         checkout, revision, snapshot, digest = self.make_restore_fixture()
-        with mock.patch.object(self.ops, "verify_release_tag") as verify_tag:
+        with mock.patch.object(
+            self.ops,
+            "verify_release_tag",
+            return_value=(self.checkout_tree(checkout), 0),
+        ) as verify_tag:
             self.ops.restore_preflight(
                 checkout,
                 "v1.0.0",
@@ -250,7 +306,11 @@ class OfflineOpsTest(unittest.TestCase):
         checkout, revision, snapshot, digest = self.make_restore_fixture()
         link = self.root / "linked-restore.sqlite3"
         link.symlink_to(snapshot)
-        with mock.patch.object(self.ops, "verify_release_tag"):
+        with mock.patch.object(
+            self.ops,
+            "verify_release_tag",
+            return_value=(self.checkout_tree(checkout), 0),
+        ):
             with self.assertRaises((OSError, RuntimeError, ValueError)):
                 self.ops.restore_preflight(
                     checkout,
@@ -267,7 +327,75 @@ class OfflineOpsTest(unittest.TestCase):
         (checkout / "untracked-build-input").write_text(
             "unexpected\n", encoding="utf-8"
         )
-        with mock.patch.object(self.ops, "verify_release_tag"):
+        with mock.patch.object(
+            self.ops,
+            "verify_release_tag",
+            return_value=(self.checkout_tree(checkout), 0),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.ops.restore_preflight(
+                    checkout,
+                    "v1.0.0",
+                    revision,
+                    snapshot,
+                    digest,
+                    self.uid,
+                    self.gid,
+                )
+
+    def test_restore_rejects_clean_assume_unchanged_build_input(self):
+        checkout, revision, snapshot, digest = self.make_restore_fixture()
+        dockerfile = checkout / "deploy" / "Dockerfile"
+        dockerfile.write_text("FROM malicious.example/image\n", encoding="utf-8")
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                checkout,
+                "update-index",
+                "--assume-unchanged",
+                "deploy/Dockerfile",
+            ],
+            check=True,
+        )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", checkout, "status", "--porcelain"], text=True
+            ),
+            "",
+        )
+        with mock.patch.object(
+            self.ops,
+            "verify_release_tag",
+            return_value=(self.checkout_tree(checkout), 0),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.ops.restore_preflight(
+                    checkout,
+                    "v1.0.0",
+                    revision,
+                    snapshot,
+                    digest,
+                    self.uid,
+                    self.gid,
+                )
+
+    def test_restore_rejects_ignored_build_context_input(self):
+        checkout, revision, snapshot, digest = self.make_restore_fixture()
+        (checkout / "ignored-build-input").write_text(
+            "malicious\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", checkout, "status", "--porcelain"], text=True
+            ),
+            "",
+        )
+        with mock.patch.object(
+            self.ops,
+            "verify_release_tag",
+            return_value=(self.checkout_tree(checkout), 0),
+        ):
             with self.assertRaises(RuntimeError):
                 self.ops.restore_preflight(
                     checkout,
@@ -284,9 +412,193 @@ class OfflineOpsTest(unittest.TestCase):
         failed = subprocess.CompletedProcess(
             ["git", "verify-tag"], 1, stdout=b"", stderr=b"bad signature"
         )
-        with mock.patch.object(self.ops.subprocess, "run", return_value=failed):
+        with mock.patch.object(
+            self.ops, "exact_git_line", return_value="tag"
+        ), mock.patch.object(self.ops.subprocess, "run", return_value=failed):
             with self.assertRaises(RuntimeError):
                 self.ops.verify_release_tag(checkout, "v1.0.0", revision)
+
+    def test_git_is_forced_to_no_replace_and_scrubs_object_env(self):
+        command = self.ops.git_command(self.root, "rev-parse", "HEAD")
+        environment = self.ops.git_environment()
+        self.assertEqual(command[1], "--no-replace-objects")
+        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+        for key in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ):
+            self.assertNotIn(key, environment)
+
+    def test_restore_rejects_replacement_ref_with_clean_malicious_worktree(self):
+        repository = self.root / "replacement-repository"
+        checkout = self.root / "replacement-checkout"
+        subprocess.run(["git", "init", "-q", repository], check=True)
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.email", "fixture@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.name", "Fixture"],
+            check=True,
+        )
+        release = repository / "release.txt"
+        release.write_text("genuine\n", encoding="utf-8")
+        subprocess.run(["git", "-C", repository, "add", "release.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", repository, "commit", "-q", "-m", "genuine"], check=True
+        )
+        genuine = subprocess.check_output(
+            ["git", "-C", repository, "rev-parse", "HEAD"], text=True
+        ).strip()
+        release.write_text("malicious\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", repository, "commit", "-qam", "malicious"], check=True
+        )
+        malicious = subprocess.check_output(
+            ["git", "-C", repository, "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "-C", repository, "replace", genuine, malicious], check=True
+        )
+        subprocess.run(
+            ["git", "-C", repository, "worktree", "add", "--detach", checkout, genuine],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        checkout.chmod(0o700)
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "-C", checkout, "status", "--porcelain"], text=True
+            ),
+            "",
+        )
+        self.assertEqual(
+            (checkout / "release.txt").read_text(encoding="utf-8"), "malicious\n"
+        )
+        with self.assertRaises(RuntimeError):
+            self.ops.reject_replace_refs(checkout)
+
+    def test_restore_env_rejects_template_defaults_duplicates_and_symlink(self):
+        env_path = self.root / "restore.env"
+        env_path.write_text(
+            (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        env_path.chmod(0o600)
+        with self.assertRaises(ValueError):
+            self.ops.verify_restore_environment(
+                env_path, self.uid, self.gid, "v1.0.0", "a" * 40, 0
+            )
+        env_path.write_text(
+            "OPSWARDEN_HOSTNAME=localhost\nOPSWARDEN_HOSTNAME=localhost\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError):
+            self.ops.parse_environment_file(env_path, self.uid, self.gid)
+        real = self.root / "real.env"
+        real.write_text("OPSWARDEN_HOSTNAME=localhost\n", encoding="utf-8")
+        real.chmod(0o600)
+        env_path.unlink()
+        env_path.symlink_to(real)
+        with self.assertRaises((OSError, ValueError)):
+            self.ops.parse_environment_file(env_path, self.uid, self.gid)
+
+    def valid_restore_env(self, revision: str, epoch: int) -> str:
+        return "\n".join(
+            (
+                "OPSWARDEN_HOSTNAME=localhost",
+                "OPSWARDEN_TLS_EMAIL=ops@example.com",
+                "OPSWARDEN_VERSION=1.0.0",
+                f"OPSWARDEN_REVISION={revision}",
+                f"SOURCE_DATE_EPOCH={epoch}",
+                "OPSWARDEN_STATE_PATH=/srv/opswarden-restore/state",
+                (
+                    "OPSWARDEN_MASTER_KEY_PATH="
+                    "/srv/opswarden-restore/secrets/master.key"
+                ),
+                "CADDY_DATA_PATH=/srv/opswarden-restore/caddy/data",
+                "CADDY_CONFIG_PATH=/srv/opswarden-restore/caddy/config",
+                "OPSWARDEN_BACKEND_SUBNET=172.31.251.0/29",
+                "OPSWARDEN_APP_IP=172.31.251.2",
+                "OPSWARDEN_CADDY_IP=172.31.251.3",
+                "OPSWARDEN_INTERNAL_CIDRS=",
+                "OPSWARDEN_RESTORE_HOST_PORT=127.0.0.1:8443:443/tcp",
+                "",
+            )
+        )
+
+    def test_restore_env_accepts_only_exact_isolated_policy(self):
+        revision = "a" * 40
+        env_path = self.root / "valid.env"
+        env_path.write_text(
+            self.valid_restore_env(revision, 1234), encoding="ascii"
+        )
+        env_path.chmod(0o600)
+        self.ops.verify_restore_environment(
+            env_path, self.uid, self.gid, "v1.0.0", revision, 1234
+        )
+
+        mutations = {
+            "production state": (
+                "/srv/opswarden-restore/state",
+                "/srv/opswarden/state",
+            ),
+            "production key": (
+                "/srv/opswarden-restore/secrets/master.key",
+                "/srv/opswarden/secrets/master.key",
+            ),
+            "revision mismatch": (revision, "b" * 40),
+            "public port": (
+                "127.0.0.1:8443:443/tcp",
+                "0.0.0.0:8443:443/tcp",
+            ),
+        }
+        original = self.valid_restore_env(revision, 1234)
+        for name, (old, new) in mutations.items():
+            with self.subTest(name=name):
+                env_path.write_text(original.replace(old, new), encoding="ascii")
+                with self.assertRaises(ValueError):
+                    self.ops.verify_restore_environment(
+                        env_path,
+                        self.uid,
+                        self.gid,
+                        "v1.0.0",
+                        revision,
+                        1234,
+                    )
+        env_path.write_text(original, encoding="ascii")
+        env_path.chmod(0o644)
+        with self.assertRaises(PermissionError):
+            self.ops.verify_restore_environment(
+                env_path, self.uid, self.gid, "v1.0.0", revision, 1234
+            )
+        env_path.chmod(0o600)
+        with self.assertRaises(PermissionError):
+            self.ops.verify_restore_environment(
+                env_path, self.uid + 1, self.gid, "v1.0.0", revision, 1234
+            )
+
+    def test_trusted_helper_rejects_writable_or_symlink_file(self):
+        helper = self.root / "offline_ops.py"
+        helper.write_text("# trusted fixture\n", encoding="ascii")
+        helper.chmod(0o755)
+        self.ops.verify_trusted_helper(
+            helper, helper, expected_uid=self.uid, expected_gid=self.gid
+        )
+        helper.chmod(0o775)
+        with self.assertRaises(PermissionError):
+            self.ops.verify_trusted_helper(
+                helper, helper, expected_uid=self.uid, expected_gid=self.gid
+            )
+        helper.chmod(0o755)
+        link = self.root / "worktree-offline_ops.py"
+        link.symlink_to(helper)
+        with self.assertRaises(PermissionError):
+            self.ops.verify_trusted_helper(
+                link, link, expected_uid=self.uid, expected_gid=self.gid
+            )
 
 
 class OfflineRevokeTest(unittest.TestCase):
@@ -325,7 +637,7 @@ class OfflineRevokeTest(unittest.TestCase):
                 revoked_at TEXT
             );
             INSERT INTO users (id, normalized_email)
-            VALUES ('user-1', 'owner@example.com');
+            VALUES ('AAAAAAAAAAAAAAAAAAAAAA', 'owner@example.com');
             """
         )
 
@@ -336,7 +648,7 @@ class OfflineRevokeTest(unittest.TestCase):
     def test_orchestration_reads_tty_before_drop_and_opens_db_after_drop(self):
         events = []
         kind = bytearray(b"user")
-        identifier = bytearray(b"owner@example.com")
+        identifier = bytearray(USER_ID.encode("ascii"))
 
         def read_selection():
             events.append("tty")
@@ -373,10 +685,22 @@ class OfflineRevokeTest(unittest.TestCase):
         self.assertEqual(kind, bytearray(len(kind)))
         self.assertEqual(identifier, bytearray(len(identifier)))
 
+    def test_revocation_helper_rejects_writable_worktree_copy(self):
+        helper = Path(self.tempdir.name).resolve() / "offline_revoke.py"
+        helper.write_text("# fixture\n", encoding="ascii")
+        helper.chmod(0o775)
+        with self.assertRaises(PermissionError):
+            self.revoke.verify_trusted_helper(
+                helper,
+                expected_path=helper,
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+            )
+
     def test_hidden_tty_input_is_not_echoed(self):
         master_fd, slave_fd = pty.openpty()
         tty_path = os.ttyname(slave_fd)
-        supplied = b"user\nowner@example.com\n"
+        supplied = b"user\n" + USER_ID.encode("ascii") + b"\n"
 
         def write_after_noecho_is_installed():
             time.sleep(0.1)
@@ -396,8 +720,8 @@ class OfflineRevokeTest(unittest.TestCase):
         os.close(slave_fd)
 
         self.assertEqual(kind, bytearray(b"user"))
-        self.assertEqual(identifier, bytearray(b"owner@example.com"))
-        self.assertNotIn(b"owner@example.com", captured)
+        self.assertEqual(identifier, bytearray(USER_ID.encode("ascii")))
+        self.assertNotIn(USER_ID.encode("ascii"), captured)
 
     def test_privilege_drop_verifies_all_real_and_effective_ids(self):
         with mock.patch.object(
@@ -468,7 +792,7 @@ class OfflineRevokeTest(unittest.TestCase):
             self.revoke.revoke_active(
                 self.connection,
                 bytearray(b"user"),
-                bytearray(b"owner@example.com"),
+                bytearray(USER_ID.encode("ascii")),
             )
 
         self.assertFalse(self.connection.in_transaction)
@@ -481,16 +805,16 @@ class OfflineRevokeTest(unittest.TestCase):
         self.connection.executescript(
             """
             INSERT INTO sessions (id, user_id, revoked_at)
-            VALUES ('active', 'user-1', NULL);
+            VALUES ('active', 'AAAAAAAAAAAAAAAAAAAAAA', NULL);
             INSERT INTO sessions (id, user_id, revoked_at)
-            VALUES ('already-revoked', 'user-1', '2026-01-01T00:00:00Z');
+            VALUES ('already-revoked', 'AAAAAAAAAAAAAAAAAAAAAA', '2026-01-01T00:00:00Z');
             """
         )
 
         count = self.revoke.revoke_active(
             self.connection,
             bytearray(b"user"),
-            bytearray(b"Owner@Example.COM"),
+            bytearray(USER_ID.encode("ascii")),
         )
 
         self.assertEqual(count, 1)
@@ -501,11 +825,38 @@ class OfflineRevokeTest(unittest.TestCase):
         self.assertEqual(rows[1][1], "2026-01-01T00:00:00Z")
         self.assertFalse(self.connection.in_transaction)
 
+    def test_exact_token_id_commit_and_zero_row_rollback(self):
+        self.connection.executescript(
+            f"""
+            INSERT INTO agents (id) VALUES ('agt_fixture');
+            INSERT INTO agent_tokens (id, agent_id, revoked_at)
+            VALUES ('{TOKEN_ID}', 'agt_fixture', NULL);
+            """
+        )
+        count = self.revoke.revoke_active(
+            self.connection,
+            bytearray(b"token"),
+            bytearray(TOKEN_ID.encode("ascii")),
+        )
+        self.assertEqual(count, 1)
+        self.assertIsNotNone(
+            self.connection.execute(
+                "SELECT revoked_at FROM agent_tokens WHERE id = ?", (TOKEN_ID,)
+            ).fetchone()[0]
+        )
+        with self.assertRaises(RuntimeError):
+            self.revoke.revoke_active(
+                self.connection,
+                bytearray(b"token"),
+                bytearray(TOKEN_ID.encode("ascii")),
+            )
+        self.assertFalse(self.connection.in_transaction)
+
     def test_commit_failure_rolls_back(self):
         self.connection.execute(
             """
             INSERT INTO sessions (id, user_id, revoked_at)
-            VALUES ('active', 'user-1', NULL)
+            VALUES ('active', 'AAAAAAAAAAAAAAAAAAAAAA', NULL)
             """
         )
 
@@ -526,7 +877,7 @@ class OfflineRevokeTest(unittest.TestCase):
             self.revoke.revoke_active(
                 FailingCommit(self.connection),
                 bytearray(b"user"),
-                bytearray(b"owner@example.com"),
+                bytearray(USER_ID.encode("ascii")),
             )
 
         self.assertFalse(self.connection.in_transaction)
@@ -534,6 +885,18 @@ class OfflineRevokeTest(unittest.TestCase):
             "SELECT revoked_at FROM sessions WHERE id = 'active'"
         ).fetchone()[0]
         self.assertIsNone(revoked)
+
+    def test_rejects_email_unicode_and_agent_id_selectors(self):
+        for kind, identifier in (
+            (b"user", b"owner@example.com"),
+            (b"user", "用户".encode("utf-8")),
+            (b"token", b"agt_" + b"a" * 32),
+        ):
+            with self.subTest(kind=kind, identifier=identifier):
+                with self.assertRaises(ValueError):
+                    self.revoke.revoke_active(
+                        self.connection, bytearray(kind), bytearray(identifier)
+                    )
 
 
 class OperationsDocumentationTest(unittest.TestCase):
@@ -544,15 +907,52 @@ class OperationsDocumentationTest(unittest.TestCase):
         preflight = restore.index("offline_ops.py restore-preflight")
         compose = restore.index("docker compose")
         self.assertLess(preflight, compose)
-        self.assertIn("git worktree add --detach", restore)
-        self.assertIn('git verify-tag "refs/tags/$release_ref"', restore)
+        self.assertIn("safe_git worktree add --detach", restore)
+        self.assertIn('safe_git verify-tag "refs/tags/$release_ref"', restore)
         self.assertIn('rev-parse HEAD)" != "$expected_revision"', restore)
 
     def test_runbook_uses_root_first_offline_revocation_helper(self):
         text = OPERATIONS_DOC.read_text(encoding="utf-8")
         revoke = text[text.index("## 9. 紧急吊销") : text.index("## 10.")]
-        self.assertIn("sudo -- python3 deploy/offline_revoke.py", revoke)
+        self.assertIn(
+            "sudo -- python3 /usr/local/libexec/opswarden/offline_revoke.py",
+            revoke,
+        )
         self.assertNotIn("sudo -u '#10001' python3 -", revoke)
+
+    def test_privileged_helpers_use_only_root_owned_trust_anchor(self):
+        text = OPERATIONS_DOC.read_text(encoding="utf-8")
+        self.assertIn("/usr/local/libexec/opswarden/offline_ops.py", text)
+        self.assertIn("/usr/local/libexec/opswarden/offline_revoke.py", text)
+        self.assertNotIn(
+            "sudo -- python3 /srv/opswarden-restore/source/deploy/offline_ops.py",
+            text,
+        )
+        self.assertNotIn("sudo -- python3 deploy/offline_revoke.py", text)
+
+    def test_restore_uses_no_replace_and_private_operator_worktree(self):
+        text = OPERATIONS_DOC.read_text(encoding="utf-8")
+        restore = text[text.index("## 8. 每季度隔离恢复演练") : text.index("## 9.")]
+        self.assertIn("GIT_NO_REPLACE_OBJECTS=1", restore)
+        self.assertIn("--no-replace-objects", restore)
+        self.assertIn("refs/replace/", restore)
+        self.assertIn("-m 0700", restore)
+        self.assertIn("RESTORE_OPERATOR_UID", restore)
+        self.assertIn(
+            "/usr/local/libexec/opswarden/offline_ops.py restore-preflight",
+            restore,
+        )
+        self.assertIn("/srv/opswarden-restore/restore.env", restore)
+        self.assertNotIn("/srv/opswarden-restore/override.yaml", restore)
+
+    def test_signed_restore_override_uses_only_env_loopback_port(self):
+        override = RESTORE_OVERRIDE.read_text(encoding="utf-8")
+        self.assertIn("${OPSWARDEN_RESTORE_HOST_PORT:", override)
+        self.assertIn(
+            "/srv/opswarden-restore-worktree/source/deploy/RestoreCaddyfile",
+            override,
+        )
+        self.assertNotIn("0.0.0.0:", override)
 
 
 if __name__ == "__main__":

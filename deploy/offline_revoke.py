@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import datetime
+import base64
+import binascii
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import sys
@@ -17,11 +20,43 @@ DATABASE = Path("/srv/opswarden/state/data/opswarden.db")
 OPSWARDEN_UID = 10001
 OPSWARDEN_GID = 10001
 PRIVATE_FILE_MODE = 0o600
+TRUSTED_REVOKE_HELPER = Path(
+    "/usr/local/libexec/opswarden/offline_revoke.py"
+)
+TOKEN_ID_RE = re.compile(r"tok_[0-9a-f]{32}")
 
 
 def require_root() -> None:
     if os.geteuid() != 0:
         raise PermissionError("offline revocation must start as root")
+
+
+def verify_trusted_helper(
+    path: Path,
+    expected_path: Path = TRUSTED_REVOKE_HELPER,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    path = Path(path)
+    if path != expected_path or path.resolve(strict=True) != expected_path:
+        raise PermissionError("revocation helper is outside its fixed trust anchor")
+    metadata = os.lstat(path)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o755
+        or metadata.st_size <= 0
+    ):
+        raise PermissionError("revocation helper ownership or mode is invalid")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise PermissionError("revocation helper changed while opening")
+    finally:
+        os.close(descriptor)
 
 
 def read_hidden_line(tty_fd: int, prompt: bytes, limit: int = 512) -> bytearray:
@@ -65,9 +100,9 @@ def read_hidden_selection(
     hidden[3] &= ~termios.ECHO
     try:
         termios.tcsetattr(tty_fd, termios.TCSANOW, hidden)
-        kind = read_hidden_line(tty_fd, b"revoke kind [user/agent] (hidden): ", 16)
+        kind = read_hidden_line(tty_fd, b"revoke kind [user/token] (hidden): ", 16)
         identifier = read_hidden_line(
-            tty_fd, b"user email or exact agent id (hidden): "
+            tty_fd, b"exact user id or token id (hidden): "
         )
         return kind, identifier
     finally:
@@ -128,29 +163,46 @@ def wipe(value: bytearray | None) -> None:
             value[index] = 0
 
 
+def canonical_user_id(value: str) -> bool:
+    if len(value) != 22 or re.fullmatch(r"[A-Za-z0-9_-]{22}", value) is None:
+        return False
+    try:
+        decoded = base64.b64decode(
+            value + "==", altchars=b"-_", validate=True
+        )
+    except (ValueError, binascii.Error):
+        return False
+    return (
+        len(decoded) == 16
+        and base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") == value
+    )
+
+
 def revoke_active(
     connection: sqlite3.Connection, kind: bytearray, identifier: bytearray
 ) -> int:
     kind_text = kind.decode("ascii", errors="strict")
-    identifier_text = identifier.decode("utf-8", errors="strict").strip()
-    if not identifier_text or len(identifier_text.encode("utf-8")) > 512:
-        raise ValueError("invalid revocation selector")
+    identifier_text = identifier.decode("ascii", errors="strict")
+    if kind_text == "user":
+        if not canonical_user_id(identifier_text):
+            raise ValueError("invalid canonical user id")
+    elif kind_text == "token":
+        if TOKEN_ID_RE.fullmatch(identifier_text) is None:
+            raise ValueError("invalid canonical token id")
+    else:
+        raise ValueError("invalid revoke kind")
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(
         timespec="microseconds"
     ).replace("+00:00", "Z")
     connection.execute("BEGIN IMMEDIATE")
     try:
         if kind_text == "user":
-            normalized_identifier = identifier_text.lower()
             expected = connection.execute(
                 """
-                SELECT COUNT(*)
-                  FROM sessions s
-                  JOIN users u ON u.id = s.user_id
-                 WHERE u.normalized_email = ?
-                   AND s.revoked_at IS NULL
+                SELECT COUNT(*) FROM sessions
+                 WHERE user_id = ? AND revoked_at IS NULL
                 """,
-                (normalized_identifier,),
+                (identifier_text,),
             ).fetchone()[0]
             if expected <= 0:
                 raise RuntimeError("no active rows matched")
@@ -158,19 +210,15 @@ def revoke_active(
                 """
                 UPDATE sessions
                    SET revoked_at = ?
-                 WHERE user_id = (
-                     SELECT id FROM users
-                      WHERE normalized_email = ?
-                 )
-                   AND revoked_at IS NULL
+                 WHERE user_id = ? AND revoked_at IS NULL
                 """,
-                (now, normalized_identifier),
+                (now, identifier_text),
             )
-        elif kind_text == "agent":
+        else:
             expected = connection.execute(
                 """
                 SELECT COUNT(*) FROM agent_tokens
-                 WHERE agent_id = ? AND revoked_at IS NULL
+                 WHERE id = ? AND revoked_at IS NULL
                 """,
                 (identifier_text,),
             ).fetchone()[0]
@@ -179,12 +227,10 @@ def revoke_active(
             cursor = connection.execute(
                 """
                 UPDATE agent_tokens SET revoked_at = ?
-                 WHERE agent_id = ? AND revoked_at IS NULL
+                 WHERE id = ? AND revoked_at IS NULL
                 """,
                 (now, identifier_text),
             )
-        else:
-            raise ValueError("invalid revoke kind")
         if cursor.rowcount != expected:
             raise RuntimeError("active row count changed during revocation")
         connection.commit()
@@ -226,6 +272,7 @@ def orchestrate(
 
 def main() -> int:
     try:
+        verify_trusted_helper(Path(__file__))
         count = orchestrate()
     except (OSError, RuntimeError, UnicodeError, ValueError, sqlite3.Error) as error:
         print(f"offline revocation refused: {error}", file=sys.stderr)
